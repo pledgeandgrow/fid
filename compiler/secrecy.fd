@@ -21,15 +21,8 @@
 // Dependencies: compiler::ast, compiler::escape (identifier walker)
 
 module compiler::secrecy;
-
-use core;
-use vec;
-use string;
-use compiler::ast;
-use compiler::parser;
-use compiler::escape;
-
-pub struct SecSummary {
+ use core; use vec; use string; use compiler::ast; use compiler::parser; use compiler::escape;
+ pub struct SecSummary {
     pub leaks: Vec<i64>,
     pub returns: Vec<i64>,
     pub outputs: bool,
@@ -37,20 +30,26 @@ pub struct SecSummary {
 
 pub struct SecFunc {
     pub key: str,
-    pub skey: str,   // skip-set key ("fn:n" / "impl:s:m" / "trait:t:m")
+    pub skey: str,
+    // skip-set key ("fn:n" / "impl:s:m" / "trait:t:m")
     pub func: Func,
 }
 
 pub struct SecrecyChecker {
     pub all: Vec<SecFunc>,
-    pub func_index: i64,        // HashMap: key -> index + 1 into all
-    pub method_index: i64,      // HashMap: method name -> index + 1 into method_keys
+    pub func_index: i64,
+    // HashMap: key -> index + 1 into all
+    pub method_index: i64,
+    // HashMap: method name -> index + 1 into method_keys
     pub method_keys: Vec<Vec<str>>,
-    pub globals: i64,           // HashMap: global or const name -> 1
-    pub summary_index: i64,     // HashMap: key -> index + 1 into summaries
+    pub globals: i64,
+    // HashMap: global or const name -> 1
+    pub summary_index: i64,
+    // HashMap: key -> index + 1 into summaries
     pub summaries: Vec<SecSummary>,
     // Per-function state; labels are flow-insensitive.
-    pub var_index: i64,         // HashMap: name -> index + 1 into var_labels
+    pub var_index: i64,
+    // HashMap: name -> index + 1 into var_labels
     pub var_labels: Vec<Vec<i64>>,
     pub ref_params: Vec<str>,
     pub pc: Vec<Vec<i64>>,
@@ -72,8 +71,12 @@ pub struct SecrecyChecker {
 fn sec_union(a: Vec<i64>, b: Vec<i64>) -> Vec<i64> {
     // Labels are never changed in place, so an empty side shares the other
     // (most labels are empty; this avoids most allocations).
-    if b.len() == 0 { return a; }
-    if a.len() == 0 { return b; }
+    if b.len() == 0 {
+        return a;
+    }
+    if a.len() == 0 {
+        return b;
+    }
     var out: Vec<i64> = Vec::new();
     var i: i64 = 0;
     var j: i64 = 0;
@@ -96,7 +99,9 @@ fn sec_union(a: Vec<i64>, b: Vec<i64>) -> Vec<i64> {
 fn sec_has(l: Vec<i64>, x: i64) -> bool {
     var i: i64 = 0;
     while i < l.len() {
-        if l.get(i) == x { return true; }
+        if l.get(i) == x {
+            return true;
+        }
         i = i + 1;
     }
     return false;
@@ -113,29 +118,20 @@ fn sec_none() -> Vec<i64> {
 }
 
 fn sec_is_output_sink(name: str) -> bool {
-    return name == "print" || name == "println" || name == "eprint" || name == "eprintln"
-        || name == "p_print_int" || name == "p_print_str" || name == "p_print_float" || name == "p_print_bool" || name == "p_print_newline"
-        || name == "p_eprint_str" || name == "p_print_vec"
-        || name == "p_socket_send" || name == "p_socket_send_str" || name == "p_http_send_response"
-        || name == "p_file_write" || name == "p_file_append" || name == "p_file_write_bin"
-        || name == "p_file_write_vec" || name == "write_file" || name == "append_file"
-        || str_starts_with(name, "p_write") || str_starts_with(name, "p_fs_write")
-        || str_starts_with(name, "p_socket_write") || str_starts_with(name, "p_net_send") || str_starts_with(name, "p_net_write")
-        || name == "log_info" || name == "log_warn" || name == "log_error" || name == "log_debug"
-        || name == "p_chan_send";
+    return name == "print" || name == "println" || name == "eprint" || name == "eprintln" || name == "p_print_int" || name == "p_print_str" || name == "p_print_float" || name == "p_print_bool" || name == "p_print_newline" || name == "p_eprint_str" || name == "p_print_vec" || name == "p_socket_send" || name == "p_socket_send_str" || name == "p_http_send_response" || name == "p_file_write" || name == "p_file_append" || name == "p_file_write_bin" || name == "p_file_write_vec" || name == "write_file" || name == "append_file" || str_starts_with(name, "p_write") || str_starts_with(name, "p_fs_write") || str_starts_with(name, "p_socket_write") || str_starts_with(name, "p_net_send") || str_starts_with(name, "p_net_write") || name == "log_info" || name == "log_warn" || name == "log_error" || name == "log_debug" || name == "p_chan_send";
 }
 
 /// Methods that read their receiver without storing their arguments in it.
 fn sec_read_only_method(name: str) -> bool {
-    return name == "get" || name == "len" || name == "is_empty" || name == "contains" || name == "index_of" || name == "find"
-        || name == "starts_with" || name == "ends_with" || name == "first" || name == "last" || name == "eq" || name == "cmp"
-        || name == "compare" || name == "to_str" || name == "to_string" || name == "clone" || name == "get_or";
+    return name == "get" || name == "len" || name == "is_empty" || name == "contains" || name == "index_of" || name == "find" || name == "starts_with" || name == "ends_with" || name == "first" || name == "last" || name == "eq" || name == "cmp" || name == "compare" || name == "to_str" || name == "to_string" || name == "clone" || name == "get_or";
 }
 
 fn sec_has_annotation(anns: Vec<Annotation>, name: str) -> bool {
     var i: i64 = 0;
     while i < anns.len() {
-        if anns.get(i).name == name { return true; }
+        if anns.get(i).name == name {
+            return true;
+        }
         i = i + 1;
     }
     return false;
@@ -148,7 +144,9 @@ pub fn SecrecyChecker_new(program: Program) -> SecrecyChecker {
     var i: i64 = 0;
     while i < program.funcs.len() {
         var f: Func = program.funcs.get(i);
-        all.push(SecFunc { key: f.name, skey: "fn:" + f.name, func: f });
+        all.push(SecFunc {
+            key: f.name, skey: "fn:" + f.name, func: f
+        });
         i = i + 1;
     }
     var ii: i64 = 0;
@@ -157,7 +155,9 @@ pub fn SecrecyChecker_new(program: Program) -> SecrecyChecker {
         var mi: i64 = 0;
         while mi < imp.methods.len() {
             var m: Func = imp.methods.get(mi);
-            all.push(SecFunc { key: imp.struct_name + "_" + m.name, skey: "impl:" + imp.struct_name + ":" + m.name, func: m });
+            all.push(SecFunc {
+                key: imp.struct_name + "_" + m.name, skey: "impl:" + imp.struct_name + ":" + m.name, func: m
+            });
             mi = mi + 1;
         }
         ii = ii + 1;
@@ -168,7 +168,9 @@ pub fn SecrecyChecker_new(program: Program) -> SecrecyChecker {
         var tmi: i64 = 0;
         while tmi < timp.methods.len() {
             var tm: Func = timp.methods.get(tmi);
-            all.push(SecFunc { key: timp.type_name + "_" + tm.name, skey: "trait:" + timp.type_name + ":" + tm.name, func: tm });
+            all.push(SecFunc {
+                key: timp.type_name + "_" + tm.name, skey: "trait:" + timp.type_name + ":" + tm.name, func: tm
+            });
             tmi = tmi + 1;
         }
         ti = ti + 1;
@@ -210,32 +212,11 @@ pub fn SecrecyChecker_new(program: Program) -> SecrecyChecker {
         ci = ci + 1;
     }
     return SecrecyChecker {
-        all: all,
-        func_index: func_index,
-        method_index: method_index,
-        method_keys: method_keys,
-        globals: globals,
-        summary_index: HashMap_new(),
-        summaries: Vec::new(),
-        var_index: HashMap_new(),
-        var_labels: Vec::new(),
-        ref_params: Vec::new(),
-        pc: Vec::new(),
-        func_name: "",
-        may_return_secret: false,
-        may_return_sensitive: false,
-        declassify: false,
-        cur_leaks: Vec::new(),
-        cur_returns: Vec::new(),
-        cur_outputs: false,
-        changed: false,
-        line: 0,
-        report: false,
-        errors: Vec::new(),
+        all: all, func_index: func_index, method_index: method_index, method_keys: method_keys, globals: globals, summary_index: HashMap_new(), summaries: Vec::new(), var_index: HashMap_new(), var_labels: Vec::new(), ref_params: Vec::new(), pc: Vec::new(), func_name: "", may_return_secret: false, may_return_sensitive: false, declassify: false, cur_leaks: Vec::new(), cur_returns: Vec::new(), cur_outputs: false, changed: false, line: 0, report: false, errors: Vec::new(),
     };
 }
 
-fn sec_error(self: &mut SecrecyChecker, kind: str, msg: str) {
+fn sec_error(self: & mut SecrecyChecker, kind: str, msg: str) {
     if self.report {
         var full: str = "Security error (" + kind + ") (line " + int_to_str(self.line) + "): in '" + self.func_name + "', " + msg;
         if !str_vec_contains(self.errors, full) {
@@ -244,17 +225,19 @@ fn sec_error(self: &mut SecrecyChecker, kind: str, msg: str) {
     }
 }
 
-fn sec_summary(self: &SecrecyChecker, key: str) -> SecSummary {
+fn sec_summary(self: & SecrecyChecker, key: str) -> SecSummary {
     var slot: i64 = HashMap_get(self.summary_index, key);
     if slot == 0 {
         var empty: Vec<i64> = Vec::new();
         var empty2: Vec<i64> = Vec::new();
-        return SecSummary { leaks: empty, returns: empty2, outputs: false };
+        return SecSummary {
+            leaks: empty, returns: empty2, outputs: false
+        };
     }
     return self.summaries.get(slot - 1);
 }
 
-fn sec_set_summary(self: &mut SecrecyChecker, key: str, s: SecSummary) {
+fn sec_set_summary(self: & mut SecrecyChecker, key: str, s: SecSummary) {
     var slot: i64 = HashMap_get(self.summary_index, key);
     if slot == 0 {
         self.summaries.push(s);
@@ -265,13 +248,15 @@ fn sec_set_summary(self: &mut SecrecyChecker, key: str, s: SecSummary) {
 }
 
 // A number that grows whenever any summary grows (summaries only grow).
-fn sec_summary_total(self: &SecrecyChecker) -> i64 {
+fn sec_summary_total(self: & SecrecyChecker) -> i64 {
     var n: i64 = 0;
     var i: i64 = 0;
     while i < self.summaries.len() {
         var s: SecSummary = self.summaries.get(i);
         n = n + s.leaks.len() + s.returns.len();
-        if s.outputs { n = n + 1; }
+        if s.outputs {
+            n = n + 1;
+        }
         i = i + 1;
     }
     return n;
@@ -279,23 +264,27 @@ fn sec_summary_total(self: &SecrecyChecker) -> i64 {
 
 // --- Variables and context ------------------------------------------------
 
-fn sec_var(self: &SecrecyChecker, name: str) -> Vec<i64> {
+fn sec_var(self: & SecrecyChecker, name: str) -> Vec<i64> {
     var slot: i64 = HashMap_get(self.var_index, name);
-    if slot == 0 { return sec_none(); }
+    if slot == 0 {
+        return sec_none();
+    }
     return self.var_labels.get(slot - 1);
 }
 
-fn sec_has_var(self: &SecrecyChecker, name: str) -> bool {
+fn sec_has_var(self: & SecrecyChecker, name: str) -> bool {
     return HashMap_get(self.var_index, name) != 0;
 }
 
 /// Give `name` (at least) the label `l`.
-fn sec_assign(self: &mut SecrecyChecker, name: str, l: Vec<i64>) {
+fn sec_assign(self: & mut SecrecyChecker, name: str, l: Vec<i64>) {
     var slot: i64 = HashMap_get(self.var_index, name);
     if slot == 0 {
         self.var_labels.push(l);
         HashMap_insert(self.var_index, name, self.var_labels.len());
-        if l.len() > 0 { self.changed = true; }
+        if l.len() > 0 {
+            self.changed = true;
+        }
         return;
     }
     var before: Vec<i64> = self.var_labels.get(slot - 1);
@@ -306,28 +295,30 @@ fn sec_assign(self: &mut SecrecyChecker, name: str, l: Vec<i64>) {
     }
 }
 
-fn sec_pc(self: &SecrecyChecker) -> Vec<i64> {
-    if self.pc.len() == 0 { return sec_none(); }
+fn sec_pc(self: & SecrecyChecker) -> Vec<i64> {
+    if self.pc.len() == 0 {
+        return sec_none();
+    }
     return self.pc.get(self.pc.len() - 1);
 }
 
-fn sec_push_pc(self: &mut SecrecyChecker, extra: Vec<i64>) {
+fn sec_push_pc(self: & mut SecrecyChecker, extra: Vec<i64>) {
     var next: Vec<i64> = sec_union(sec_pc(self), extra);
     self.pc.push(next);
 }
 
-fn sec_pop_pc(self: &mut SecrecyChecker) {
+fn sec_pop_pc(self: & mut SecrecyChecker) {
     self.pc.pop();
 }
 
-fn sec_note_leak(self: &mut SecrecyChecker, i: i64) {
+fn sec_note_leak(self: & mut SecrecyChecker, i: i64) {
     if !sec_has(self.cur_leaks, i) {
         self.cur_leaks = sec_union(self.cur_leaks, sec_one(i));
         self.changed = true;
     }
 }
 
-fn sec_note_output(self: &mut SecrecyChecker) {
+fn sec_note_output(self: & mut SecrecyChecker) {
     if !self.cur_outputs {
         self.cur_outputs = true;
         self.changed = true;
@@ -335,27 +326,31 @@ fn sec_note_output(self: &mut SecrecyChecker) {
 }
 
 /// `data` reaches the output `what` while the code runs under `pc`.
-fn sec_sink(self: &mut SecrecyChecker, what: str, data: Vec<i64>, pc: Vec<i64>) {
+fn sec_sink(self: & mut SecrecyChecker, what: str, data: Vec<i64>, pc: Vec<i64>) {
     sec_note_output(self);
-    if sec_has(data, -1) {
+    if sec_has(data, - 1) {
         sec_error(self, "@secret", "a secret value reaches " + what);
-    } else if sec_has(data, -2) {
+    } else if sec_has(data, - 2) {
         sec_error(self, "@sensitive", "a sensitive value reaches " + what + "; release it through privacy::release (a consent check) or mark the function @declassify");
-    } else if sec_has(pc, -1) {
+    } else if sec_has(pc, - 1) {
         sec_error(self, "@secret", what + " runs inside a branch or loop that depends on a secret");
-    } else if sec_has(pc, -2) {
+    } else if sec_has(pc, - 2) {
         sec_error(self, "@sensitive", what + " runs inside a branch or loop that depends on sensitive data");
     }
     var both: Vec<i64> = sec_union(data, pc);
     var i: i64 = 0;
     while i < both.len() {
-        if both.get(i) >= 0 { sec_note_leak(self, both.get(i)); }
+        if both.get(i) >= 0 {
+            sec_note_leak(self, both.get(i));
+        }
         i = i + 1;
     }
 }
 
-fn sec_ret(self: &mut SecrecyChecker, l: Vec<i64>) {
-    if self.declassify { return; }
+fn sec_ret(self: & mut SecrecyChecker, l: Vec<i64>) {
+    if self.declassify {
+        return;
+    }
     var i: i64 = 0;
     while i < l.len() {
         var o: i64 = l.get(i);
@@ -364,7 +359,7 @@ fn sec_ret(self: &mut SecrecyChecker, l: Vec<i64>) {
                 self.cur_returns = sec_union(self.cur_returns, sec_one(o));
                 self.changed = true;
             }
-        } else if o == -1 {
+        } else if o == - 1 {
             if !self.may_return_secret {
                 sec_error(self, "@secret", "returns a secret value; mark the function @secret (callers keep its result secret) or @declassify (an audited release)");
             }
@@ -377,7 +372,7 @@ fn sec_ret(self: &mut SecrecyChecker, l: Vec<i64>) {
 
 // --- Functions ------------------------------------------------------------
 
-fn sec_analyze_func(self: &mut SecrecyChecker, key: str, f: Func) {
+fn sec_analyze_func(self: & mut SecrecyChecker, key: str, f: Func) {
     self.func_name = f.name;
     self.line = 0;
     self.may_return_secret = sec_has_annotation(f.annotations, "secret");
@@ -396,22 +391,28 @@ fn sec_analyze_func(self: &mut SecrecyChecker, key: str, f: Func) {
     while i < f.params.len() {
         var p: Param = f.params.get(i);
         if sec_has_annotation(p.annotations, "secret") {
-            sec_assign(self, p.name, sec_one(-1));
+            sec_assign(self, p.name, sec_one(- 1));
         } else if sec_has_annotation(p.annotations, "sensitive") {
-            sec_assign(self, p.name, sec_one(-2));
+            sec_assign(self, p.name, sec_one(- 2));
         } else {
             sec_assign(self, p.name, sec_one(i));
         }
         match p.ty {
-            Type::Ref(_, _) => { self.ref_params.push(p.name); }
-            _ => {}
+            Type::Ref(_, _) => {
+                self.ref_params.push(p.name);
+            }
+            _ => {
+            }
         }
         i = i + 1;
     }
     var is_void: bool = false;
     match f.ret_ty {
-        Type::Void => { is_void = true; }
-        _ => {}
+        Type::Void => {
+            is_void = true;
+        }
+        _ => {
+        }
     }
     // Labels only grow, so a few passes reach the function's fixpoint.
     var pass: i64 = 0;
@@ -420,16 +421,22 @@ fn sec_analyze_func(self: &mut SecrecyChecker, key: str, f: Func) {
         var no_pc: Vec<Vec<i64>> = Vec::new();
         self.pc = no_pc;
         var tail: Vec<i64> = sec_stmts_value(self, f.body);
-        if !is_void { sec_ret(self, tail); }
-        if !self.changed { pass = 8; }
+        if !is_void {
+            sec_ret(self, tail);
+        }
+        if !self.changed {
+            pass = 8;
+        }
         pass = pass + 1;
     }
-    sec_set_summary(self, key, SecSummary { leaks: self.cur_leaks, returns: self.cur_returns, outputs: self.cur_outputs });
+    sec_set_summary(self, key, SecSummary {
+        leaks: self.cur_leaks, returns: self.cur_returns, outputs: self.cur_outputs
+    });
 }
 
 // --- Statements -----------------------------------------------------------
 
-fn sec_stmts(self: &mut SecrecyChecker, stmts: Vec<Stmt>) {
+fn sec_stmts(self: & mut SecrecyChecker, stmts: Vec<Stmt>) {
     var i: i64 = 0;
     while i < stmts.len() {
         sec_stmt(self, stmts.get(i));
@@ -438,9 +445,11 @@ fn sec_stmts(self: &mut SecrecyChecker, stmts: Vec<Stmt>) {
 }
 
 /// Process `stmts` and return the label of their value (the last statement's).
-fn sec_stmts_value(self: &mut SecrecyChecker, stmts: Vec<Stmt>) -> Vec<i64> {
+fn sec_stmts_value(self: & mut SecrecyChecker, stmts: Vec<Stmt>) -> Vec<i64> {
     var n: i64 = stmts.len();
-    if n == 0 { return sec_none(); }
+    if n == 0 {
+        return sec_none();
+    }
     var i: i64 = 0;
     while i < n - 1 {
         sec_stmt(self, stmts.get(i));
@@ -449,14 +458,19 @@ fn sec_stmts_value(self: &mut SecrecyChecker, stmts: Vec<Stmt>) -> Vec<i64> {
     var last: Stmt = stmts.get(n - 1);
     self.line = stmt_line(last);
     match last {
-        Stmt::Expr(e, _) => { return sec_expr(self, e); }
+        Stmt::Expr(e, _) => {
+            return sec_expr(self, e);
+        }
         Stmt::If(cond, then_block, else_block, _) => {
             var c: Vec<i64> = sec_expr(self, cond);
             sec_push_pc(self, c);
             var l: Vec<i64> = sec_stmts_value(self, then_block);
             match else_block {
-                OptStmts::Some(b) => { l = sec_union(l, sec_stmts_value(self, b)); }
-                OptStmts::None => {}
+                OptStmts::Some(b) => {
+                    l = sec_union(l, sec_stmts_value(self, b));
+                }
+                OptStmts::None => {
+                }
             }
             sec_pop_pc(self);
             return sec_union(l, c);
@@ -474,7 +488,7 @@ fn sec_stmts_value(self: &mut SecrecyChecker, stmts: Vec<Stmt>) -> Vec<i64> {
     return sec_none();
 }
 
-fn sec_arms(self: &mut SecrecyChecker, arms: Vec<MatchArm>, scrutinee: Vec<i64>) -> Vec<i64> {
+fn sec_arms(self: & mut SecrecyChecker, arms: Vec<MatchArm>, scrutinee: Vec<i64>) -> Vec<i64> {
     sec_push_pc(self, scrutinee);
     var pc: Vec<i64> = sec_pc(self);
     var out: Vec<i64> = Vec::new();
@@ -486,7 +500,9 @@ fn sec_arms(self: &mut SecrecyChecker, arms: Vec<MatchArm>, scrutinee: Vec<i64>)
         var arm: MatchArm = arms.get(ai);
         var bound: Vec<i64> = sec_union(scrutinee, pc);
         match arm.pattern {
-            Pattern::Ident(name) => { sec_assign(self, name, bound); }
+            Pattern::Ident(name) => {
+                sec_assign(self, name, bound);
+            }
             Pattern::EnumVariant(_, _, bindings) => {
                 var bi: i64 = 0;
                 while bi < bindings.len() {
@@ -494,11 +510,15 @@ fn sec_arms(self: &mut SecrecyChecker, arms: Vec<MatchArm>, scrutinee: Vec<i64>)
                     bi = bi + 1;
                 }
             }
-            _ => {}
+            _ => {
+            }
         }
         match arm.guard {
-            OptBoxExpr::Some(g) => { guards = sec_union(guards, sec_expr(self, box_expr_deref(g))); }
-            OptBoxExpr::None => {}
+            OptBoxExpr::Some(g) => {
+                guards = sec_union(guards, sec_expr(self, box_expr_deref(g)));
+            }
+            OptBoxExpr::None => {
+            }
         }
         sec_push_pc(self, guards);
         out = sec_union(out, sec_union(guards, sec_stmts_value(self, arm.body)));
@@ -512,25 +532,37 @@ fn sec_arms(self: &mut SecrecyChecker, arms: Vec<MatchArm>, scrutinee: Vec<i64>)
 /// The variable a place expression (`x`, `x.f`, `x[i]`, `*x`) writes into.
 fn sec_base_var(e: Expr) -> OptStr {
     match e {
-        Expr::Ident(n) => { return OptStr::Some(n); }
-        Expr::FieldAccess(inner, _) => { return sec_base_var(box_expr_deref(inner)); }
-        Expr::OptionalFieldAccess(inner, _) => { return sec_base_var(box_expr_deref(inner)); }
-        Expr::Deref(inner) => { return sec_base_var(box_expr_deref(inner)); }
-        Expr::Index(array, _) => { return sec_base_var(box_expr_deref(array)); }
-        _ => { return OptStr::None; }
+        Expr::Ident(n) => {
+            return OptStr::Some(n);
+        }
+        Expr::FieldAccess(inner, _) => {
+            return sec_base_var(box_expr_deref(inner));
+        }
+        Expr::OptionalFieldAccess(inner, _) => {
+            return sec_base_var(box_expr_deref(inner));
+        }
+        Expr::Deref(inner) => {
+            return sec_base_var(box_expr_deref(inner));
+        }
+        Expr::Index(array, _) => {
+            return sec_base_var(box_expr_deref(array));
+        }
+        _ => {
+            return OptStr::None;
+        }
     }
     return OptStr::None;
 }
 
 /// `name` (directly or through a field, element or dereference) receives `l`.
-fn sec_store(self: &mut SecrecyChecker, name: str, l: Vec<i64>) {
+fn sec_store(self: & mut SecrecyChecker, name: str, l: Vec<i64>) {
     if sec_has_var(self, name) || HashMap_get(self.globals, name) == 0 {
         sec_assign(self, name, l);
         // The caller sees what is written through a reference parameter.
         if str_vec_contains(self.ref_params, name) && !self.declassify {
-            if sec_has(l, -1) && !self.may_return_secret {
+            if sec_has(l, - 1) && !self.may_return_secret {
                 sec_error(self, "@secret", "writes a secret value through reference parameter '" + name + "'; mark the function @secret or @declassify");
-            } else if sec_has(l, -2) && !self.may_return_sensitive {
+            } else if sec_has(l, - 2) && !self.may_return_sensitive {
                 sec_error(self, "@sensitive", "writes a sensitive value through reference parameter '" + name + "'; mark the function @sensitive or @declassify");
             }
         }
@@ -539,10 +571,13 @@ fn sec_store(self: &mut SecrecyChecker, name: str, l: Vec<i64>) {
     }
 }
 
-fn sec_store_place(self: &mut SecrecyChecker, place: Expr, l: Vec<i64>) {
+fn sec_store_place(self: & mut SecrecyChecker, place: Expr, l: Vec<i64>) {
     match sec_base_var(place) {
-        OptStr::Some(base) => { sec_store(self, base, l); }
-        OptStr::None => {}
+        OptStr::Some(base) => {
+            sec_store(self, base, l);
+        }
+        OptStr::None => {
+        }
     }
 }
 
@@ -550,14 +585,18 @@ fn sec_has_secret_annotation(anns: Vec<Annotation>) -> bool {
     return sec_has_annotation(anns, "secret");
 }
 
-fn sec_stmt(self: &mut SecrecyChecker, s: Stmt) {
+fn sec_stmt(self: & mut SecrecyChecker, s: Stmt) {
     self.line = stmt_line(s);
     var pc: Vec<i64> = sec_pc(self);
     match s {
         Stmt::Let(name, _, expr, _, _, annotations, _) => {
             var l: Vec<i64> = sec_union(sec_expr(self, expr), pc);
-            if sec_has_secret_annotation(annotations) { l = sec_union(l, sec_one(-1)); }
-            if sec_has_annotation(annotations, "sensitive") { l = sec_union(l, sec_one(-2)); }
+            if sec_has_secret_annotation(annotations) {
+                l = sec_union(l, sec_one(- 1));
+            }
+            if sec_has_annotation(annotations, "sensitive") {
+                l = sec_union(l, sec_one(- 2));
+            }
             sec_assign(self, name, l);
         }
         Stmt::LetTuple(names, expr, _) => {
@@ -570,8 +609,12 @@ fn sec_stmt(self: &mut SecrecyChecker, s: Stmt) {
         }
         Stmt::LetUninit(name, _, annotations, _) => {
             var ul: Vec<i64> = pc;
-            if sec_has_secret_annotation(annotations) { ul = sec_union(ul, sec_one(-1)); }
-            if sec_has_annotation(annotations, "sensitive") { ul = sec_union(ul, sec_one(-2)); }
+            if sec_has_secret_annotation(annotations) {
+                ul = sec_union(ul, sec_one(- 1));
+            }
+            if sec_has_annotation(annotations, "sensitive") {
+                ul = sec_union(ul, sec_one(- 2));
+            }
             sec_assign(self, name, ul);
         }
         Stmt::Assign(target, _, expr, _) => {
@@ -593,20 +636,26 @@ fn sec_stmt(self: &mut SecrecyChecker, s: Stmt) {
             var dl: Vec<i64> = sec_union(sec_expr(self, expr), pc);
             sec_store_place(self, ptr_expr, dl);
         }
-        Stmt::Expr(e, _) => { sec_expr(self, e); }
+        Stmt::Expr(e, _) => {
+            sec_expr(self, e);
+        }
         Stmt::Return(value, _) => {
             match value {
                 OptBoxExpr::Some(e) => {
                     var rl: Vec<i64> = sec_union(sec_expr(self, box_expr_deref(e)), pc);
                     sec_ret(self, rl);
                 }
-                OptBoxExpr::None => {}
+                OptBoxExpr::None => {
+                }
             }
         }
         Stmt::Break(value, _) => {
             match value {
-                OptBoxExpr::Some(e) => { sec_expr(self, box_expr_deref(e)); }
-                OptBoxExpr::None => {}
+                OptBoxExpr::Some(e) => {
+                    sec_expr(self, box_expr_deref(e));
+                }
+                OptBoxExpr::None => {
+                }
             }
         }
         Stmt::If(cond, then_block, else_block, _) => {
@@ -614,8 +663,11 @@ fn sec_stmt(self: &mut SecrecyChecker, s: Stmt) {
             sec_push_pc(self, c);
             sec_stmts(self, then_block);
             match else_block {
-                OptStmts::Some(b) => { sec_stmts(self, b); }
-                OptStmts::None => {}
+                OptStmts::Some(b) => {
+                    sec_stmts(self, b);
+                }
+                OptStmts::None => {
+                }
             }
             sec_pop_pc(self);
         }
@@ -637,16 +689,36 @@ fn sec_stmt(self: &mut SecrecyChecker, s: Stmt) {
             var ml: Vec<i64> = sec_expr(self, expr);
             sec_arms(self, arms, ml);
         }
-        Stmt::Loop(body, _) => { sec_stmts(self, body); }
-        Stmt::Defer(body, _) => { sec_stmts(self, body); }
-        Stmt::Unsafe(body, _) => { sec_stmts(self, body); }
-        Stmt::Sandbox(body, _) => { sec_stmts(self, body); }
-        Stmt::Txn(body, _) => { sec_stmts(self, body); }
-        Stmt::Handle(body, _, _) => { sec_stmts(self, body); }
-        Stmt::RegionBlock(_, _, _, _, _, body, _) => { sec_stmts(self, body); }
-        Stmt::SpawnScope(body, _) => { sec_stmts(self, body); }
-        Stmt::Query(_, body, _) => { sec_stmts(self, body); }
-        Stmt::GradBlock(_, body, _) => { sec_stmts(self, body); }
+        Stmt::Loop(body, _) => {
+            sec_stmts(self, body);
+        }
+        Stmt::Defer(body, _) => {
+            sec_stmts(self, body);
+        }
+        Stmt::Unsafe(body, _) => {
+            sec_stmts(self, body);
+        }
+        Stmt::Sandbox(body, _) => {
+            sec_stmts(self, body);
+        }
+        Stmt::Txn(body, _) => {
+            sec_stmts(self, body);
+        }
+        Stmt::Handle(body, _, _) => {
+            sec_stmts(self, body);
+        }
+        Stmt::RegionBlock(_, _, _, _, _, body, _) => {
+            sec_stmts(self, body);
+        }
+        Stmt::SpawnScope(body, _) => {
+            sec_stmts(self, body);
+        }
+        Stmt::Query(_, body, _) => {
+            sec_stmts(self, body);
+        }
+        Stmt::GradBlock(_, body, _) => {
+            sec_stmts(self, body);
+        }
         Stmt::Parallel(branches, _) => {
             var bi: i64 = 0;
             while bi < branches.len() {
@@ -664,23 +736,31 @@ fn sec_stmt(self: &mut SecrecyChecker, s: Stmt) {
                 ci = ci + 1;
             }
             match default {
-                OptStmts::Some(d) => { sec_stmts(self, d); }
-                OptStmts::None => {}
+                OptStmts::Some(d) => {
+                    sec_stmts(self, d);
+                }
+                OptStmts::None => {
+                }
             }
         }
-        Stmt::Do(_, _, args, _) => { sec_exprs(self, args); }
+        Stmt::Do(_, _, args, _) => {
+            sec_exprs(self, args);
+        }
         Stmt::Resume(cont, value, _) => {
             sec_expr(self, cont);
             sec_expr(self, value);
         }
-        Stmt::Backward(loss, _) => { sec_expr(self, loss); }
-        _ => {}
+        Stmt::Backward(loss, _) => {
+            sec_expr(self, loss);
+        }
+        _ => {
+        }
     }
 }
 
 // --- Expressions ----------------------------------------------------------
 
-fn sec_exprs(self: &mut SecrecyChecker, es: Vec<Expr>) -> Vec<Vec<i64>> {
+fn sec_exprs(self: & mut SecrecyChecker, es: Vec<Expr>) -> Vec<Vec<i64>> {
     var out: Vec<Vec<i64>> = Vec::new();
     var i: i64 = 0;
     while i < es.len() {
@@ -700,43 +780,86 @@ fn sec_union_all(ls: Vec<Vec<i64>>) -> Vec<i64> {
     return out;
 }
 
-fn sec_expr2(self: &mut SecrecyChecker, a: Box<Expr>, b: Box<Expr>) -> Vec<i64> {
+fn sec_expr2(self: & mut SecrecyChecker, a: Box<Expr>, b: Box<Expr>) -> Vec<i64> {
     var l: Vec<i64> = sec_expr(self, box_expr_deref(a));
     return sec_union(l, sec_expr(self, box_expr_deref(b)));
 }
 
-fn sec_expr(self: &mut SecrecyChecker, e: Expr) -> Vec<i64> {
+fn sec_expr(self: & mut SecrecyChecker, e: Expr) -> Vec<i64> {
     match e {
-        Expr::Ident(n) => { return sec_var(self, n); }
-        Expr::Binary(_, l, r) => { return sec_expr2(self, l, r); }
-        Expr::StrConcat(l, r) => { return sec_expr2(self, l, r); }
-        Expr::Range(l, r, _) => { return sec_expr2(self, l, r); }
-        Expr::Coalesce(l, r) => { return sec_expr2(self, l, r); }
-        Expr::PipeForward(l, r) => { return sec_expr2(self, l, r); }
-        Expr::Index(l, r) => { return sec_expr2(self, l, r); }
-        Expr::Unary(_, x) => { return sec_expr(self, box_expr_deref(x)); }
-        Expr::FieldAccess(x, _) => { return sec_expr(self, box_expr_deref(x)); }
-        Expr::OptionalFieldAccess(x, _) => { return sec_expr(self, box_expr_deref(x)); }
-        Expr::Ref(x, _) => { return sec_expr(self, box_expr_deref(x)); }
-        Expr::Deref(x) => { return sec_expr(self, box_expr_deref(x)); }
-        Expr::Try(x) => { return sec_expr(self, box_expr_deref(x)); }
-        Expr::IsCheck(x, _) => { return sec_expr(self, box_expr_deref(x)); }
-        Expr::Cast(x, _) => { return sec_expr(self, box_expr_deref(x)); }
-        Expr::QuantCast(x, _) => { return sec_expr(self, box_expr_deref(x)); }
-        Expr::Await(x) => { return sec_expr(self, box_expr_deref(x)); }
-        Expr::NamedArg(_, x) => { return sec_expr(self, box_expr_deref(x)); }
+        Expr::Ident(n) => {
+            return sec_var(self, n);
+        }
+        Expr::Binary(_, l, r) => {
+            return sec_expr2(self, l, r);
+        }
+        Expr::StrConcat(l, r) => {
+            return sec_expr2(self, l, r);
+        }
+        Expr::Range(l, r, _) => {
+            return sec_expr2(self, l, r);
+        }
+        Expr::Coalesce(l, r) => {
+            return sec_expr2(self, l, r);
+        }
+        Expr::PipeForward(l, r) => {
+            return sec_expr2(self, l, r);
+        }
+        Expr::Index(l, r) => {
+            return sec_expr2(self, l, r);
+        }
+        Expr::Unary(_, x) => {
+            return sec_expr(self, box_expr_deref(x));
+        }
+        Expr::FieldAccess(x, _) => {
+            return sec_expr(self, box_expr_deref(x));
+        }
+        Expr::OptionalFieldAccess(x, _) => {
+            return sec_expr(self, box_expr_deref(x));
+        }
+        Expr::Ref(x, _) => {
+            return sec_expr(self, box_expr_deref(x));
+        }
+        Expr::Deref(x) => {
+            return sec_expr(self, box_expr_deref(x));
+        }
+        Expr::Try(x) => {
+            return sec_expr(self, box_expr_deref(x));
+        }
+        Expr::IsCheck(x, _) => {
+            return sec_expr(self, box_expr_deref(x));
+        }
+        Expr::Cast(x, _) => {
+            return sec_expr(self, box_expr_deref(x));
+        }
+        Expr::QuantCast(x, _) => {
+            return sec_expr(self, box_expr_deref(x));
+        }
+        Expr::Await(x) => {
+            return sec_expr(self, box_expr_deref(x));
+        }
+        Expr::NamedArg(_, x) => {
+            return sec_expr(self, box_expr_deref(x));
+        }
         Expr::Spawn(x) => {
             var task: Expr = box_expr_deref(x);
             var sl: Vec<i64> = sec_expr(self, task);
             match task {
-                Expr::Call(_, args) => { sl = sec_union(sl, sec_union_all(sec_exprs(self, args))); }
-                _ => {}
+                Expr::Call(_, args) => {
+                    sl = sec_union(sl, sec_union_all(sec_exprs(self, args)));
+                }
+                _ => {
+                }
             }
             sec_sink(self, "another task (spawn)", sl, sec_pc(self));
             return sec_none();
         }
-        Expr::Call(callee, args) => { return sec_call(self, callee, args); }
-        Expr::MethodCall(receiver, method, args) => { return sec_method_call(self, box_expr_deref(receiver), method, args); }
+        Expr::Call(callee, args) => {
+            return sec_call(self, callee, args);
+        }
+        Expr::MethodCall(receiver, method, args) => {
+            return sec_method_call(self, box_expr_deref(receiver), method, args);
+        }
         Expr::StructLit(_, fields, spread) => {
             var fl: Vec<i64> = Vec::new();
             var fi: i64 = 0;
@@ -745,21 +868,33 @@ fn sec_expr(self: &mut SecrecyChecker, e: Expr) -> Vec<i64> {
                 fi = fi + 1;
             }
             match spread {
-                OptBoxExpr::Some(sp) => { fl = sec_union(fl, sec_expr(self, box_expr_deref(sp))); }
-                OptBoxExpr::None => {}
+                OptBoxExpr::Some(sp) => {
+                    fl = sec_union(fl, sec_expr(self, box_expr_deref(sp)));
+                }
+                OptBoxExpr::None => {
+                }
             }
             return fl;
         }
-        Expr::EnumLit(_, _, args) => { return sec_union_all(sec_exprs(self, args)); }
-        Expr::TupleLit(args) => { return sec_union_all(sec_exprs(self, args)); }
-        Expr::ArrayLit(_, args) => { return sec_union_all(sec_exprs(self, args)); }
+        Expr::EnumLit(_, _, args) => {
+            return sec_union_all(sec_exprs(self, args));
+        }
+        Expr::TupleLit(args) => {
+            return sec_union_all(sec_exprs(self, args));
+        }
+        Expr::ArrayLit(_, args) => {
+            return sec_union_all(sec_exprs(self, args));
+        }
         Expr::If(cond, then_block, else_block) => {
             var c: Vec<i64> = sec_expr(self, box_expr_deref(cond));
             sec_push_pc(self, c);
             var il: Vec<i64> = sec_stmts_value(self, then_block);
             match else_block {
-                OptStmts::Some(b) => { il = sec_union(il, sec_stmts_value(self, b)); }
-                OptStmts::None => {}
+                OptStmts::Some(b) => {
+                    il = sec_union(il, sec_stmts_value(self, b));
+                }
+                OptStmts::None => {
+                }
             }
             sec_pop_pc(self);
             return sec_union(il, c);
@@ -769,32 +904,43 @@ fn sec_expr(self: &mut SecrecyChecker, e: Expr) -> Vec<i64> {
             var ml: Vec<i64> = sec_arms(self, arms, s);
             return sec_union(ml, s);
         }
-        Expr::Block(b) => { return sec_stmts_value(self, b); }
-        Expr::TryBlock(b) => { return sec_stmts_value(self, b); }
-        Expr::Closure(params, body, _) => { return sec_closure(self, params, body); }
+        Expr::Block(b) => {
+            return sec_stmts_value(self, b);
+        }
+        Expr::TryBlock(b) => {
+            return sec_stmts_value(self, b);
+        }
+        Expr::Closure(params, body, _) => {
+            return sec_closure(self, params, body);
+        }
         Expr::FString(parts) => {
             var pl: Vec<i64> = Vec::new();
             var pi: i64 = 0;
             while pi < parts.len() {
                 var part: FStringPart = parts.get(pi);
                 match part {
-                    FStringPart::Expr(x2) => { pl = sec_union(pl, sec_expr(self, x2)); }
-                    FStringPart::Literal(_) => {}
+                    FStringPart::Expr(x2) => {
+                        pl = sec_union(pl, sec_expr(self, x2));
+                    }
+                    FStringPart::Literal(_) => {
+                    }
                 }
                 pi = pi + 1;
             }
             return pl;
         }
-        _ => { return sec_none(); }
+        _ => {
+            return sec_none();
+        }
     }
     return sec_none();
 }
 
-fn sec_closure(self: &mut SecrecyChecker, params: Vec<Param>, body: Vec<Stmt>) -> Vec<i64> {
+fn sec_closure(self: & mut SecrecyChecker, params: Vec<Param>, body: Vec<Stmt>) -> Vec<i64> {
     // The body runs where the closure is called; check it here with the
     // captured labels, and give the closure those labels.
     var used: Vec<str> = Vec::new();
-    esc_idents_stmts(body, &mut used);
+    esc_idents_stmts(body, & mut used);
     var captured: Vec<i64> = Vec::new();
     var ui: i64 = 0;
     while ui < used.len() {
@@ -802,7 +948,9 @@ fn sec_closure(self: &mut SecrecyChecker, params: Vec<Param>, body: Vec<Stmt>) -
         var is_param: bool = false;
         var pi: i64 = 0;
         while pi < params.len() {
-            if params.get(pi).name == name { is_param = true; }
+            if params.get(pi).name == name {
+                is_param = true;
+            }
             pi = pi + 1;
         }
         if !is_param && sec_has_var(self, name) {
@@ -826,7 +974,7 @@ fn sec_closure(self: &mut SecrecyChecker, params: Vec<Param>, body: Vec<Stmt>) -
     return captured;
 }
 
-fn sec_call(self: &mut SecrecyChecker, callee: str, args: Vec<Expr>) -> Vec<i64> {
+fn sec_call(self: & mut SecrecyChecker, callee: str, args: Vec<Expr>) -> Vec<i64> {
     var ls: Vec<Vec<i64>> = sec_exprs(self, args);
     var all: Vec<i64> = sec_union_all(ls);
     var pc: Vec<i64> = sec_pc(self);
@@ -850,22 +998,26 @@ fn sec_call(self: &mut SecrecyChecker, callee: str, args: Vec<Expr>) -> Vec<i64>
 }
 
 /// Apply callee `f`'s summary to argument labels `ls` (`ls[i]` is parameter `i`).
-fn sec_apply_summary(self: &mut SecrecyChecker, name: str, f: Func, summ: SecSummary, ls: Vec<Vec<i64>>, pc: Vec<i64>) -> Vec<i64> {
+fn sec_apply_summary(self: & mut SecrecyChecker, name: str, f: Func, summ: SecSummary, ls: Vec<Vec<i64>>, pc: Vec<i64>) -> Vec<i64> {
     var li: i64 = 0;
     while li < summ.leaks.len() {
         var i: i64 = summ.leaks.get(li);
         if i < ls.len() {
             var l: Vec<i64> = ls.get(i);
             var pname: str = "";
-            if i < f.params.len() { pname = f.params.get(i).name; }
-            if sec_has(l, -1) {
+            if i < f.params.len() {
+                pname = f.params.get(i).name;
+            }
+            if sec_has(l, - 1) {
                 sec_error(self, "@secret", "a secret value is passed to '" + name + "', which outputs its parameter '" + pname + "'");
-            } else if sec_has(l, -2) {
+            } else if sec_has(l, - 2) {
                 sec_error(self, "@sensitive", "a sensitive value is passed to '" + name + "', which outputs its parameter '" + pname + "'");
             }
             var oi: i64 = 0;
             while oi < l.len() {
-                if l.get(oi) >= 0 { sec_note_leak(self, l.get(oi)); }
+                if l.get(oi) >= 0 {
+                    sec_note_leak(self, l.get(oi));
+                }
                 oi = oi + 1;
             }
         }
@@ -873,14 +1025,16 @@ fn sec_apply_summary(self: &mut SecrecyChecker, name: str, f: Func, summ: SecSum
     }
     if summ.outputs {
         sec_note_output(self);
-        if sec_has(pc, -1) {
+        if sec_has(pc, - 1) {
             sec_error(self, "@secret", "'" + name + "' produces output and is called inside a branch or loop that depends on a secret");
-        } else if sec_has(pc, -2) {
+        } else if sec_has(pc, - 2) {
             sec_error(self, "@sensitive", "'" + name + "' produces output and is called inside a branch or loop that depends on sensitive data");
         }
         var pi: i64 = 0;
         while pi < pc.len() {
-            if pc.get(pi) >= 0 { sec_note_leak(self, pc.get(pi)); }
+            if pc.get(pi) >= 0 {
+                sec_note_leak(self, pc.get(pi));
+            }
             pi = pi + 1;
         }
     }
@@ -888,16 +1042,24 @@ fn sec_apply_summary(self: &mut SecrecyChecker, name: str, f: Func, summ: SecSum
     var ri: i64 = 0;
     while ri < summ.returns.len() {
         var r: i64 = summ.returns.get(ri);
-        if r < ls.len() { out = sec_union(out, ls.get(r)); }
+        if r < ls.len() {
+            out = sec_union(out, ls.get(r));
+        }
         ri = ri + 1;
     }
-    if sec_has_annotation(f.annotations, "secret") { out = sec_union(out, sec_one(-1)); }
-    if sec_has_annotation(f.annotations, "sensitive") { out = sec_union(out, sec_one(-2)); }
-    if sec_has_annotation(f.annotations, "declassify") { out = sec_none(); }
+    if sec_has_annotation(f.annotations, "secret") {
+        out = sec_union(out, sec_one(- 1));
+    }
+    if sec_has_annotation(f.annotations, "sensitive") {
+        out = sec_union(out, sec_one(- 2));
+    }
+    if sec_has_annotation(f.annotations, "declassify") {
+        out = sec_none();
+    }
     return out;
 }
 
-fn sec_method_call(self: &mut SecrecyChecker, receiver: Expr, method: str, args: Vec<Expr>) -> Vec<i64> {
+fn sec_method_call(self: & mut SecrecyChecker, receiver: Expr, method: str, args: Vec<Expr>) -> Vec<i64> {
     var recv: Vec<i64> = sec_expr(self, receiver);
     var ls: Vec<Vec<i64>> = Vec::new();
     ls.push(recv);
@@ -911,11 +1073,15 @@ fn sec_method_call(self: &mut SecrecyChecker, receiver: Expr, method: str, args:
     var pc: Vec<i64> = sec_pc(self);
     var keys: Vec<str> = Vec::new();
     var mslot: i64 = HashMap_get(self.method_index, method);
-    if mslot != 0 { keys = self.method_keys.get(mslot - 1); }
+    if mslot != 0 {
+        keys = self.method_keys.get(mslot - 1);
+    }
     // A method may store its arguments into its receiver.
     if !sec_read_only_method(method) {
         var stored: Vec<i64> = sec_union(sec_union_all(argls), pc);
-        if stored.len() > 0 { sec_store_place(self, receiver, stored); }
+        if stored.len() > 0 {
+            sec_store_place(self, receiver, stored);
+        }
     }
     if keys.len() == 0 {
         if method == "send" {
@@ -946,15 +1112,17 @@ pub fn secrecy_check(program: Program) -> Vec<str> {
 // the reporting pass skips bodies in the skip set.
 pub fn secrecy_check_skipped(program: Program, skip: i64) -> Vec<str> {
     // Every label starts at an @secret annotation: none parsed, none to track.
-    if !parser_saw_secret() { return Vec::new(); }
+    if !parser_saw_secret() {
+        return Vec::new();
+    }
     var c: SecrecyChecker = SecrecyChecker_new(program);
-    var before: i64 = -1;
-    while before != sec_summary_total(&c) {
-        before = sec_summary_total(&c);
+    var before: i64 = - 1;
+    while before != sec_summary_total(& c) {
+        before = sec_summary_total(& c);
         var i: i64 = 0;
         while i < c.all.len() {
             var sf: SecFunc = c.all.get(i);
-            sec_analyze_func(&mut c, sf.key, sf.func);
+            sec_analyze_func(& mut c, sf.key, sf.func);
             i = i + 1;
         }
     }
@@ -963,7 +1131,7 @@ pub fn secrecy_check_skipped(program: Program, skip: i64) -> Vec<str> {
     while j < c.all.len() {
         var sf2: SecFunc = c.all.get(j);
         if skip == 0 || !HashMap_contains(skip, sf2.skey) {
-            sec_analyze_func(&mut c, sf2.key, sf2.func);
+            sec_analyze_func(& mut c, sf2.key, sf2.func);
         }
         j = j + 1;
     }

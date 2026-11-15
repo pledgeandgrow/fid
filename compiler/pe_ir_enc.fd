@@ -16,49 +16,13 @@
 //   - Shadow space: 32 bytes; stack 16-byte aligned before CALL
 
 module compiler::pe_ir_enc;
-
-use core;
-use vec;
-use string;
-
+ use core; use vec; use string;
 // ===========================================================================
 // Register ids (Reg / XmmReg in Rust)
 // ===========================================================================
 
-pub const PEIR_RAX: i64 = 0;
-pub const PEIR_RCX: i64 = 1;
-pub const PEIR_RDX: i64 = 2;
-pub const PEIR_RBX: i64 = 3;
-pub const PEIR_RSP: i64 = 4;
-pub const PEIR_RBP: i64 = 5;
-pub const PEIR_RSI: i64 = 6;
-pub const PEIR_RDI: i64 = 7;
-pub const PEIR_R8: i64 = 8;
-pub const PEIR_R9: i64 = 9;
-pub const PEIR_R10: i64 = 10;
-pub const PEIR_R11: i64 = 11;
-pub const PEIR_R12: i64 = 12;
-pub const PEIR_R13: i64 = 13;
-pub const PEIR_R14: i64 = 14;
-pub const PEIR_R15: i64 = 15;
-
-pub const XMM0: i64 = 0;
-pub const XMM1: i64 = 1;
-pub const XMM2: i64 = 2;
-pub const XMM3: i64 = 3;
-pub const XMM4: i64 = 4;
-pub const XMM5: i64 = 5;
-pub const XMM6: i64 = 6;
-pub const XMM7: i64 = 7;
-pub const XMM8: i64 = 8;
-pub const XMM9: i64 = 9;
-pub const XMM10: i64 = 10;
-pub const XMM11: i64 = 11;
-pub const XMM12: i64 = 12;
-pub const XMM13: i64 = 13;
-pub const XMM14: i64 = 14;
-pub const XMM15: i64 = 15;
-
+pub const PEIR_RAX: i64 = 0; pub const PEIR_RCX: i64 = 1; pub const PEIR_RDX: i64 = 2; pub const PEIR_RBX: i64 = 3; pub const PEIR_RSP: i64 = 4; pub const PEIR_RBP: i64 = 5; pub const PEIR_RSI: i64 = 6; pub const PEIR_RDI: i64 = 7; pub const PEIR_R8: i64 = 8; pub const PEIR_R9: i64 = 9; pub const PEIR_R10: i64 = 10; pub const PEIR_R11: i64 = 11; pub const PEIR_R12: i64 = 12; pub const PEIR_R13: i64 = 13; pub const PEIR_R14: i64 = 14; pub const PEIR_R15: i64 = 15;
+ pub const XMM0: i64 = 0; pub const XMM1: i64 = 1; pub const XMM2: i64 = 2; pub const XMM3: i64 = 3; pub const XMM4: i64 = 4; pub const XMM5: i64 = 5; pub const XMM6: i64 = 6; pub const XMM7: i64 = 7; pub const XMM8: i64 = 8; pub const XMM9: i64 = 9; pub const XMM10: i64 = 10; pub const XMM11: i64 = 11; pub const XMM12: i64 = 12; pub const XMM13: i64 = 13; pub const XMM14: i64 = 14; pub const XMM15: i64 = 15;
 /// Low 3 bits (ModR/M encoding) — Reg::code
 pub fn peir_reg_code(r: i64) -> i64 {
     return r & 7;
@@ -79,13 +43,10 @@ pub fn xmm_high(x: i64) -> bool {
 // ===========================================================================
 
 /// Relative jump/call (rel32): disp32 = target - (code_offset + 4)
-pub const PEIR_RELOC_REL32: i64 = 0;
-/// RIP-relative data access: disp32 = target_rva - (code_rva + 4)
+pub const PEIR_RELOC_REL32: i64 = 0;  /// RIP-relative data access: disp32 = target_rva - (code_rva + 4)
 /// (marker only — rip refs use PeirRipRef, not PeirReloc)
-pub const PEIR_RELOC_RIPREL32: i64 = 1;
-/// RIP-relative lea to a code label: disp32 = target_code - (code_offset + 4)
+pub const PEIR_RELOC_RIPREL32: i64 = 1;  /// RIP-relative lea to a code label: disp32 = target_code - (code_offset + 4)
 pub const PEIR_RELOC_LEALABEL: i64 = 2;
-
 /// Pending relocation — a location in code that needs to be patched
 /// after all labels are resolved
 pub struct PeirReloc {
@@ -98,7 +59,9 @@ pub struct PeirReloc {
 }
 
 pub fn PeirReloc_new(code_offset: i64, target_label: i64, kind: i64) -> PeirReloc {
-    return PeirReloc { code_offset: code_offset, target_label: target_label, kind: kind };
+    return PeirReloc {
+        code_offset: code_offset, target_label: target_label, kind: kind
+    };
 }
 
 /// Pending RIP-relative reference to .rdata section
@@ -110,7 +73,9 @@ pub struct PeirRipRef {
 }
 
 pub fn PeirRipRef_new(code_offset: i64, rdata_offset: i64) -> PeirRipRef {
-    return PeirRipRef { code_offset: code_offset, rdata_offset: rdata_offset };
+    return PeirRipRef {
+        code_offset: code_offset, rdata_offset: rdata_offset
+    };
 }
 
 // ===========================================================================
@@ -140,75 +105,93 @@ pub struct PeirEnc {
 
 pub fn PeirEnc_new() -> PeirEnc {
     return PeirEnc {
-        code: Vec::new(),
-        labels: Vec::new(),
-        pending_labels: Vec::new(),
-        pending_rip_refs: Vec::new(),
-        next_label: 0,
-        last_store_disp: 0,
-        last_store_reg: 0,
-        last_store_end: -1,
+        code: Vec::new(), labels: Vec::new(), pending_labels: Vec::new(), pending_rip_refs: Vec::new(), next_label: 0, last_store_disp: 0, last_store_reg: 0, last_store_end: - 1,
     };
 }
 
 /// Allocate a new label ID
-pub fn PeirEnc_alloc_label(self: &mut PeirEnc) -> i64 {
+pub fn PeirEnc_alloc_label(self: & mut PeirEnc) -> i64 {
     var id: i64 = self.next_label;
     self.next_label = self.next_label + 1;
-    self.labels.push(-1);
+    self.labels.push(- 1);
     return id;
 }
 
 /// Mark a label at the current code position
-pub fn PeirEnc_place_label(self: &mut PeirEnc, label: i64) -> void {
-    self.last_store_end = -1;
+pub fn PeirEnc_place_label(self: & mut PeirEnc, label: i64) -> void {
+    self.last_store_end = - 1;
     self.labels.set(label, self.code.len());
 }
 
 /// Align code output to a boundary using multi-byte NOPs.
-pub fn PeirEnc_align_to(self: &mut PeirEnc, boundary: i64) -> void {
-    if boundary == 0 { return; }
+pub fn PeirEnc_align_to(self: & mut PeirEnc, boundary: i64) -> void {
+    if boundary == 0 {
+        return;
+    }
     var cur: i64 = self.code.len();
     var rem: i64 = cur % boundary;
-    if rem == 0 { return; }
+    if rem == 0 {
+        return;
+    }
     var pad: i64 = boundary - rem;
     var remaining: i64 = pad;
     while remaining >= 8 {
         // NOPS[7]: 0F 1F 84 00 00 00 00 00
-        self.code.push(0x0F); self.code.push(0x1F); self.code.push(0x84);
-        self.code.push(0x00); self.code.push(0x00); self.code.push(0x00);
-        self.code.push(0x00); self.code.push(0x00);
+        self.code.push(0x0F);
+        self.code.push(0x1F);
+        self.code.push(0x84);
+        self.code.push(0x00);
+        self.code.push(0x00);
+        self.code.push(0x00);
+        self.code.push(0x00);
+        self.code.push(0x00);
         remaining = remaining - 8;
     }
     if remaining == 1 {
         self.code.push(0x90);
     } else if remaining == 2 {
-        self.code.push(0x66); self.code.push(0x90);
+        self.code.push(0x66);
+        self.code.push(0x90);
     } else if remaining == 3 {
-        self.code.push(0x0F); self.code.push(0x1F); self.code.push(0x00);
+        self.code.push(0x0F);
+        self.code.push(0x1F);
+        self.code.push(0x00);
     } else if remaining == 4 {
-        self.code.push(0x0F); self.code.push(0x1F); self.code.push(0x40);
+        self.code.push(0x0F);
+        self.code.push(0x1F);
+        self.code.push(0x40);
         self.code.push(0x00);
     } else if remaining == 5 {
-        self.code.push(0x0F); self.code.push(0x1F); self.code.push(0x44);
-        self.code.push(0x00); self.code.push(0x00);
+        self.code.push(0x0F);
+        self.code.push(0x1F);
+        self.code.push(0x44);
+        self.code.push(0x00);
+        self.code.push(0x00);
     } else if remaining == 6 {
-        self.code.push(0x66); self.code.push(0x0F); self.code.push(0x1F);
-        self.code.push(0x44); self.code.push(0x00); self.code.push(0x00);
+        self.code.push(0x66);
+        self.code.push(0x0F);
+        self.code.push(0x1F);
+        self.code.push(0x44);
+        self.code.push(0x00);
+        self.code.push(0x00);
     } else if remaining == 7 {
-        self.code.push(0x0F); self.code.push(0x1F); self.code.push(0x80);
-        self.code.push(0x00); self.code.push(0x00); self.code.push(0x00);
+        self.code.push(0x0F);
+        self.code.push(0x1F);
+        self.code.push(0x80);
+        self.code.push(0x00);
+        self.code.push(0x00);
+        self.code.push(0x00);
         self.code.push(0x00);
     }
 }
 
 /// Get current code offset
-pub fn PeirEnc_offset(self: &PeirEnc) -> i64 {
+pub fn PeirEnc_offset(self: & PeirEnc) -> i64 {
     return self.code.len();
 }
 
 /// Emit raw bytes (masked to 0..255)
-pub fn PeirEnc_emit(self: &mut PeirEnc, bytes: Vec<i64>) -> void {
+pub fn PeirEnc_emit(self: & mut PeirEnc, bytes: Vec<i64>) -> void {
     var i: i64 = 0;
     while i < bytes.len() {
         self.code.push(bytes.get(i) & 0xFF);
@@ -216,16 +199,16 @@ pub fn PeirEnc_emit(self: &mut PeirEnc, bytes: Vec<i64>) -> void {
     }
 }
 
-pub fn PeirEnc_emit_u8(self: &mut PeirEnc, b: i64) -> void {
+pub fn PeirEnc_emit_u8(self: & mut PeirEnc, b: i64) -> void {
     self.code.push(b & 0xFF);
 }
 
-pub fn PeirEnc_emit_u16(self: &mut PeirEnc, w: i64) -> void {
+pub fn PeirEnc_emit_u16(self: & mut PeirEnc, w: i64) -> void {
     self.code.push(w & 0xFF);
     self.code.push((w >> 8) & 0xFF);
 }
 
-pub fn PeirEnc_emit_u32(self: &mut PeirEnc, d: i64) -> void {
+pub fn PeirEnc_emit_u32(self: & mut PeirEnc, d: i64) -> void {
     self.code.push(d & 0xFF);
     self.code.push((d >> 8) & 0xFF);
     self.code.push((d >> 16) & 0xFF);
@@ -233,11 +216,11 @@ pub fn PeirEnc_emit_u32(self: &mut PeirEnc, d: i64) -> void {
 }
 
 /// emit_i32 — same little-endian byte layout as emit_u32
-pub fn PeirEnc_emit_i32(self: &mut PeirEnc, d: i64) -> void {
+pub fn PeirEnc_emit_i32(self: & mut PeirEnc, d: i64) -> void {
     PeirEnc_emit_u32(self, d);
 }
 
-pub fn PeirEnc_emit_u64(self: &mut PeirEnc, q: i64) -> void {
+pub fn PeirEnc_emit_u64(self: & mut PeirEnc, q: i64) -> void {
     self.code.push(q & 0xFF);
     self.code.push((q >> 8) & 0xFF);
     self.code.push((q >> 16) & 0xFF);
@@ -253,34 +236,42 @@ pub fn PeirEnc_emit_u64(self: &mut PeirEnc, q: i64) -> void {
 /// r: extends ModR/M.reg (dst register)
 /// x: extends SIB.index
 /// b: extends ModR/M.r/m or SIB.base or opcode reg
-pub fn PeirEnc_rex(self: &mut PeirEnc, w: bool, r: bool, x: bool, b: bool) -> void {
+pub fn PeirEnc_rex(self: & mut PeirEnc, w: bool, r: bool, x: bool, b: bool) -> void {
     var rex: i64 = 0x40;
-    if w { rex = rex | 0x08; }
-    if r { rex = rex | 0x04; }
-    if x { rex = rex | 0x02; }
-    if b { rex = rex | 0x01; }
+    if w {
+        rex = rex | 0x08;
+    }
+    if r {
+        rex = rex | 0x04;
+    }
+    if x {
+        rex = rex | 0x02;
+    }
+    if b {
+        rex = rex | 0x01;
+    }
     self.code.push(rex);
 }
 
 /// Emit REX.W prefix (64-bit operand, no extended regs)
-pub fn PeirEnc_rex_w(self: &mut PeirEnc) -> void {
+pub fn PeirEnc_rex_w(self: & mut PeirEnc) -> void {
     PeirEnc_rex(self, true, false, false, false);
 }
 
 /// Emit ModR/M byte
-pub fn PeirEnc_modrm(self: &mut PeirEnc, m: i64, reg: i64, rm: i64) -> void {
+pub fn PeirEnc_modrm(self: & mut PeirEnc, m: i64, reg: i64, rm: i64) -> void {
     self.code.push(((m & 3) << 6) | ((reg & 7) << 3) | (rm & 7));
 }
 
 /// Encode a register-to-register ModR/M (mod=11)
-pub fn PeirEnc_modrm_rr(self: &mut PeirEnc, reg: i64, rm: i64) -> void {
+pub fn PeirEnc_modrm_rr(self: & mut PeirEnc, reg: i64, rm: i64) -> void {
     PeirEnc_modrm(self, 3, peir_reg_code(reg), peir_reg_code(rm));
 }
 
 // ─── Common instruction encodings ───
 
 /// push r64
-pub fn PeirEnc_push(self: &mut PeirEnc, r: i64) -> void {
+pub fn PeirEnc_push(self: & mut PeirEnc, r: i64) -> void {
     if reg_ext(r) {
         PeirEnc_rex(self, false, false, false, true);
     }
@@ -288,7 +279,7 @@ pub fn PeirEnc_push(self: &mut PeirEnc, r: i64) -> void {
 }
 
 /// pop r64
-pub fn PeirEnc_pop(self: &mut PeirEnc, r: i64) -> void {
+pub fn PeirEnc_pop(self: & mut PeirEnc, r: i64) -> void {
     if reg_ext(r) {
         PeirEnc_rex(self, false, false, false, true);
     }
@@ -296,17 +287,17 @@ pub fn PeirEnc_pop(self: &mut PeirEnc, r: i64) -> void {
 }
 
 /// ret
-pub fn PeirEnc_ret(self: &mut PeirEnc) -> void {
+pub fn PeirEnc_ret(self: & mut PeirEnc) -> void {
     self.code.push(0xC3);
 }
 
 /// nop
-pub fn PeirEnc_nop(self: &mut PeirEnc) -> void {
+pub fn PeirEnc_nop(self: & mut PeirEnc) -> void {
     self.code.push(0x90);
 }
 
 /// ud2
-pub fn PeirEnc_ud2(self: &mut PeirEnc) -> void {
+pub fn PeirEnc_ud2(self: & mut PeirEnc) -> void {
     self.code.push(0x0F);
     self.code.push(0x0B);
 }
@@ -316,28 +307,34 @@ pub fn PeirEnc_ud2(self: &mut PeirEnc) -> void {
 // For register-to-register: ModR/M = 11 (mod) | reg (dst) | rm (src)
 
 /// Emit REX prefix for XMM register pair (dst, src)
-pub fn PeirEnc_rex_sse(self: &mut PeirEnc, dst: i64, src: i64) -> void {
+pub fn PeirEnc_rex_sse(self: & mut PeirEnc, dst: i64, src: i64) -> void {
     var w: bool = false;
     var r: bool = xmm_high(dst);
     var b: bool = xmm_high(src);
     if w || r || b {
         var rex: i64 = 0x40;
-        if w { rex = rex | 0x08; }
-        if r { rex = rex | 0x04; }
-        if b { rex = rex | 0x01; }
+        if w {
+            rex = rex | 0x08;
+        }
+        if r {
+            rex = rex | 0x04;
+        }
+        if b {
+            rex = rex | 0x01;
+        }
         self.code.push(rex);
     }
 }
 
 /// ModR/M byte for XMM reg-to-reg: 11 | dst_code | src_code
-pub fn PeirEnc_modrm_xmm(self: &mut PeirEnc, dst: i64, src: i64) -> void {
+pub fn PeirEnc_modrm_xmm(self: & mut PeirEnc, dst: i64, src: i64) -> void {
     var modrm: i64 = 0xC0 | ((dst & 7) << 3) | (src & 7);
     self.code.push(modrm);
 }
 
 /// addpd xmm_dst, xmm_src — SSE2 packed double add
 /// Encoding: 66 0F 58 ModR/M
-pub fn PeirEnc_addpd_rr(self: &mut PeirEnc, dst: i64, src: i64) -> void {
+pub fn PeirEnc_addpd_rr(self: & mut PeirEnc, dst: i64, src: i64) -> void {
     self.code.push(0x66);
     PeirEnc_rex_sse(self, dst, src);
     self.code.push(0x0F);
@@ -347,7 +344,7 @@ pub fn PeirEnc_addpd_rr(self: &mut PeirEnc, dst: i64, src: i64) -> void {
 
 /// subpd xmm_dst, xmm_src — SSE2 packed double subtract
 /// Encoding: 66 0F 5C ModR/M
-pub fn PeirEnc_subpd_rr(self: &mut PeirEnc, dst: i64, src: i64) -> void {
+pub fn PeirEnc_subpd_rr(self: & mut PeirEnc, dst: i64, src: i64) -> void {
     self.code.push(0x66);
     PeirEnc_rex_sse(self, dst, src);
     self.code.push(0x0F);
@@ -357,7 +354,7 @@ pub fn PeirEnc_subpd_rr(self: &mut PeirEnc, dst: i64, src: i64) -> void {
 
 /// mulpd xmm_dst, xmm_src — SSE2 packed double multiply
 /// Encoding: 66 0F 59 ModR/M
-pub fn PeirEnc_mulpd_rr(self: &mut PeirEnc, dst: i64, src: i64) -> void {
+pub fn PeirEnc_mulpd_rr(self: & mut PeirEnc, dst: i64, src: i64) -> void {
     self.code.push(0x66);
     PeirEnc_rex_sse(self, dst, src);
     self.code.push(0x0F);
@@ -367,7 +364,7 @@ pub fn PeirEnc_mulpd_rr(self: &mut PeirEnc, dst: i64, src: i64) -> void {
 
 /// divpd xmm_dst, xmm_src — SSE2 packed double divide
 /// Encoding: 66 0F 5E ModR/M
-pub fn PeirEnc_divpd_rr(self: &mut PeirEnc, dst: i64, src: i64) -> void {
+pub fn PeirEnc_divpd_rr(self: & mut PeirEnc, dst: i64, src: i64) -> void {
     self.code.push(0x66);
     PeirEnc_rex_sse(self, dst, src);
     self.code.push(0x0F);
@@ -377,7 +374,7 @@ pub fn PeirEnc_divpd_rr(self: &mut PeirEnc, dst: i64, src: i64) -> void {
 
 /// movapd xmm_dst, xmm_src — SSE2 move aligned packed double
 /// Encoding: 66 0F 28 ModR/M
-pub fn PeirEnc_movapd_rr(self: &mut PeirEnc, dst: i64, src: i64) -> void {
+pub fn PeirEnc_movapd_rr(self: & mut PeirEnc, dst: i64, src: i64) -> void {
     self.code.push(0x66);
     PeirEnc_rex_sse(self, dst, src);
     self.code.push(0x0F);
@@ -387,7 +384,7 @@ pub fn PeirEnc_movapd_rr(self: &mut PeirEnc, dst: i64, src: i64) -> void {
 
 /// movsd xmm_dst, xmm_src — SSE2 move scalar double
 /// Encoding: F2 0F 10 ModR/M
-pub fn PeirEnc_movsd_rr(self: &mut PeirEnc, dst: i64, src: i64) -> void {
+pub fn PeirEnc_movsd_rr(self: & mut PeirEnc, dst: i64, src: i64) -> void {
     self.code.push(0xF2);
     PeirEnc_rex_sse(self, dst, src);
     self.code.push(0x0F);
@@ -396,7 +393,7 @@ pub fn PeirEnc_movsd_rr(self: &mut PeirEnc, dst: i64, src: i64) -> void {
 }
 
 /// addpd xmm_dst, [rbp+disp] — SSE2 add from memory
-pub fn PeirEnc_addpd_mem_rbp(self: &mut PeirEnc, dst: i64, disp: i64) -> void {
+pub fn PeirEnc_addpd_mem_rbp(self: & mut PeirEnc, dst: i64, disp: i64) -> void {
     self.code.push(0x66);
     if xmm_high(dst) {
         var rex: i64 = 0x40 | 0x04;
@@ -415,14 +412,15 @@ pub fn PeirEnc_addpd_mem_rbp(self: &mut PeirEnc, dst: i64, disp: i64) -> void {
 }
 
 /// movapd [rbp+disp], xmm_src — SSE2 store to memory
-pub fn PeirEnc_movapd_mem_rbp(self: &mut PeirEnc, disp: i64, src: i64) -> void {
+pub fn PeirEnc_movapd_mem_rbp(self: & mut PeirEnc, disp: i64, src: i64) -> void {
     self.code.push(0x66);
     if xmm_high(src) {
         var rex: i64 = 0x40 | 0x01;
         self.code.push(rex);
     }
     self.code.push(0x0F);
-    self.code.push(0x29); // movapd m128, xmm
+    self.code.push(0x29);
+    // movapd m128, xmm
     if disp >= 0 - 128 && disp <= 127 {
         self.code.push(0x40 | ((src & 7) << 3) | 5);
         self.code.push(disp & 0xFF);
@@ -433,7 +431,7 @@ pub fn PeirEnc_movapd_mem_rbp(self: &mut PeirEnc, disp: i64, src: i64) -> void {
 }
 
 /// movapd xmm_dst, [rbp+disp] — SSE2 load from memory
-pub fn PeirEnc_movapd_rbp_reg(self: &mut PeirEnc, dst: i64, disp: i64) -> void {
+pub fn PeirEnc_movapd_rbp_reg(self: & mut PeirEnc, dst: i64, disp: i64) -> void {
     self.code.push(0x66);
     if xmm_high(dst) {
         var rex: i64 = 0x40 | 0x04;
@@ -456,12 +454,16 @@ pub fn PeirEnc_movapd_rbp_reg(self: &mut PeirEnc, dst: i64, disp: i64) -> void {
 
 /// Emit 2-byte VEX prefix for AVX instruction
 /// v_dst = destination XMM, v_src = source XMM (second operand)
-pub fn PeirEnc_vex2(self: &mut PeirEnc, dst: i64, src: i64, opcode_len: i64) -> void {
+pub fn PeirEnc_vex2(self: & mut PeirEnc, dst: i64, src: i64, opcode_len: i64) -> void {
     // C5 [R.vvvv:1=L'.0 | R:1=~R | V:4=~vvvv]
     // For 2-byte VEX: implied 0F leading opcode byte
     var r_bit: i64 = 1;
-    if xmm_high(dst) { r_bit = 0; } // inverted
-    var vvvv: i64 = (~(src & 0x0F)) & 0x0F; // inverted
+    if xmm_high(dst) {
+        r_bit = 0;
+    }
+    // inverted
+    var vvvv: i64 = (~(src & 0x0F)) & 0x0F;
+    // inverted
     var vex_byte: i64 = 0xC0 | (r_bit << 7) | (vvvv << 3);
     self.code.push(0xC5);
     self.code.push(vex_byte);
@@ -469,7 +471,7 @@ pub fn PeirEnc_vex2(self: &mut PeirEnc, dst: i64, src: i64, opcode_len: i64) -> 
 
 /// vaddpd xmm_dst, xmm_src1, xmm_src2 — AVX packed double add
 /// Encoding: C5 [vex] 58 ModR/M
-pub fn PeirEnc_vaddpd_rr(self: &mut PeirEnc, dst: i64, src1: i64, src2: i64) -> void {
+pub fn PeirEnc_vaddpd_rr(self: & mut PeirEnc, dst: i64, src1: i64, src2: i64) -> void {
     PeirEnc_vex2(self, dst, src1, 1);
     self.code.push(0x58);
     // ModR/M: 11 | dst | src2
@@ -480,7 +482,7 @@ pub fn PeirEnc_vaddpd_rr(self: &mut PeirEnc, dst: i64, src1: i64, src2: i64) -> 
 }
 
 /// vmulpd xmm_dst, xmm_src1, xmm_src2 — AVX packed double multiply
-pub fn PeirEnc_vmulpd_rr(self: &mut PeirEnc, dst: i64, src1: i64, src2: i64) -> void {
+pub fn PeirEnc_vmulpd_rr(self: & mut PeirEnc, dst: i64, src1: i64, src2: i64) -> void {
     PeirEnc_vex2(self, dst, src1, 1);
     self.code.push(0x59);
     var modrm: i64 = 0xC0 | ((dst & 7) << 3) | (src2 & 7);
@@ -488,7 +490,7 @@ pub fn PeirEnc_vmulpd_rr(self: &mut PeirEnc, dst: i64, src1: i64, src2: i64) -> 
 }
 
 /// mov r64, imm64 (10 bytes)
-pub fn PeirEnc_mov_imm64(self: &mut PeirEnc, r: i64, val: i64) -> void {
+pub fn PeirEnc_mov_imm64(self: & mut PeirEnc, r: i64, val: i64) -> void {
     PeirEnc_rex(self, true, false, false, reg_ext(r));
     self.code.push(0xB8 + peir_reg_code(r));
     PeirEnc_emit_u64(self, val);
@@ -496,9 +498,11 @@ pub fn PeirEnc_mov_imm64(self: &mut PeirEnc, r: i64, val: i64) -> void {
 
 /// mov r64, imm in its shortest form: mov r32 (zero-extends), imm32
 /// sign-extended, or movabs. Flags are left alone.
-pub fn PeirEnc_mov_imm(self: &mut PeirEnc, r: i64, val: i64) -> void {
+pub fn PeirEnc_mov_imm(self: & mut PeirEnc, r: i64, val: i64) -> void {
     if val >= 0 && val <= 0xFFFFFFFF {
-        if reg_ext(r) { self.code.push(0x41); }
+        if reg_ext(r) {
+            self.code.push(0x41);
+        }
         self.code.push(0xB8 + peir_reg_code(r));
         PeirEnc_emit_u32(self, val);
     } else if val >= 0 - 2147483648 && val <= 2147483647 {
@@ -509,7 +513,7 @@ pub fn PeirEnc_mov_imm(self: &mut PeirEnc, r: i64, val: i64) -> void {
 }
 
 /// mov r64, imm32 (sign-extended, 7 bytes)
-pub fn PeirEnc_mov_imm32(self: &mut PeirEnc, r: i64, val: i64) -> void {
+pub fn PeirEnc_mov_imm32(self: & mut PeirEnc, r: i64, val: i64) -> void {
     PeirEnc_rex(self, true, false, false, reg_ext(r));
     self.code.push(0xC7);
     PeirEnc_modrm(self, 3, 0, peir_reg_code(r));
@@ -517,7 +521,7 @@ pub fn PeirEnc_mov_imm32(self: &mut PeirEnc, r: i64, val: i64) -> void {
 }
 
 /// mov r64, r64
-pub fn PeirEnc_mov_rr(self: &mut PeirEnc, dst: i64, src: i64) -> void {
+pub fn PeirEnc_mov_rr(self: & mut PeirEnc, dst: i64, src: i64) -> void {
     PeirEnc_rex(self, true, reg_ext(src), false, reg_ext(dst));
     self.code.push(0x89);
     PeirEnc_modrm_rr(self, src, dst);
@@ -527,24 +531,30 @@ pub fn PeirEnc_mov_rr(self: &mut PeirEnc, dst: i64, src: i64) -> void {
 // PEIR_REG_SLOT). Values are read and written through mov_reg_mem_rbp and
 // mov_mem_rbp_reg, so every instruction works on a register value unchanged;
 // anything else that takes an offset must not get one (emit_mem_rbp panics).
-pub const PEIR_REG_SLOT: i64 = 0x7F000000;
-pub const PEIR_VALUE_REGS: i64 = 7;
-/// Value registers 7 and 8 are r10 and r11: caller-saved, so only a value
+pub const PEIR_REG_SLOT: i64 = 0x7F000000; pub const PEIR_VALUE_REGS: i64 = 7;  /// Value registers 7 and 8 are r10 and r11: caller-saved, so only a value
 /// whose live range has no call (and nothing else that uses them) gets one
 /// (competitive OP16).
-pub const PEIR_ALL_REGS: i64 = 9;
-/// A frame offset at or above this names xmm register (offset -
+pub const PEIR_ALL_REGS: i64 = 9;  /// A frame offset at or above this names xmm register (offset -
 /// PEIR_XMM_SLOT): an f64 value kept in a register (competitive OP17).
 pub const PEIR_XMM_SLOT: i64 = 0x7F000100;
-
 /// The registers that hold values instead of stack slots: seven
 /// callee-saved ones, then r10 and r11.
 pub fn peir_value_reg(i: i64) -> i64 {
-    if i == 0 { return PEIR_RBX; }
-    if i == 1 { return PEIR_RSI; }
-    if i == 2 { return PEIR_RDI; }
-    if i == 7 { return PEIR_R10; }
-    if i == 8 { return PEIR_R11; }
+    if i == 0 {
+        return PEIR_RBX;
+    }
+    if i == 1 {
+        return PEIR_RSI;
+    }
+    if i == 2 {
+        return PEIR_RDI;
+    }
+    if i == 7 {
+        return PEIR_R10;
+    }
+    if i == 8 {
+        return PEIR_R11;
+    }
     return PEIR_R12 + i - 3;
 }
 
@@ -553,7 +563,7 @@ pub fn peir_is_xmm_slot(disp: i64) -> bool {
 }
 
 /// movq r64, xmm
-pub fn PeirEnc_movq_r64_xmm(self: &mut PeirEnc, r: i64, xmm: i64) -> void {
+pub fn PeirEnc_movq_r64_xmm(self: & mut PeirEnc, r: i64, xmm: i64) -> void {
     self.code.push(0x66);
     PeirEnc_rex(self, true, false, false, reg_ext(r));
     self.code.push(0x0F);
@@ -562,7 +572,7 @@ pub fn PeirEnc_movq_r64_xmm(self: &mut PeirEnc, r: i64, xmm: i64) -> void {
 }
 
 /// movdqu [rbp + disp], xmm (a callee-saved xmm register, all 128 bits)
-pub fn PeirEnc_movdqu_mem_rbp_xmm(self: &mut PeirEnc, disp: i64, xmm: i64) -> void {
+pub fn PeirEnc_movdqu_mem_rbp_xmm(self: & mut PeirEnc, disp: i64, xmm: i64) -> void {
     self.code.push(0xF3);
     self.code.push(0x0F);
     self.code.push(0x7F);
@@ -570,7 +580,7 @@ pub fn PeirEnc_movdqu_mem_rbp_xmm(self: &mut PeirEnc, disp: i64, xmm: i64) -> vo
 }
 
 /// movdqu xmm, [rbp + disp]
-pub fn PeirEnc_movdqu_xmm_mem_rbp(self: &mut PeirEnc, xmm: i64, disp: i64) -> void {
+pub fn PeirEnc_movdqu_xmm_mem_rbp(self: & mut PeirEnc, xmm: i64, disp: i64) -> void {
     self.code.push(0xF3);
     self.code.push(0x0F);
     self.code.push(0x6F);
@@ -578,9 +588,9 @@ pub fn PeirEnc_movdqu_xmm_mem_rbp(self: &mut PeirEnc, xmm: i64, disp: i64) -> vo
 }
 
 /// cmp r64, imm (the 8-bit form when it fits)
-pub fn PeirEnc_cmp_r_imm(self: &mut PeirEnc, r: i64, imm: i64) -> void {
+pub fn PeirEnc_cmp_r_imm(self: & mut PeirEnc, r: i64, imm: i64) -> void {
     PeirEnc_rex(self, true, false, false, reg_ext(r));
-    if imm >= -128 && imm <= 127 {
+    if imm >= - 128 && imm <= 127 {
         self.code.push(0x83);
         PeirEnc_modrm(self, 3, 7, peir_reg_code(r));
         self.code.push(imm & 0xFF);
@@ -592,8 +602,8 @@ pub fn PeirEnc_cmp_r_imm(self: &mut PeirEnc, r: i64, imm: i64) -> void {
 }
 
 /// add r64, imm (the 8-bit form when it fits)
-pub fn PeirEnc_add_r_imm(self: &mut PeirEnc, r: i64, imm: i64) -> void {
-    if imm >= -128 && imm <= 127 {
+pub fn PeirEnc_add_r_imm(self: & mut PeirEnc, r: i64, imm: i64) -> void {
+    if imm >= - 128 && imm <= 127 {
         PeirEnc_add_r_i8(self, r, imm);
     } else {
         PeirEnc_add_r_i32(self, r, imm);
@@ -601,8 +611,8 @@ pub fn PeirEnc_add_r_imm(self: &mut PeirEnc, r: i64, imm: i64) -> void {
 }
 
 /// imul dst, src, imm (the 8-bit form when it fits)
-pub fn PeirEnc_imul_r_r_imm(self: &mut PeirEnc, dst: i64, src: i64, imm: i64) -> void {
-    if imm >= -128 && imm <= 127 {
+pub fn PeirEnc_imul_r_r_imm(self: & mut PeirEnc, dst: i64, src: i64, imm: i64) -> void {
+    if imm >= - 128 && imm <= 127 {
         PeirEnc_rex(self, true, reg_ext(dst), false, reg_ext(src));
         self.code.push(0x6B);
         PeirEnc_modrm_rr(self, dst, src);
@@ -613,21 +623,29 @@ pub fn PeirEnc_imul_r_r_imm(self: &mut PeirEnc, dst: i64, src: i64, imm: i64) ->
 }
 
 /// lea dst, [base + disp]
-pub fn PeirEnc_lea_base_disp(self: &mut PeirEnc, dst: i64, base: i64, disp: i64) -> void {
+pub fn PeirEnc_lea_base_disp(self: & mut PeirEnc, dst: i64, base: i64, disp: i64) -> void {
     PeirEnc_rex(self, true, reg_ext(dst), false, reg_ext(base));
     self.code.push(0x8D);
     var bc: i64 = peir_reg_code(base);
-    var small: bool = disp >= -128 && disp <= 127;
+    var small: bool = disp >= - 128 && disp <= 127;
     var m: i64 = 2;
-    if small { m = 1; }
+    if small {
+        m = 1;
+    }
     PeirEnc_modrm(self, m, peir_reg_code(dst), bc);
     // rsp and r12 as a base need a SIB byte
-    if bc == 4 { self.code.push(0x24); }
-    if small { self.code.push(disp & 0xFF); } else { PeirEnc_emit_i32(self, disp); }
+    if bc == 4 {
+        self.code.push(0x24);
+    }
+    if small {
+        self.code.push(disp & 0xFF);
+    } else {
+        PeirEnc_emit_i32(self, disp);
+    }
 }
 
 /// lea dst, [base + index * (1 << scale)]
-pub fn PeirEnc_lea_base_index(self: &mut PeirEnc, dst: i64, base: i64, index: i64, scale: i64) -> void {
+pub fn PeirEnc_lea_base_index(self: & mut PeirEnc, dst: i64, base: i64, index: i64, scale: i64) -> void {
     PeirEnc_rex(self, true, reg_ext(dst), reg_ext(index), reg_ext(base));
     self.code.push(0x8D);
     var bc: i64 = peir_reg_code(base);
@@ -645,12 +663,16 @@ pub fn PeirEnc_lea_base_index(self: &mut PeirEnc, dst: i64, base: i64, index: i6
 /// A 64-bit instruction `opcode` with a memory operand [base + disp], or
 /// [base + index*8 + disp] when index >= 0; `reg` is the ModRM reg field
 /// (a register, or an opcode extension when `reg_is_reg` is false).
-pub fn PeirEnc_mem_op(self: &mut PeirEnc, opcode: i64, reg: i64, reg_is_reg: bool, base: i64, index: i64, disp: i64) -> void {
+pub fn PeirEnc_mem_op(self: & mut PeirEnc, opcode: i64, reg: i64, reg_is_reg: bool, base: i64, index: i64, disp: i64) -> void {
     PeirEnc_rex(self, true, reg_is_reg && reg_ext(reg), index >= 0 && reg_ext(index), reg_ext(base));
     self.code.push(opcode);
     var bc: i64 = peir_reg_code(base);
     var m: i64 = 2;
-    if disp == 0 && bc != 5 { m = 0; } else if disp >= -128 && disp <= 127 { m = 1; }
+    if disp == 0 && bc != 5 {
+        m = 0;
+    } else if disp >= - 128 && disp <= 127 {
+        m = 1;
+    }
     var rf: i64 = reg & 7;
     if index >= 0 {
         PeirEnc_modrm(self, m, rf, 4);
@@ -661,12 +683,16 @@ pub fn PeirEnc_mem_op(self: &mut PeirEnc, opcode: i64, reg: i64, reg_is_reg: boo
     } else {
         PeirEnc_modrm(self, m, rf, bc);
     }
-    if m == 1 { self.code.push(disp & 0xFF); }
-    if m == 2 { PeirEnc_emit_i32(self, disp); }
+    if m == 1 {
+        self.code.push(disp & 0xFF);
+    }
+    if m == 2 {
+        PeirEnc_emit_i32(self, disp);
+    }
 }
 
 /// movzx r32, byte [base + index] (zero-extends into all of r64)
-pub fn PeirEnc_movzx_r_byte_idx(self: &mut PeirEnc, r: i64, base: i64, index: i64) -> void {
+pub fn PeirEnc_movzx_r_byte_idx(self: & mut PeirEnc, r: i64, base: i64, index: i64) -> void {
     if reg_ext(r) || reg_ext(index) || reg_ext(base) {
         PeirEnc_rex(self, false, reg_ext(r), reg_ext(index), reg_ext(base));
     }
@@ -676,7 +702,7 @@ pub fn PeirEnc_movzx_r_byte_idx(self: &mut PeirEnc, r: i64, base: i64, index: i6
 }
 
 /// mov byte [base + index], r8 (the low byte of r)
-pub fn PeirEnc_mov_byte_idx_r(self: &mut PeirEnc, base: i64, index: i64, r: i64) -> void {
+pub fn PeirEnc_mov_byte_idx_r(self: & mut PeirEnc, base: i64, index: i64, r: i64) -> void {
     // without a REX prefix, byte registers 4-7 are ah..bh, not spl..dil
     if reg_ext(r) || reg_ext(index) || reg_ext(base) || peir_reg_code(r) >= 4 {
         PeirEnc_rex(self, false, reg_ext(r), reg_ext(index), reg_ext(base));
@@ -686,7 +712,7 @@ pub fn PeirEnc_mov_byte_idx_r(self: &mut PeirEnc, base: i64, index: i64, r: i64)
 }
 
 /// ModRM + SIB of [base + index*1]
-fn PeirEnc_byte_idx_modrm(self: &mut PeirEnc, r: i64, base: i64, index: i64) -> void {
+fn PeirEnc_byte_idx_modrm(self: & mut PeirEnc, r: i64, base: i64, index: i64) -> void {
     var bc: i64 = peir_reg_code(base);
     if bc == 5 {
         PeirEnc_modrm(self, 1, r & 7, 4);
@@ -699,70 +725,74 @@ fn PeirEnc_byte_idx_modrm(self: &mut PeirEnc, r: i64, base: i64, index: i64) -> 
 }
 
 /// cmp r64, [base + disp]
-pub fn PeirEnc_cmp_r_mem(self: &mut PeirEnc, r: i64, base: i64, disp: i64) -> void {
-    PeirEnc_mem_op(self, 0x3B, r, true, base, -1, disp);
+pub fn PeirEnc_cmp_r_mem(self: & mut PeirEnc, r: i64, base: i64, disp: i64) -> void {
+    PeirEnc_mem_op(self, 0x3B, r, true, base, - 1, disp);
 }
 
 /// cmp qword [base + disp], imm8
-pub fn PeirEnc_cmp_mem_imm8(self: &mut PeirEnc, base: i64, disp: i64, imm: i64) -> void {
-    PeirEnc_mem_op(self, 0x83, 7, false, base, -1, disp);
+pub fn PeirEnc_cmp_mem_imm8(self: & mut PeirEnc, base: i64, disp: i64, imm: i64) -> void {
+    PeirEnc_mem_op(self, 0x83, 7, false, base, - 1, disp);
     self.code.push(imm & 0xFF);
 }
 
 /// or r64, [base + disp]
-pub fn PeirEnc_or_r_mem(self: &mut PeirEnc, r: i64, base: i64, disp: i64) -> void {
-    PeirEnc_mem_op(self, 0x0B, r, true, base, -1, disp);
+pub fn PeirEnc_or_r_mem(self: & mut PeirEnc, r: i64, base: i64, disp: i64) -> void {
+    PeirEnc_mem_op(self, 0x0B, r, true, base, - 1, disp);
 }
 
 /// mov r64, [base + index*8]
-pub fn PeirEnc_mov_r_idx8(self: &mut PeirEnc, r: i64, base: i64, index: i64) -> void {
+pub fn PeirEnc_mov_r_idx8(self: & mut PeirEnc, r: i64, base: i64, index: i64) -> void {
     PeirEnc_mem_op(self, 0x8B, r, true, base, index, 0);
 }
 
 /// mov [base + index*8], r64
-pub fn PeirEnc_mov_idx8_r(self: &mut PeirEnc, base: i64, index: i64, r: i64) -> void {
+pub fn PeirEnc_mov_idx8_r(self: & mut PeirEnc, base: i64, index: i64, r: i64) -> void {
     PeirEnc_mem_op(self, 0x89, r, true, base, index, 0);
 }
 
 /// mov r64, [rbp + disp]
-pub fn PeirEnc_mov_reg_mem_rbp(self: &mut PeirEnc, dst: i64, disp: i64) -> void {
+pub fn PeirEnc_mov_reg_mem_rbp(self: & mut PeirEnc, dst: i64, disp: i64) -> void {
     if disp >= PEIR_XMM_SLOT {
-        self.last_store_end = -1;
+        self.last_store_end = - 1;
         PeirEnc_movq_r64_xmm(self, dst, disp - PEIR_XMM_SLOT);
         return;
     }
     if disp >= PEIR_REG_SLOT {
-        self.last_store_end = -1;
+        self.last_store_end = - 1;
         var src: i64 = peir_value_reg(disp - PEIR_REG_SLOT);
-        if dst != src { PeirEnc_mov_rr(self, dst, src); }
+        if dst != src {
+            PeirEnc_mov_rr(self, dst, src);
+        }
         return;
     }
     if self.last_store_end == self.code.len() && disp == self.last_store_disp {
         // The slot was just written from a register and nothing was emitted
         // since — forward the register, skip the reload.
-        self.last_store_end = -1;
+        self.last_store_end = - 1;
         if dst != self.last_store_reg {
             PeirEnc_mov_rr(self, dst, self.last_store_reg);
         }
         return;
     }
-    self.last_store_end = -1;
+    self.last_store_end = - 1;
     PeirEnc_rex(self, true, reg_ext(dst), false, false);
     self.code.push(0x8B);
     PeirEnc_emit_mem_rbp(self, peir_reg_code(dst), disp);
 }
 
 /// mov [rbp + disp], r64
-pub fn PeirEnc_mov_mem_rbp_reg(self: &mut PeirEnc, disp: i64, src: i64) -> void {
+pub fn PeirEnc_mov_mem_rbp_reg(self: & mut PeirEnc, disp: i64, src: i64) -> void {
     if disp >= PEIR_XMM_SLOT {
-        self.last_store_end = -1;
+        self.last_store_end = - 1;
         PeirEnc_movq_xmm_r64(self, disp - PEIR_XMM_SLOT, src);
         return;
     }
     if disp >= PEIR_REG_SLOT {
-        self.last_store_end = -1;
+        self.last_store_end = - 1;
         var rd: i64 = peir_value_reg(disp - PEIR_REG_SLOT);
-        if rd != src { PeirEnc_mov_rr(self, rd, src); }
+        if rd != src {
+            PeirEnc_mov_rr(self, rd, src);
+        }
         return;
     }
     PeirEnc_rex(self, true, reg_ext(src), false, false);
@@ -776,11 +806,14 @@ pub fn PeirEnc_mov_mem_rbp_reg(self: &mut PeirEnc, disp: i64, src: i64) -> void 
 /// Emit RBP-relative memory operand (ModR/M + optional SIB + displacement)
 /// For RBP base: mod=01 for disp8, mod=10 for disp32
 /// RBP with mod=00 means RIP-relative, so we always need a displacement.
-pub fn PeirEnc_emit_mem_rbp(self: &mut PeirEnc, regc: i64, disp: i64) -> void {
-    if disp >= PEIR_REG_SLOT { panic("pe_ir: a register value used as memory"); }
+pub fn PeirEnc_emit_mem_rbp(self: & mut PeirEnc, regc: i64, disp: i64) -> void {
+    if disp >= PEIR_REG_SLOT {
+        panic("pe_ir: a register value used as memory");
+    }
     if disp == 0 {
         // RBP with mod=00 is RIP-relative, so we must use disp8=0
-        PeirEnc_modrm(self, 1, regc, 5); // RBP = 5
+        PeirEnc_modrm(self, 1, regc, 5);
+        // RBP = 5
         self.code.push(0);
     } else if disp >= 0 - 128 && disp <= 127 {
         PeirEnc_modrm(self, 1, regc, 5);
@@ -792,7 +825,7 @@ pub fn PeirEnc_emit_mem_rbp(self: &mut PeirEnc, regc: i64, disp: i64) -> void {
 }
 
 /// Emit memory operand for [reg + disp] where reg is NOT RBP/RSP
-pub fn PeirEnc_emit_mem_reg(self: &mut PeirEnc, regc: i64, base: i64, disp: i64) -> void {
+pub fn PeirEnc_emit_mem_reg(self: & mut PeirEnc, regc: i64, base: i64, disp: i64) -> void {
     if peir_reg_code(base) == 4 {
         // RSP/R12 require SIB byte
         if disp == 0 {
@@ -823,101 +856,109 @@ pub fn PeirEnc_emit_mem_reg(self: &mut PeirEnc, regc: i64, base: i64, disp: i64)
 }
 
 /// lea r64, [rbp + disp32] — compute address of RBP-relative slot
-pub fn PeirEnc_lea_rbp(self: &mut PeirEnc, dst: i64, disp: i64) -> void {
+pub fn PeirEnc_lea_rbp(self: & mut PeirEnc, dst: i64, disp: i64) -> void {
     PeirEnc_rex(self, true, reg_ext(dst), false, false);
     self.code.push(0x8D);
     PeirEnc_emit_mem_rbp(self, peir_reg_code(dst), disp);
 }
 
 /// lea r64, [rip + rdata_offset] — RIP-relative, patched later
-pub fn PeirEnc_lea_rip(self: &mut PeirEnc, dst: i64, rdata_offset: i64) -> void {
+pub fn PeirEnc_lea_rip(self: & mut PeirEnc, dst: i64, rdata_offset: i64) -> void {
     PeirEnc_rex(self, true, reg_ext(dst), false, false);
     self.code.push(0x8D);
     // RIP-relative: mod=00, rm=101
     PeirEnc_modrm(self, 0, peir_reg_code(dst), 5);
     // Record pending RIP-relative reference
     self.pending_rip_refs.push(PeirRipRef_new(self.code.len(), rdata_offset));
-    PeirEnc_emit_i32(self, 0); // placeholder, patched later
+    PeirEnc_emit_i32(self, 0);
+    // placeholder, patched later
 }
 
 /// lea r64, [rip + disp32] — load address of a code label (for function ptrs)
-pub fn PeirEnc_lea_label(self: &mut PeirEnc, dst: i64, label: i64) -> void {
+pub fn PeirEnc_lea_label(self: & mut PeirEnc, dst: i64, label: i64) -> void {
     PeirEnc_rex(self, true, reg_ext(dst), false, false);
     self.code.push(0x8D);
     // RIP-relative: mod=00, rm=101
     PeirEnc_modrm(self, 0, peir_reg_code(dst), 5);
     self.pending_labels.push(PeirReloc_new(self.code.len(), label, PEIR_RELOC_LEALABEL));
-    PeirEnc_emit_i32(self, 0); // placeholder, patched later
+    PeirEnc_emit_i32(self, 0);
+    // placeholder, patched later
 }
 
 /// call [rip + rdata_offset] — call through IAT, patched later
-pub fn PeirEnc_call_rip(self: &mut PeirEnc, rdata_offset: i64) -> void {
+pub fn PeirEnc_call_rip(self: & mut PeirEnc, rdata_offset: i64) -> void {
     self.code.push(0xFF);
     // mod=00, reg=2 (CALL r/m64), rm=101 (RIP-relative)
     PeirEnc_modrm(self, 0, 2, 5);
     self.pending_rip_refs.push(PeirRipRef_new(self.code.len(), rdata_offset));
-    PeirEnc_emit_i32(self, 0); // placeholder
+    PeirEnc_emit_i32(self, 0);
+    // placeholder
 }
 
 /// mov r64, [rip + rdata_offset] — load from .rdata, patched later
-pub fn PeirEnc_mov_reg_rip(self: &mut PeirEnc, dst: i64, rdata_offset: i64) -> void {
+pub fn PeirEnc_mov_reg_rip(self: & mut PeirEnc, dst: i64, rdata_offset: i64) -> void {
     PeirEnc_rex(self, true, reg_ext(dst), false, false);
     self.code.push(0x8B);
     PeirEnc_modrm(self, 0, peir_reg_code(dst), 5);
     self.pending_rip_refs.push(PeirRipRef_new(self.code.len(), rdata_offset));
-    PeirEnc_emit_i32(self, 0); // placeholder, patched later
+    PeirEnc_emit_i32(self, 0);
+    // placeholder, patched later
 }
 
 /// mov [rip + rdata_offset], r64 — store to .rdata, patched later
-pub fn PeirEnc_mov_rip_reg(self: &mut PeirEnc, rdata_offset: i64, src: i64) -> void {
+pub fn PeirEnc_mov_rip_reg(self: & mut PeirEnc, rdata_offset: i64, src: i64) -> void {
     PeirEnc_rex(self, true, reg_ext(src), false, false);
     self.code.push(0x89);
     PeirEnc_modrm(self, 0, peir_reg_code(src), 5);
     self.pending_rip_refs.push(PeirRipRef_new(self.code.len(), rdata_offset));
-    PeirEnc_emit_i32(self, 0); // placeholder, patched later
+    PeirEnc_emit_i32(self, 0);
+    // placeholder, patched later
 }
 
 /// call rel32 — direct call to a local label
-pub fn PeirEnc_call_label(self: &mut PeirEnc, label: i64) -> void {
+pub fn PeirEnc_call_label(self: & mut PeirEnc, label: i64) -> void {
     self.code.push(0xE8);
     self.pending_labels.push(PeirReloc_new(self.code.len(), label, PEIR_RELOC_REL32));
-    PeirEnc_emit_i32(self, 0); // placeholder
+    PeirEnc_emit_i32(self, 0);
+    // placeholder
 }
 
 /// jmp rel32 — unconditional jump to a local label
-pub fn PeirEnc_jmp_label(self: &mut PeirEnc, label: i64) -> void {
+pub fn PeirEnc_jmp_label(self: & mut PeirEnc, label: i64) -> void {
     self.code.push(0xE9);
     self.pending_labels.push(PeirReloc_new(self.code.len(), label, PEIR_RELOC_REL32));
-    PeirEnc_emit_i32(self, 0); // placeholder
+    PeirEnc_emit_i32(self, 0);
+    // placeholder
 }
 
 /// jcc rel32 — conditional jump to a local label
 /// cc is the condition code (e.g., 0x0=jo, 0x4=je, 0x5=jne, etc.)
-pub fn PeirEnc_jcc_label(self: &mut PeirEnc, cc: i64, label: i64) -> void {
+pub fn PeirEnc_jcc_label(self: & mut PeirEnc, cc: i64, label: i64) -> void {
     self.code.push(0x0F);
     self.code.push((0x80 + cc) & 0xFF);
     self.pending_labels.push(PeirReloc_new(self.code.len(), label, PEIR_RELOC_REL32));
-    PeirEnc_emit_i32(self, 0); // placeholder
+    PeirEnc_emit_i32(self, 0);
+    // placeholder
 }
 
 // ─── Arithmetic instructions ───
 
 /// add r64, r64
-pub fn PeirEnc_add_rr(self: &mut PeirEnc, dst: i64, src: i64) -> void {
+pub fn PeirEnc_add_rr(self: & mut PeirEnc, dst: i64, src: i64) -> void {
     PeirEnc_rex(self, true, reg_ext(src), false, reg_ext(dst));
     self.code.push(0x01);
     PeirEnc_modrm_rr(self, src, dst);
 }
 
 /// sub r64, r64
-pub fn PeirEnc_sub_rr(self: &mut PeirEnc, dst: i64, src: i64) -> void {
+pub fn PeirEnc_sub_rr(self: & mut PeirEnc, dst: i64, src: i64) -> void {
     PeirEnc_rex(self, true, reg_ext(src), false, reg_ext(dst));
     self.code.push(0x29);
     PeirEnc_modrm_rr(self, src, dst);
 }
 
 /// imul r, r, imm32: OF is set as by imul r, r/m
-pub fn PeirEnc_imul_r_i32(self: &mut PeirEnc, r: i64, imm: i64) -> void {
+pub fn PeirEnc_imul_r_i32(self: & mut PeirEnc, r: i64, imm: i64) -> void {
     PeirEnc_rex(self, true, reg_ext(r), false, reg_ext(r));
     self.code.push(0x69);
     PeirEnc_modrm_rr(self, r, r);
@@ -925,7 +966,7 @@ pub fn PeirEnc_imul_r_i32(self: &mut PeirEnc, r: i64, imm: i64) -> void {
 }
 
 /// imul r64, r64
-pub fn PeirEnc_imul_rr(self: &mut PeirEnc, dst: i64, src: i64) -> void {
+pub fn PeirEnc_imul_rr(self: & mut PeirEnc, dst: i64, src: i64) -> void {
     PeirEnc_rex(self, true, reg_ext(dst), false, reg_ext(src));
     self.code.push(0x0F);
     self.code.push(0xAF);
@@ -933,56 +974,56 @@ pub fn PeirEnc_imul_rr(self: &mut PeirEnc, dst: i64, src: i64) -> void {
 }
 
 /// idiv r/m64
-pub fn PeirEnc_idiv_r(self: &mut PeirEnc, r: i64) -> void {
+pub fn PeirEnc_idiv_r(self: & mut PeirEnc, r: i64) -> void {
     PeirEnc_rex(self, true, false, false, reg_ext(r));
     self.code.push(0xF7);
     PeirEnc_modrm(self, 3, 7, peir_reg_code(r));
 }
 
 /// and r64, r64
-pub fn PeirEnc_and_rr(self: &mut PeirEnc, dst: i64, src: i64) -> void {
+pub fn PeirEnc_and_rr(self: & mut PeirEnc, dst: i64, src: i64) -> void {
     PeirEnc_rex(self, true, reg_ext(src), false, reg_ext(dst));
     self.code.push(0x21);
     PeirEnc_modrm_rr(self, src, dst);
 }
 
 /// or r64, r64
-pub fn PeirEnc_or_rr(self: &mut PeirEnc, dst: i64, src: i64) -> void {
+pub fn PeirEnc_or_rr(self: & mut PeirEnc, dst: i64, src: i64) -> void {
     PeirEnc_rex(self, true, reg_ext(src), false, reg_ext(dst));
     self.code.push(0x09);
     PeirEnc_modrm_rr(self, src, dst);
 }
 
 /// xor r64, r64
-pub fn PeirEnc_xor_rr(self: &mut PeirEnc, dst: i64, src: i64) -> void {
+pub fn PeirEnc_xor_rr(self: & mut PeirEnc, dst: i64, src: i64) -> void {
     PeirEnc_rex(self, true, reg_ext(src), false, reg_ext(dst));
     self.code.push(0x31);
     PeirEnc_modrm_rr(self, src, dst);
 }
 
 /// not r64
-pub fn PeirEnc_not_r(self: &mut PeirEnc, r: i64) -> void {
+pub fn PeirEnc_not_r(self: & mut PeirEnc, r: i64) -> void {
     PeirEnc_rex(self, true, false, false, reg_ext(r));
     self.code.push(0xF7);
     PeirEnc_modrm(self, 3, 2, peir_reg_code(r));
 }
 
 /// neg r64
-pub fn PeirEnc_neg_r(self: &mut PeirEnc, r: i64) -> void {
+pub fn PeirEnc_neg_r(self: & mut PeirEnc, r: i64) -> void {
     PeirEnc_rex(self, true, false, false, reg_ext(r));
     self.code.push(0xF7);
     PeirEnc_modrm(self, 3, 3, peir_reg_code(r));
 }
 
 /// cmp r64, r64
-pub fn PeirEnc_cmp_rr(self: &mut PeirEnc, left: i64, right: i64) -> void {
+pub fn PeirEnc_cmp_rr(self: & mut PeirEnc, left: i64, right: i64) -> void {
     PeirEnc_rex(self, true, reg_ext(left), false, reg_ext(right));
     self.code.push(0x3B);
     PeirEnc_modrm_rr(self, left, right);
 }
 
 /// cmp r8, imm8 (compare low byte of reg with immediate)
-pub fn PeirEnc_cmp_r8_i8(self: &mut PeirEnc, r: i64, val: i64) -> void {
+pub fn PeirEnc_cmp_r8_i8(self: & mut PeirEnc, r: i64, val: i64) -> void {
     var need_rex: bool = reg_ext(r) || peir_reg_code(r) >= 4;
     if need_rex {
         PeirEnc_rex(self, false, false, false, reg_ext(r));
@@ -993,21 +1034,21 @@ pub fn PeirEnc_cmp_r8_i8(self: &mut PeirEnc, r: i64, val: i64) -> void {
 }
 
 /// test r64, r64
-pub fn PeirEnc_test_rr(self: &mut PeirEnc, left: i64, right: i64) -> void {
+pub fn PeirEnc_test_rr(self: & mut PeirEnc, left: i64, right: i64) -> void {
     PeirEnc_rex(self, true, reg_ext(right), false, reg_ext(left));
     self.code.push(0x85);
     PeirEnc_modrm_rr(self, right, left);
 }
 
 /// shl r64, cl
-pub fn PeirEnc_shl_cl(self: &mut PeirEnc, r: i64) -> void {
+pub fn PeirEnc_shl_cl(self: & mut PeirEnc, r: i64) -> void {
     PeirEnc_rex(self, true, false, false, reg_ext(r));
     self.code.push(0xD3);
     PeirEnc_modrm(self, 3, 4, peir_reg_code(r));
 }
 
 /// shl r64, imm8
-pub fn PeirEnc_shl_r_i8(self: &mut PeirEnc, r: i64, count: i64) -> void {
+pub fn PeirEnc_shl_r_i8(self: & mut PeirEnc, r: i64, count: i64) -> void {
     PeirEnc_rex(self, true, false, false, reg_ext(r));
     self.code.push(0xC1);
     PeirEnc_modrm(self, 3, 4, peir_reg_code(r));
@@ -1015,49 +1056,50 @@ pub fn PeirEnc_shl_r_i8(self: &mut PeirEnc, r: i64, count: i64) -> void {
 }
 
 /// div r/m64 (unsigned divide RDX:RAX by operand, quotient RAX, rem RDX)
-pub fn PeirEnc_div_rr(self: &mut PeirEnc, src: i64) -> void {
+pub fn PeirEnc_div_rr(self: & mut PeirEnc, src: i64) -> void {
     PeirEnc_rex(self, true, false, false, reg_ext(src));
     self.code.push(0xF7);
     PeirEnc_modrm(self, 3, 6, peir_reg_code(src));
 }
 
 /// mul r/m64 (unsigned RDX:RAX = RAX * operand; OF and CF set when RDX != 0)
-pub fn PeirEnc_mul_r(self: &mut PeirEnc, src: i64) -> void {
+pub fn PeirEnc_mul_r(self: & mut PeirEnc, src: i64) -> void {
     PeirEnc_rex(self, true, false, false, reg_ext(src));
     self.code.push(0xF7);
     PeirEnc_modrm(self, 3, 4, peir_reg_code(src));
 }
 
 /// shr r64, cl
-pub fn PeirEnc_shr_cl(self: &mut PeirEnc, r: i64) -> void {
+pub fn PeirEnc_shr_cl(self: & mut PeirEnc, r: i64) -> void {
     PeirEnc_rex(self, true, false, false, reg_ext(r));
     self.code.push(0xD3);
     PeirEnc_modrm(self, 3, 5, peir_reg_code(r));
 }
 
 /// mov r32, r32 (zero-extends into the 64-bit register)
-pub fn PeirEnc_mov_r32_r32(self: &mut PeirEnc, dst: i64, src: i64) -> void {
+pub fn PeirEnc_mov_r32_r32(self: & mut PeirEnc, dst: i64, src: i64) -> void {
     PeirEnc_rex(self, false, reg_ext(src), false, reg_ext(dst));
     self.code.push(0x89);
     PeirEnc_modrm(self, 3, peir_reg_code(src), peir_reg_code(dst));
 }
 
 /// sar r64, cl
-pub fn PeirEnc_sar_cl(self: &mut PeirEnc, r: i64) -> void {
+pub fn PeirEnc_sar_cl(self: & mut PeirEnc, r: i64) -> void {
     PeirEnc_rex(self, true, false, false, reg_ext(r));
     self.code.push(0xD3);
     PeirEnc_modrm(self, 3, 7, peir_reg_code(r));
 }
 
 /// cqo (sign-extend RAX into RDX:RAX)
-pub fn PeirEnc_cqo(self: &mut PeirEnc) -> void {
+pub fn PeirEnc_cqo(self: & mut PeirEnc) -> void {
     PeirEnc_rex_w(self);
     self.code.push(0x99);
 }
 
 /// movzx r32, r/m8 (zero-extend byte to dword)
-pub fn PeirEnc_movzx_r32_r8(self: &mut PeirEnc, dst: i64, src: i64) -> void {
-    var need_rex: bool = reg_ext(dst) || reg_ext(src) || peir_reg_code(src) == 4; // RSP/SP needs REX
+pub fn PeirEnc_movzx_r32_r8(self: & mut PeirEnc, dst: i64, src: i64) -> void {
+    var need_rex: bool = reg_ext(dst) || reg_ext(src) || peir_reg_code(src) == 4;
+    // RSP/SP needs REX
     if need_rex {
         PeirEnc_rex(self, false, reg_ext(dst), false, reg_ext(src));
     }
@@ -1067,7 +1109,7 @@ pub fn PeirEnc_movzx_r32_r8(self: &mut PeirEnc, dst: i64, src: i64) -> void {
 }
 
 /// movzx r32, r16 (zero-extend word to dword)
-pub fn PeirEnc_movzx_r32_r16(self: &mut PeirEnc, dst: i64, src: i64) -> void {
+pub fn PeirEnc_movzx_r32_r16(self: & mut PeirEnc, dst: i64, src: i64) -> void {
     if reg_ext(dst) || reg_ext(src) {
         PeirEnc_rex(self, false, reg_ext(dst), false, reg_ext(src));
     }
@@ -1077,14 +1119,14 @@ pub fn PeirEnc_movzx_r32_r16(self: &mut PeirEnc, dst: i64, src: i64) -> void {
 }
 
 /// movsxd r64, r32 (sign-extend dword to qword)
-pub fn PeirEnc_movsxd_rr(self: &mut PeirEnc, dst: i64, src: i64) -> void {
+pub fn PeirEnc_movsxd_rr(self: & mut PeirEnc, dst: i64, src: i64) -> void {
     PeirEnc_rex(self, true, reg_ext(dst), false, reg_ext(src));
     self.code.push(0x63);
     PeirEnc_modrm_rr(self, dst, src);
 }
 
 /// movsx r64, r8 (sign-extend byte to qword)
-pub fn PeirEnc_movsx_r64_r8(self: &mut PeirEnc, dst: i64, src: i64) -> void {
+pub fn PeirEnc_movsx_r64_r8(self: & mut PeirEnc, dst: i64, src: i64) -> void {
     PeirEnc_rex(self, true, reg_ext(dst), false, reg_ext(src));
     self.code.push(0x0F);
     self.code.push(0xBE);
@@ -1092,7 +1134,7 @@ pub fn PeirEnc_movsx_r64_r8(self: &mut PeirEnc, dst: i64, src: i64) -> void {
 }
 
 /// movsx r64, r16 (sign-extend word to qword)
-pub fn PeirEnc_movsx_r64_r16(self: &mut PeirEnc, dst: i64, src: i64) -> void {
+pub fn PeirEnc_movsx_r64_r16(self: & mut PeirEnc, dst: i64, src: i64) -> void {
     PeirEnc_rex(self, true, reg_ext(dst), false, reg_ext(src));
     self.code.push(0x0F);
     self.code.push(0xBF);
@@ -1100,7 +1142,7 @@ pub fn PeirEnc_movsx_r64_r16(self: &mut PeirEnc, dst: i64, src: i64) -> void {
 }
 
 /// setcc r/m8 — set byte on condition
-pub fn PeirEnc_setcc_r(self: &mut PeirEnc, cc: i64, r: i64) -> void {
+pub fn PeirEnc_setcc_r(self: & mut PeirEnc, cc: i64, r: i64) -> void {
     if reg_ext(r) {
         PeirEnc_rex(self, false, false, false, true);
     }
@@ -1110,39 +1152,43 @@ pub fn PeirEnc_setcc_r(self: &mut PeirEnc, cc: i64, r: i64) -> void {
 }
 
 /// sub rsp, imm8
-pub fn PeirEnc_sub_rsp_i8(self: &mut PeirEnc, val: i64) -> void {
+pub fn PeirEnc_sub_rsp_i8(self: & mut PeirEnc, val: i64) -> void {
     PeirEnc_rex_w(self);
     self.code.push(0x83);
-    PeirEnc_modrm(self, 3, 5, 4); // /5 = sub, rm=RSP
+    PeirEnc_modrm(self, 3, 5, 4);
+    // /5 = sub, rm=RSP
     self.code.push(val & 0xFF);
 }
 
 /// sub rsp, imm32
-pub fn PeirEnc_sub_rsp_i32(self: &mut PeirEnc, val: i64) -> void {
+pub fn PeirEnc_sub_rsp_i32(self: & mut PeirEnc, val: i64) -> void {
     PeirEnc_rex_w(self);
     self.code.push(0x81);
-    PeirEnc_modrm(self, 3, 5, 4); // /5 = sub, rm=RSP
+    PeirEnc_modrm(self, 3, 5, 4);
+    // /5 = sub, rm=RSP
     PeirEnc_emit_i32(self, val);
 }
 
 /// add rsp, imm8
-pub fn PeirEnc_add_rsp_i8(self: &mut PeirEnc, val: i64) -> void {
+pub fn PeirEnc_add_rsp_i8(self: & mut PeirEnc, val: i64) -> void {
     PeirEnc_rex_w(self);
     self.code.push(0x83);
-    PeirEnc_modrm(self, 3, 0, 4); // /0 = add, rm=RSP
+    PeirEnc_modrm(self, 3, 0, 4);
+    // /0 = add, rm=RSP
     self.code.push(val & 0xFF);
 }
 
 /// add rsp, imm32
-pub fn PeirEnc_add_rsp_i32(self: &mut PeirEnc, val: i64) -> void {
+pub fn PeirEnc_add_rsp_i32(self: & mut PeirEnc, val: i64) -> void {
     PeirEnc_rex_w(self);
     self.code.push(0x81);
-    PeirEnc_modrm(self, 3, 0, 4); // /0 = add, rm=RSP
+    PeirEnc_modrm(self, 3, 0, 4);
+    // /0 = add, rm=RSP
     PeirEnc_emit_i32(self, val);
 }
 
 /// add r64, imm32
-pub fn PeirEnc_add_r_i32(self: &mut PeirEnc, r: i64, val: i64) -> void {
+pub fn PeirEnc_add_r_i32(self: & mut PeirEnc, r: i64, val: i64) -> void {
     PeirEnc_rex(self, true, false, false, reg_ext(r));
     self.code.push(0x81);
     PeirEnc_modrm(self, 3, 0, peir_reg_code(r));
@@ -1150,7 +1196,7 @@ pub fn PeirEnc_add_r_i32(self: &mut PeirEnc, r: i64, val: i64) -> void {
 }
 
 /// add r64, imm8
-pub fn PeirEnc_add_r_i8(self: &mut PeirEnc, r: i64, val: i64) -> void {
+pub fn PeirEnc_add_r_i8(self: & mut PeirEnc, r: i64, val: i64) -> void {
     PeirEnc_rex(self, true, false, false, reg_ext(r));
     self.code.push(0x83);
     PeirEnc_modrm(self, 3, 0, peir_reg_code(r));
@@ -1158,7 +1204,7 @@ pub fn PeirEnc_add_r_i8(self: &mut PeirEnc, r: i64, val: i64) -> void {
 }
 
 /// mov r8, imm8 (for byte stores)
-pub fn PeirEnc_mov_r8_imm(self: &mut PeirEnc, r: i64, val: i64) -> void {
+pub fn PeirEnc_mov_r8_imm(self: & mut PeirEnc, r: i64, val: i64) -> void {
     if reg_ext(r) {
         PeirEnc_rex(self, false, false, false, true);
     }
@@ -1167,7 +1213,7 @@ pub fn PeirEnc_mov_r8_imm(self: &mut PeirEnc, r: i64, val: i64) -> void {
 }
 
 /// mov r8b, [reg] (byte load through pointer, handles RBP/R13 and RSP/R12)
-pub fn PeirEnc_mov_reg8_mem(self: &mut PeirEnc, dst: i64, base: i64) -> void {
+pub fn PeirEnc_mov_reg8_mem(self: & mut PeirEnc, dst: i64, base: i64) -> void {
     var need_rex: bool = reg_ext(dst) || reg_ext(base) || peir_reg_code(dst) >= 4 || peir_reg_code(base) >= 4;
     if need_rex {
         PeirEnc_rex(self, false, reg_ext(dst), false, reg_ext(base));
@@ -1188,7 +1234,7 @@ pub fn PeirEnc_mov_reg8_mem(self: &mut PeirEnc, dst: i64, base: i64) -> void {
 }
 
 /// mov [reg], r8b (byte store through pointer, handles RBP/R13 and RSP/R12)
-pub fn PeirEnc_mov_mem_reg8_ptr(self: &mut PeirEnc, base: i64, src: i64) -> void {
+pub fn PeirEnc_mov_mem_reg8_ptr(self: & mut PeirEnc, base: i64, src: i64) -> void {
     var need_rex: bool = reg_ext(src) || reg_ext(base) || peir_reg_code(src) >= 4 || peir_reg_code(base) >= 4;
     if need_rex {
         PeirEnc_rex(self, false, reg_ext(src), false, reg_ext(base));
@@ -1209,7 +1255,7 @@ pub fn PeirEnc_mov_mem_reg8_ptr(self: &mut PeirEnc, base: i64, src: i64) -> void
 }
 
 /// mov [reg], r8 (byte store through pointer)
-pub fn PeirEnc_mov_mem_reg8(self: &mut PeirEnc, base: i64, src: i64) -> void {
+pub fn PeirEnc_mov_mem_reg8(self: & mut PeirEnc, base: i64, src: i64) -> void {
     var need_rex: bool = reg_ext(src) || reg_ext(base) || peir_reg_code(src) >= 4 || peir_reg_code(base) >= 4;
     if need_rex {
         PeirEnc_rex(self, false, reg_ext(src), false, reg_ext(base));
@@ -1218,14 +1264,15 @@ pub fn PeirEnc_mov_mem_reg8(self: &mut PeirEnc, base: i64, src: i64) -> void {
     if (peir_reg_code(base) & 7) == 4 {
         // RSP or R12: need SIB byte
         PeirEnc_modrm(self, 0, peir_reg_code(src), 4);
-        self.code.push(0x24); // SIB: scale=0, index=none, base=RSP/R12
+        self.code.push(0x24);
+        // SIB: scale=0, index=none, base=RSP/R12
     } else {
         PeirEnc_modrm(self, 0, peir_reg_code(src), peir_reg_code(base));
     }
 }
 
 /// mov [reg + disp], r8 (byte store with displacement)
-pub fn PeirEnc_mov_mem_disp_reg8(self: &mut PeirEnc, base: i64, disp: i64, src: i64) -> void {
+pub fn PeirEnc_mov_mem_disp_reg8(self: & mut PeirEnc, base: i64, disp: i64, src: i64) -> void {
     var need_rex: bool = reg_ext(src) || reg_ext(base) || peir_reg_code(src) >= 4 || peir_reg_code(base) >= 4;
     if need_rex {
         PeirEnc_rex(self, false, reg_ext(src), false, reg_ext(base));
@@ -1252,7 +1299,7 @@ pub fn PeirEnc_mov_mem_disp_reg8(self: &mut PeirEnc, base: i64, disp: i64, src: 
 }
 
 /// mov [reg + reg], r8 (byte store with index)
-pub fn PeirEnc_mov_mem_idx_reg8(self: &mut PeirEnc, base: i64, index: i64, src: i64) -> void {
+pub fn PeirEnc_mov_mem_idx_reg8(self: & mut PeirEnc, base: i64, index: i64, src: i64) -> void {
     PeirEnc_rex(self, false, reg_ext(src), reg_ext(index), reg_ext(base));
     self.code.push(0x88);
     // Use SIB: mod=00, reg=src, rm=100 (SIB follows)
@@ -1261,7 +1308,8 @@ pub fn PeirEnc_mov_mem_idx_reg8(self: &mut PeirEnc, base: i64, index: i64, src: 
     if peir_reg_code(base) == 5 {
         PeirEnc_modrm(self, 1, peir_reg_code(src), 4);
         self.code.push((0 << 6) | (peir_reg_code(index) << 3) | peir_reg_code(base));
-        self.code.push(0); // disp8 = 0
+        self.code.push(0);
+        // disp8 = 0
     } else {
         PeirEnc_modrm(self, 0, peir_reg_code(src), 4);
         self.code.push((0 << 6) | (peir_reg_code(index) << 3) | peir_reg_code(base));
@@ -1269,13 +1317,14 @@ pub fn PeirEnc_mov_mem_idx_reg8(self: &mut PeirEnc, base: i64, index: i64, src: 
 }
 
 /// mov r8, [reg + reg] (byte load with index)
-pub fn PeirEnc_mov_reg8_mem_idx(self: &mut PeirEnc, dst: i64, base: i64, index: i64) -> void {
+pub fn PeirEnc_mov_reg8_mem_idx(self: & mut PeirEnc, dst: i64, base: i64, index: i64) -> void {
     PeirEnc_rex(self, false, reg_ext(dst), reg_ext(index), reg_ext(base));
     self.code.push(0x8A);
     if peir_reg_code(base) == 5 {
         PeirEnc_modrm(self, 1, peir_reg_code(dst), 4);
         self.code.push((0 << 6) | (peir_reg_code(index) << 3) | peir_reg_code(base));
-        self.code.push(0); // disp8 = 0
+        self.code.push(0);
+        // disp8 = 0
     } else {
         PeirEnc_modrm(self, 0, peir_reg_code(dst), 4);
         self.code.push((0 << 6) | (peir_reg_code(index) << 3) | peir_reg_code(base));
@@ -1283,41 +1332,44 @@ pub fn PeirEnc_mov_reg8_mem_idx(self: &mut PeirEnc, dst: i64, base: i64, index: 
 }
 
 /// cmp byte [reg + reg], imm8
-pub fn PeirEnc_cmp_mem_idx_imm8(self: &mut PeirEnc, base: i64, index: i64, val: i64) -> void {
+pub fn PeirEnc_cmp_mem_idx_imm8(self: & mut PeirEnc, base: i64, index: i64, val: i64) -> void {
     PeirEnc_rex(self, false, false, reg_ext(index), reg_ext(base));
     self.code.push(0x80);
     if peir_reg_code(base) == 5 {
-        PeirEnc_modrm(self, 1, 7, 4); // /7 = cmp, rm=100 (SIB), mod=01 for RBP/R13
+        PeirEnc_modrm(self, 1, 7, 4);
+        // /7 = cmp, rm=100 (SIB), mod=01 for RBP/R13
         self.code.push((0 << 6) | (peir_reg_code(index) << 3) | peir_reg_code(base));
-        self.code.push(0); // disp8 = 0
+        self.code.push(0);
+        // disp8 = 0
     } else {
-        PeirEnc_modrm(self, 0, 7, 4); // /7 = cmp, rm=100 (SIB)
+        PeirEnc_modrm(self, 0, 7, 4);
+        // /7 = cmp, rm=100 (SIB)
         self.code.push((0 << 6) | (peir_reg_code(index) << 3) | peir_reg_code(base));
     }
     self.code.push(val & 0xFF);
 }
 
 /// inc r64
-pub fn PeirEnc_inc_r(self: &mut PeirEnc, r: i64) -> void {
+pub fn PeirEnc_inc_r(self: & mut PeirEnc, r: i64) -> void {
     PeirEnc_rex(self, true, false, false, reg_ext(r));
     self.code.push(0xFF);
     PeirEnc_modrm(self, 3, 0, peir_reg_code(r));
 }
 
 /// dec r64
-pub fn PeirEnc_dec_r(self: &mut PeirEnc, r: i64) -> void {
+pub fn PeirEnc_dec_r(self: & mut PeirEnc, r: i64) -> void {
     PeirEnc_rex(self, true, false, false, reg_ext(r));
     self.code.push(0xFF);
     PeirEnc_modrm(self, 3, 1, peir_reg_code(r));
 }
 
 /// xor r64, r64 (zero a register)
-pub fn PeirEnc_xor_self(self: &mut PeirEnc, r: i64) -> void {
+pub fn PeirEnc_xor_self(self: & mut PeirEnc, r: i64) -> void {
     PeirEnc_xor_rr(self, r, r);
 }
 
 /// mov rax, [reg] (load through pointer, 64-bit)
-pub fn PeirEnc_mov_reg_ptr(self: &mut PeirEnc, dst: i64, base: i64) -> void {
+pub fn PeirEnc_mov_reg_ptr(self: & mut PeirEnc, dst: i64, base: i64) -> void {
     PeirEnc_rex(self, true, reg_ext(dst), false, reg_ext(base));
     self.code.push(0x8B);
     if peir_reg_code(base) == 4 {
@@ -1334,7 +1386,7 @@ pub fn PeirEnc_mov_reg_ptr(self: &mut PeirEnc, dst: i64, base: i64) -> void {
 }
 
 /// mov [reg], r64 (store through pointer, 64-bit)
-pub fn PeirEnc_mov_ptr_reg(self: &mut PeirEnc, base: i64, src: i64) -> void {
+pub fn PeirEnc_mov_ptr_reg(self: & mut PeirEnc, base: i64, src: i64) -> void {
     PeirEnc_rex(self, true, reg_ext(src), false, reg_ext(base));
     self.code.push(0x89);
     if peir_reg_code(base) == 4 {
@@ -1349,7 +1401,7 @@ pub fn PeirEnc_mov_ptr_reg(self: &mut PeirEnc, base: i64, src: i64) -> void {
 }
 
 /// mov [reg], r32 (32-bit store through pointer, no REX.W)
-pub fn PeirEnc_mov_ptr_reg32(self: &mut PeirEnc, base: i64, src: i64) -> void {
+pub fn PeirEnc_mov_ptr_reg32(self: & mut PeirEnc, base: i64, src: i64) -> void {
     var need_rex: bool = reg_ext(src) || reg_ext(base);
     if need_rex {
         PeirEnc_rex(self, false, reg_ext(src), false, reg_ext(base));
@@ -1367,8 +1419,9 @@ pub fn PeirEnc_mov_ptr_reg32(self: &mut PeirEnc, base: i64, src: i64) -> void {
 }
 
 /// mov [reg], r16 (16-bit store through pointer, 0x66 prefix)
-pub fn PeirEnc_mov_ptr_reg16(self: &mut PeirEnc, base: i64, src: i64) -> void {
-    self.code.push(0x66); // operand-size override
+pub fn PeirEnc_mov_ptr_reg16(self: & mut PeirEnc, base: i64, src: i64) -> void {
+    self.code.push(0x66);
+    // operand-size override
     var need_rex: bool = reg_ext(src) || reg_ext(base);
     if need_rex {
         PeirEnc_rex(self, false, reg_ext(src), false, reg_ext(base));
@@ -1386,7 +1439,7 @@ pub fn PeirEnc_mov_ptr_reg16(self: &mut PeirEnc, base: i64, src: i64) -> void {
 }
 
 /// mov r8, [reg] (byte load through pointer)
-pub fn PeirEnc_mov_reg8_ptr(self: &mut PeirEnc, dst: i64, base: i64) -> void {
+pub fn PeirEnc_mov_reg8_ptr(self: & mut PeirEnc, dst: i64, base: i64) -> void {
     var need_rex: bool = reg_ext(dst) || reg_ext(base) || peir_reg_code(dst) >= 4 || peir_reg_code(base) >= 4;
     if need_rex {
         PeirEnc_rex(self, false, reg_ext(dst), false, reg_ext(base));
@@ -1404,7 +1457,7 @@ pub fn PeirEnc_mov_reg8_ptr(self: &mut PeirEnc, dst: i64, base: i64) -> void {
 }
 
 /// mov r32, [reg] (32-bit load through pointer, no REX.W)
-pub fn PeirEnc_mov_reg32_ptr(self: &mut PeirEnc, dst: i64, base: i64) -> void {
+pub fn PeirEnc_mov_reg32_ptr(self: & mut PeirEnc, dst: i64, base: i64) -> void {
     var need_rex: bool = reg_ext(dst) || reg_ext(base);
     if need_rex {
         PeirEnc_rex(self, false, reg_ext(dst), false, reg_ext(base));
@@ -1422,8 +1475,9 @@ pub fn PeirEnc_mov_reg32_ptr(self: &mut PeirEnc, dst: i64, base: i64) -> void {
 }
 
 /// mov r16, [reg] (16-bit load through pointer, 0x66 prefix)
-pub fn PeirEnc_mov_reg16_ptr(self: &mut PeirEnc, dst: i64, base: i64) -> void {
-    self.code.push(0x66); // operand-size override
+pub fn PeirEnc_mov_reg16_ptr(self: & mut PeirEnc, dst: i64, base: i64) -> void {
+    self.code.push(0x66);
+    // operand-size override
     var need_rex: bool = reg_ext(dst) || reg_ext(base);
     if need_rex {
         PeirEnc_rex(self, false, reg_ext(dst), false, reg_ext(base));
@@ -1441,35 +1495,39 @@ pub fn PeirEnc_mov_reg16_ptr(self: &mut PeirEnc, dst: i64, base: i64) -> void {
 }
 
 /// mov rax, [reg + reg*1] (load with index, 64-bit)
-pub fn PeirEnc_mov_reg_mem_idx(self: &mut PeirEnc, dst: i64, base: i64, index: i64) -> void {
+pub fn PeirEnc_mov_reg_mem_idx(self: & mut PeirEnc, dst: i64, base: i64, index: i64) -> void {
     PeirEnc_rex(self, true, reg_ext(dst), reg_ext(index), reg_ext(base));
     self.code.push(0x8B);
     if peir_reg_code(base) == 5 {
-        PeirEnc_modrm(self, 1, peir_reg_code(dst), 4); // SIB with disp8=0 for RBP/R13
+        PeirEnc_modrm(self, 1, peir_reg_code(dst), 4);
+        // SIB with disp8=0 for RBP/R13
         self.code.push((0 << 6) | (peir_reg_code(index) << 3) | peir_reg_code(base));
         self.code.push(0);
     } else {
-        PeirEnc_modrm(self, 0, peir_reg_code(dst), 4); // SIB
+        PeirEnc_modrm(self, 0, peir_reg_code(dst), 4);
+        // SIB
         self.code.push((0 << 6) | (peir_reg_code(index) << 3) | peir_reg_code(base));
     }
 }
 
 /// mov [reg + reg*1], r64 (store with index, 64-bit)
-pub fn PeirEnc_mov_mem_idx_reg(self: &mut PeirEnc, base: i64, index: i64, src: i64) -> void {
+pub fn PeirEnc_mov_mem_idx_reg(self: & mut PeirEnc, base: i64, index: i64, src: i64) -> void {
     PeirEnc_rex(self, true, reg_ext(src), reg_ext(index), reg_ext(base));
     self.code.push(0x89);
     if peir_reg_code(base) == 5 {
-        PeirEnc_modrm(self, 1, peir_reg_code(src), 4); // SIB with disp8=0 for RBP/R13
+        PeirEnc_modrm(self, 1, peir_reg_code(src), 4);
+        // SIB with disp8=0 for RBP/R13
         self.code.push((0 << 6) | (peir_reg_code(index) << 3) | peir_reg_code(base));
         self.code.push(0);
     } else {
-        PeirEnc_modrm(self, 0, peir_reg_code(src), 4); // SIB
+        PeirEnc_modrm(self, 0, peir_reg_code(src), 4);
+        // SIB
         self.code.push((0 << 6) | (peir_reg_code(index) << 3) | peir_reg_code(base));
     }
 }
 
 /// mov rax, [reg + disp32] (load through pointer with displacement)
-pub fn PeirEnc_mov_reg_mem_disp(self: &mut PeirEnc, dst: i64, base: i64, disp: i64) -> void {
+pub fn PeirEnc_mov_reg_mem_disp(self: & mut PeirEnc, dst: i64, base: i64, disp: i64) -> void {
     PeirEnc_rex(self, true, reg_ext(dst), false, reg_ext(base));
     self.code.push(0x8B);
     if peir_reg_code(base) == 4 {
@@ -1492,7 +1550,7 @@ pub fn PeirEnc_mov_reg_mem_disp(self: &mut PeirEnc, dst: i64, base: i64, disp: i
 }
 
 /// mov [reg + disp32], r64 (store through pointer with displacement)
-pub fn PeirEnc_mov_mem_disp_reg(self: &mut PeirEnc, base: i64, disp: i64, src: i64) -> void {
+pub fn PeirEnc_mov_mem_disp_reg(self: & mut PeirEnc, base: i64, disp: i64, src: i64) -> void {
     PeirEnc_rex(self, true, reg_ext(src), false, reg_ext(base));
     self.code.push(0x89);
     if peir_reg_code(base) == 4 {
@@ -1515,7 +1573,7 @@ pub fn PeirEnc_mov_mem_disp_reg(self: &mut PeirEnc, base: i64, disp: i64, src: i
 }
 
 /// mov [reg + disp], r32 (32-bit store, no REX.W)
-pub fn PeirEnc_mov_mem_disp_reg32(self: &mut PeirEnc, base: i64, disp: i64, src: i64) -> void {
+pub fn PeirEnc_mov_mem_disp_reg32(self: & mut PeirEnc, base: i64, disp: i64, src: i64) -> void {
     var need_rex: bool = reg_ext(src) || reg_ext(base);
     if need_rex {
         PeirEnc_rex(self, false, reg_ext(src), false, reg_ext(base));
@@ -1541,7 +1599,7 @@ pub fn PeirEnc_mov_mem_disp_reg32(self: &mut PeirEnc, base: i64, disp: i64, src:
 }
 
 /// imul r64, r64, imm32 (three-operand imul)
-pub fn PeirEnc_imul_r_r_imm32(self: &mut PeirEnc, dst: i64, src: i64, val: i64) -> void {
+pub fn PeirEnc_imul_r_r_imm32(self: & mut PeirEnc, dst: i64, src: i64, val: i64) -> void {
     PeirEnc_rex(self, true, reg_ext(dst), false, reg_ext(src));
     self.code.push(0x69);
     PeirEnc_modrm_rr(self, dst, src);
@@ -1550,7 +1608,7 @@ pub fn PeirEnc_imul_r_r_imm32(self: &mut PeirEnc, dst: i64, src: i64, val: i64) 
 
 /// call r64 (indirect call through register)
 /// NOTE: Rust emits the REX byte unconditionally (0x40 when not extended).
-pub fn PeirEnc_call_reg(self: &mut PeirEnc, r: i64) -> void {
+pub fn PeirEnc_call_reg(self: & mut PeirEnc, r: i64) -> void {
     PeirEnc_rex(self, false, false, false, reg_ext(r));
     self.code.push(0xFF);
     PeirEnc_modrm(self, 3, 2, peir_reg_code(r));
@@ -1559,10 +1617,12 @@ pub fn PeirEnc_call_reg(self: &mut PeirEnc, r: i64) -> void {
 // ─── SSE/float instructions (minimal) ───
 
 /// movsd xmm, [rbp + disp]
-pub fn PeirEnc_movsd_xmm_mem_rbp(self: &mut PeirEnc, xmm: i64, disp: i64) -> void {
+pub fn PeirEnc_movsd_xmm_mem_rbp(self: & mut PeirEnc, xmm: i64, disp: i64) -> void {
     if disp >= PEIR_XMM_SLOT {
         var src: i64 = disp - PEIR_XMM_SLOT;
-        if src != xmm { PeirEnc_movapd_rr(self, xmm, src); }
+        if src != xmm {
+            PeirEnc_movapd_rr(self, xmm, src);
+        }
         return;
     }
     if disp >= PEIR_REG_SLOT {
@@ -1578,10 +1638,12 @@ pub fn PeirEnc_movsd_xmm_mem_rbp(self: &mut PeirEnc, xmm: i64, disp: i64) -> voi
 }
 
 /// movsd [rbp + disp], xmm
-pub fn PeirEnc_movsd_mem_rbp_xmm(self: &mut PeirEnc, disp: i64, xmm: i64) -> void {
+pub fn PeirEnc_movsd_mem_rbp_xmm(self: & mut PeirEnc, disp: i64, xmm: i64) -> void {
     if disp >= PEIR_XMM_SLOT {
         var dst: i64 = disp - PEIR_XMM_SLOT;
-        if dst != xmm { PeirEnc_movapd_rr(self, dst, xmm); }
+        if dst != xmm {
+            PeirEnc_movapd_rr(self, dst, xmm);
+        }
         return;
     }
     if disp >= PEIR_REG_SLOT {
@@ -1596,7 +1658,7 @@ pub fn PeirEnc_movsd_mem_rbp_xmm(self: &mut PeirEnc, disp: i64, xmm: i64) -> voi
 }
 
 /// movss xmm, [rbp + disp]
-pub fn PeirEnc_movss_xmm_mem_rbp(self: &mut PeirEnc, xmm: i64, disp: i64) -> void {
+pub fn PeirEnc_movss_xmm_mem_rbp(self: & mut PeirEnc, xmm: i64, disp: i64) -> void {
     self.code.push(0xF3);
     PeirEnc_rex_w(self);
     self.code.push(0x0F);
@@ -1605,7 +1667,7 @@ pub fn PeirEnc_movss_xmm_mem_rbp(self: &mut PeirEnc, xmm: i64, disp: i64) -> voi
 }
 
 /// movss [rbp + disp], xmm
-pub fn PeirEnc_movss_mem_rbp_xmm(self: &mut PeirEnc, disp: i64, xmm: i64) -> void {
+pub fn PeirEnc_movss_mem_rbp_xmm(self: & mut PeirEnc, disp: i64, xmm: i64) -> void {
     self.code.push(0xF3);
     PeirEnc_rex_w(self);
     self.code.push(0x0F);
@@ -1614,7 +1676,7 @@ pub fn PeirEnc_movss_mem_rbp_xmm(self: &mut PeirEnc, disp: i64, xmm: i64) -> voi
 }
 
 /// addsd xmm0, xmm1
-pub fn PeirEnc_addsd(self: &mut PeirEnc, dst: i64, src: i64) -> void {
+pub fn PeirEnc_addsd(self: & mut PeirEnc, dst: i64, src: i64) -> void {
     self.code.push(0xF2);
     self.code.push(0x0F);
     self.code.push(0x58);
@@ -1622,7 +1684,7 @@ pub fn PeirEnc_addsd(self: &mut PeirEnc, dst: i64, src: i64) -> void {
 }
 
 /// subsd xmm0, xmm1
-pub fn PeirEnc_subsd(self: &mut PeirEnc, dst: i64, src: i64) -> void {
+pub fn PeirEnc_subsd(self: & mut PeirEnc, dst: i64, src: i64) -> void {
     self.code.push(0xF2);
     self.code.push(0x0F);
     self.code.push(0x5C);
@@ -1630,7 +1692,7 @@ pub fn PeirEnc_subsd(self: &mut PeirEnc, dst: i64, src: i64) -> void {
 }
 
 /// mulsd xmm0, xmm1
-pub fn PeirEnc_mulsd(self: &mut PeirEnc, dst: i64, src: i64) -> void {
+pub fn PeirEnc_mulsd(self: & mut PeirEnc, dst: i64, src: i64) -> void {
     self.code.push(0xF2);
     self.code.push(0x0F);
     self.code.push(0x59);
@@ -1638,7 +1700,7 @@ pub fn PeirEnc_mulsd(self: &mut PeirEnc, dst: i64, src: i64) -> void {
 }
 
 /// divsd xmm0, xmm1
-pub fn PeirEnc_divsd(self: &mut PeirEnc, dst: i64, src: i64) -> void {
+pub fn PeirEnc_divsd(self: & mut PeirEnc, dst: i64, src: i64) -> void {
     self.code.push(0xF2);
     self.code.push(0x0F);
     self.code.push(0x5E);
@@ -1646,7 +1708,7 @@ pub fn PeirEnc_divsd(self: &mut PeirEnc, dst: i64, src: i64) -> void {
 }
 
 /// xorpd xmm, [rbp + disp]
-pub fn PeirEnc_xorpd_xmm_mem_rbp(self: &mut PeirEnc, xmm: i64, disp: i64) -> void {
+pub fn PeirEnc_xorpd_xmm_mem_rbp(self: & mut PeirEnc, xmm: i64, disp: i64) -> void {
     self.code.push(0x66);
     self.code.push(0x0F);
     self.code.push(0x57);
@@ -1654,7 +1716,7 @@ pub fn PeirEnc_xorpd_xmm_mem_rbp(self: &mut PeirEnc, xmm: i64, disp: i64) -> voi
 }
 
 /// xorpd xmm, xmm (register-to-register)
-pub fn PeirEnc_xorpd_xmm_xmm(self: &mut PeirEnc, dst: i64, src: i64) -> void {
+pub fn PeirEnc_xorpd_xmm_xmm(self: & mut PeirEnc, dst: i64, src: i64) -> void {
     self.code.push(0x66);
     self.code.push(0x0F);
     self.code.push(0x57);
@@ -1662,7 +1724,7 @@ pub fn PeirEnc_xorpd_xmm_xmm(self: &mut PeirEnc, dst: i64, src: i64) -> void {
 }
 
 /// movq xmm, r64 (move 64-bit GPR to XMM)
-pub fn PeirEnc_movq_xmm_r64(self: &mut PeirEnc, xmm: i64, r: i64) -> void {
+pub fn PeirEnc_movq_xmm_r64(self: & mut PeirEnc, xmm: i64, r: i64) -> void {
     self.code.push(0x66);
     PeirEnc_rex(self, true, false, false, reg_ext(r));
     self.code.push(0x0F);
@@ -1671,7 +1733,7 @@ pub fn PeirEnc_movq_xmm_r64(self: &mut PeirEnc, xmm: i64, r: i64) -> void {
 }
 
 /// ucomisd xmm0, xmm1
-pub fn PeirEnc_ucomisd(self: &mut PeirEnc, dst: i64, src: i64) -> void {
+pub fn PeirEnc_ucomisd(self: & mut PeirEnc, dst: i64, src: i64) -> void {
     self.code.push(0x66);
     self.code.push(0x0F);
     self.code.push(0x2E);
@@ -1679,7 +1741,7 @@ pub fn PeirEnc_ucomisd(self: &mut PeirEnc, dst: i64, src: i64) -> void {
 }
 
 /// ucomiss xmm0, xmm1
-pub fn PeirEnc_ucomiss(self: &mut PeirEnc, dst: i64, src: i64) -> void {
+pub fn PeirEnc_ucomiss(self: & mut PeirEnc, dst: i64, src: i64) -> void {
     self.code.push(0xF3);
     self.code.push(0x0F);
     self.code.push(0x2E);
@@ -1687,7 +1749,7 @@ pub fn PeirEnc_ucomiss(self: &mut PeirEnc, dst: i64, src: i64) -> void {
 }
 
 /// cvtsi2sd xmm, r64
-pub fn PeirEnc_cvtsi2sd_r64(self: &mut PeirEnc, xmm: i64, r: i64) -> void {
+pub fn PeirEnc_cvtsi2sd_r64(self: & mut PeirEnc, xmm: i64, r: i64) -> void {
     self.code.push(0xF2);
     PeirEnc_rex(self, true, false, false, reg_ext(r));
     self.code.push(0x0F);
@@ -1696,7 +1758,7 @@ pub fn PeirEnc_cvtsi2sd_r64(self: &mut PeirEnc, xmm: i64, r: i64) -> void {
 }
 
 /// cvttsd2si r64, xmm
-pub fn PeirEnc_cvttsd2si_r64(self: &mut PeirEnc, r: i64, xmm: i64) -> void {
+pub fn PeirEnc_cvttsd2si_r64(self: & mut PeirEnc, r: i64, xmm: i64) -> void {
     self.code.push(0xF2);
     PeirEnc_rex(self, true, false, false, reg_ext(r));
     self.code.push(0x0F);
@@ -1705,7 +1767,7 @@ pub fn PeirEnc_cvttsd2si_r64(self: &mut PeirEnc, r: i64, xmm: i64) -> void {
 }
 
 /// addss xmm0, xmm1
-pub fn PeirEnc_addss(self: &mut PeirEnc, dst: i64, src: i64) -> void {
+pub fn PeirEnc_addss(self: & mut PeirEnc, dst: i64, src: i64) -> void {
     self.code.push(0xF3);
     self.code.push(0x0F);
     self.code.push(0x58);
@@ -1713,7 +1775,7 @@ pub fn PeirEnc_addss(self: &mut PeirEnc, dst: i64, src: i64) -> void {
 }
 
 /// subss xmm0, xmm1
-pub fn PeirEnc_subss(self: &mut PeirEnc, dst: i64, src: i64) -> void {
+pub fn PeirEnc_subss(self: & mut PeirEnc, dst: i64, src: i64) -> void {
     self.code.push(0xF3);
     self.code.push(0x0F);
     self.code.push(0x5C);
@@ -1721,7 +1783,7 @@ pub fn PeirEnc_subss(self: &mut PeirEnc, dst: i64, src: i64) -> void {
 }
 
 /// mulss xmm0, xmm1
-pub fn PeirEnc_mulss(self: &mut PeirEnc, dst: i64, src: i64) -> void {
+pub fn PeirEnc_mulss(self: & mut PeirEnc, dst: i64, src: i64) -> void {
     self.code.push(0xF3);
     self.code.push(0x0F);
     self.code.push(0x59);
@@ -1729,7 +1791,7 @@ pub fn PeirEnc_mulss(self: &mut PeirEnc, dst: i64, src: i64) -> void {
 }
 
 /// divss xmm0, xmm1
-pub fn PeirEnc_divss(self: &mut PeirEnc, dst: i64, src: i64) -> void {
+pub fn PeirEnc_divss(self: & mut PeirEnc, dst: i64, src: i64) -> void {
     self.code.push(0xF3);
     self.code.push(0x0F);
     self.code.push(0x5E);
@@ -1737,23 +1799,23 @@ pub fn PeirEnc_divss(self: &mut PeirEnc, dst: i64, src: i64) -> void {
 }
 
 /// movq xmm, [rbp + disp] (64-bit SSE move)
-pub fn PeirEnc_movq_xmm_mem_rbp(self: &mut PeirEnc, xmm: i64, disp: i64) -> void {
+pub fn PeirEnc_movq_xmm_mem_rbp(self: & mut PeirEnc, xmm: i64, disp: i64) -> void {
     PeirEnc_movsd_xmm_mem_rbp(self, xmm, disp);
 }
 
 /// movq [rbp + disp], xmm
-pub fn PeirEnc_movq_mem_rbp_xmm(self: &mut PeirEnc, disp: i64, xmm: i64) -> void {
+pub fn PeirEnc_movq_mem_rbp_xmm(self: & mut PeirEnc, disp: i64, xmm: i64) -> void {
     PeirEnc_movsd_mem_rbp_xmm(self, disp, xmm);
 }
 
 // ─── Label resolution ───
 
 /// Resolve all pending label relocations (local jumps/calls)
-pub fn PeirEnc_resolve_labels(self: &mut PeirEnc) -> void {
+pub fn PeirEnc_resolve_labels(self: & mut PeirEnc) -> void {
     var i: i64 = 0;
     while i < self.pending_labels.len() {
         var reloc: PeirReloc = self.pending_labels.get(i);
-        var target_offset: i64 = -1;
+        var target_offset: i64 = - 1;
         if reloc.target_label >= 0 && reloc.target_label < self.labels.len() {
             target_offset = self.labels.get(reloc.target_label);
         }
@@ -1774,7 +1836,7 @@ pub fn PeirEnc_resolve_labels(self: &mut PeirEnc) -> void {
 /// Resolve all RIP-relative references to .rdata
 /// text_rva: virtual address of .text section start
 /// rdata_rva: virtual address of .rdata section start
-pub fn PeirEnc_resolve_rip_refs(self: &mut PeirEnc, text_rva: i64, rdata_rva: i64) -> void {
+pub fn PeirEnc_resolve_rip_refs(self: & mut PeirEnc, text_rva: i64, rdata_rva: i64) -> void {
     var i: i64 = 0;
     while i < self.pending_rip_refs.len() {
         var ref_: PeirRipRef = self.pending_rip_refs.get(i);
@@ -1865,28 +1927,82 @@ pub fn pe_kernel32_imports() -> Vec<str> {
 /// loader refuses to start a program importing one that is not.
 pub fn pe_msvcrt_imports() -> Vec<str> {
     var v: Vec<str> = Vec::new();
-    v.push("sqrt"); v.push("pow"); v.push("floor"); v.push("ceil");
-    v.push("fabs"); v.push("fmod"); v.push("exp"); v.push("log");
+    v.push("sqrt");
+    v.push("pow");
+    v.push("floor");
+    v.push("ceil");
+    v.push("fabs");
+    v.push("fmod");
+    v.push("exp");
+    v.push("log");
     v.push("log10");
-    v.push("sin"); v.push("cos"); v.push("tan"); v.push("asin");
-    v.push("acos"); v.push("atan"); v.push("atan2"); v.push("sinh");
-    v.push("cosh"); v.push("tanh");
-    v.push("strtod"); v.push("_strtoi64"); v.push("atof"); v.push("atoi");
+    v.push("sin");
+    v.push("cos");
+    v.push("tan");
+    v.push("asin");
+    v.push("acos");
+    v.push("atan");
+    v.push("atan2");
+    v.push("sinh");
+    v.push("cosh");
+    v.push("tanh");
+    v.push("strtod");
+    v.push("_strtoi64");
+    v.push("atof");
+    v.push("atoi");
     v.push("atol");
-    v.push("strlen"); v.push("strcmp"); v.push("strncmp"); v.push("strcpy");
-    v.push("strncpy"); v.push("strcat"); v.push("strchr"); v.push("strstr");
-    v.push("memcpy"); v.push("memmove"); v.push("memset"); v.push("memcmp");
-    v.push("toupper"); v.push("tolower"); v.push("isalpha"); v.push("isdigit");
-    v.push("isspace"); v.push("isalnum");
-    v.push("abs"); v.push("labs"); v.push("_abs64"); v.push("rand");
-    v.push("srand"); v.push("time"); v.push("clock");
-    v.push("malloc"); v.push("calloc"); v.push("realloc"); v.push("free");
-    v.push("getenv"); v.push("exit"); v.push("qsort"); v.push("bsearch"); v.push("ldiv");
-    v.push("_snprintf"); v.push("putchar"); v.push("puts"); v.push("getchar");
-    v.push("fopen"); v.push("fclose"); v.push("fread"); v.push("fwrite");
-    v.push("fflush"); v.push("fgets"); v.push("fputs");
-    v.push("fseek"); v.push("ftell"); v.push("_fseeki64"); v.push("remove"); v.push("rand_s");
-    v.push("rename"); v.push("_access");
+    v.push("strlen");
+    v.push("strcmp");
+    v.push("strncmp");
+    v.push("strcpy");
+    v.push("strncpy");
+    v.push("strcat");
+    v.push("strchr");
+    v.push("strstr");
+    v.push("memcpy");
+    v.push("memmove");
+    v.push("memset");
+    v.push("memcmp");
+    v.push("toupper");
+    v.push("tolower");
+    v.push("isalpha");
+    v.push("isdigit");
+    v.push("isspace");
+    v.push("isalnum");
+    v.push("abs");
+    v.push("labs");
+    v.push("_abs64");
+    v.push("rand");
+    v.push("srand");
+    v.push("time");
+    v.push("clock");
+    v.push("malloc");
+    v.push("calloc");
+    v.push("realloc");
+    v.push("free");
+    v.push("getenv");
+    v.push("exit");
+    v.push("qsort");
+    v.push("bsearch");
+    v.push("ldiv");
+    v.push("_snprintf");
+    v.push("putchar");
+    v.push("puts");
+    v.push("getchar");
+    v.push("fopen");
+    v.push("fclose");
+    v.push("fread");
+    v.push("fwrite");
+    v.push("fflush");
+    v.push("fgets");
+    v.push("fputs");
+    v.push("fseek");
+    v.push("ftell");
+    v.push("_fseeki64");
+    v.push("remove");
+    v.push("rand_s");
+    v.push("rename");
+    v.push("_access");
     v.push("system");
     return v;
 }
@@ -1899,8 +2015,7 @@ pub struct PeDllImport {
 
 // What this program imports beyond kernel32 and msvcrt: `extern "C" link "x"`
 var g_pe_extra_imports: Vec<PeDllImport> = Vec::new();
-
-pub fn pe_clear_extra_imports() {
+ pub fn pe_clear_extra_imports() {
     g_pe_extra_imports = Vec::new();
 }
 
@@ -1912,7 +2027,9 @@ pub fn pe_add_extra_import(dll: str, name: str) {
         if e.dll == dll {
             var k: i64 = 0;
             while k < e.names.len() {
-                if e.names.get(k) == name { return; }
+                if e.names.get(k) == name {
+                    return;
+                }
                 k = k + 1;
             }
             g_pe_extra_imports.get(i).names.push(name);
@@ -1922,16 +2039,25 @@ pub fn pe_add_extra_import(dll: str, name: str) {
     }
     var names: Vec<str> = Vec::new();
     names.push(name);
-    g_pe_extra_imports.push(PeDllImport { dll: dll, names: names });
+    g_pe_extra_imports.push(PeDllImport {
+        dll: dll, names: names
+    });
 }
 
 /// The DLL of a `link` library, "" for the Unix libraries the C runtime covers.
 pub fn pe_link_dll(lib: str) -> str {
-    if lib == "" || lib == "m" || lib == "c" || lib == "pthread" || lib == "dl" || lib == "rt"
-        || lib == "msvcrt" || lib == "kernel32" { return ""; }
-    if lib == "GL" { return "opengl32.dll"; }
-    if lib == "GLU" { return "glu32.dll"; }
-    if str_ends_with(lib, ".dll") { return lib; }
+    if lib == "" || lib == "m" || lib == "c" || lib == "pthread" || lib == "dl" || lib == "rt" || lib == "msvcrt" || lib == "kernel32" {
+        return "";
+    }
+    if lib == "GL" {
+        return "opengl32.dll";
+    }
+    if lib == "GLU" {
+        return "glu32.dll";
+    }
+    if str_ends_with(lib, ".dll") {
+        return lib;
+    }
     return lib + ".dll";
 }
 
@@ -1940,13 +2066,14 @@ pub fn pe_link_dll(lib: str) -> str {
 /// itself at start-up (PeirGen_gen_dll_loader), so that a missing library
 /// is reported by name instead of the loader failing silently (release E4).
 pub const PE_STATIC_DLLS: i64 = 2;
-
 /// The files to try, in order, for a `link` DLL: SQLite's own sqlite3.dll,
 /// else the copy every Windows 10 and 11 has (winsqlite3.dll, same API).
 pub fn pe_link_dll_candidates(dll: str) -> Vec<str> {
     var v: Vec<str> = Vec::new();
     v.push(dll);
-    if dll == "sqlite3.dll" { v.push("winsqlite3.dll"); }
+    if dll == "sqlite3.dll" {
+        v.push("winsqlite3.dll");
+    }
     return v;
 }
 
@@ -1954,22 +2081,32 @@ pub fn pe_link_dll_candidates(dll: str) -> Vec<str> {
 /// folder, the system folder or a PATH entry)? For a compile-time warning.
 pub fn pe_dll_found(dll: str, out_dir: str) -> bool {
     var dirs: Vec<str> = Vec::new();
-    if out_dir != "" { dirs.push(out_dir); }
+    if out_dir != "" {
+        dirs.push(out_dir);
+    }
     dirs.push(".");
     var root = p_getenv("SystemRoot");
-    if (root as i64) != 0 { dirs.push(root + "\\System32"); } else { dirs.push("C:\\Windows\\System32"); }
+    if (root as i64) != 0 {
+        dirs.push(root + "\\System32");
+    } else {
+        dirs.push("C:\\Windows\\System32");
+    }
     var path = p_getenv("PATH");
     if (path as i64) != 0 {
         var parts: Vec<str> = str_split(path, ";");
         var pi: i64 = 0;
         while pi < parts.len() {
-            if str_len(parts.get(pi)) > 0 { dirs.push(parts.get(pi)); }
+            if str_len(parts.get(pi)) > 0 {
+                dirs.push(parts.get(pi));
+            }
             pi = pi + 1;
         }
     }
     var di: i64 = 0;
     while di < dirs.len() {
-        if p_file_exists(dirs.get(di) + "\\" + dll) != 0 { return true; }
+        if p_file_exists(dirs.get(di) + "\\" + dll) != 0 {
+            return true;
+        }
         di = di + 1;
     }
     return false;
@@ -1978,8 +2115,12 @@ pub fn pe_dll_found(dll: str, out_dir: str) -> bool {
 /// The DLLs of the import table, in IAT order.
 pub fn pe_dll_imports() -> Vec<PeDllImport> {
     var v: Vec<PeDllImport> = Vec::new();
-    v.push(PeDllImport { dll: "kernel32.dll", names: pe_kernel32_imports() });
-    v.push(PeDllImport { dll: "msvcrt.dll", names: pe_msvcrt_imports() });
+    v.push(PeDllImport {
+        dll: "kernel32.dll", names: pe_kernel32_imports()
+    });
+    v.push(PeDllImport {
+        dll: "msvcrt.dll", names: pe_msvcrt_imports()
+    });
     var i: i64 = 0;
     while i < g_pe_extra_imports.len() {
         v.push(g_pe_extra_imports.get(i));
@@ -2006,24 +2147,11 @@ pub fn pe_import_slot(name: str) -> i64 {
         base = base + names.len();
         d = d + 1;
     }
-    return -1;
+    return - 1;
 }
 
 /// IAT indices for each imported function (first 13 kernel32 imports)
-pub const PIAT_GET_STD_HANDLE: i64 = 0;
-pub const PIAT_WRITE_FILE: i64 = 1;
-pub const PIAT_EXIT_PROCESS: i64 = 2;
-pub const PIAT_GET_PROCESS_HEAP: i64 = 3;
-pub const PIAT_HEAP_ALLOC: i64 = 4;
-pub const PIAT_HEAP_FREE: i64 = 5;
-pub const PIAT_CREATE_FILE_A: i64 = 6;
-pub const PIAT_READ_FILE: i64 = 7;
-pub const PIAT_CLOSE_HANDLE: i64 = 8;
-pub const PIAT_GET_FILE_SIZE: i64 = 9;
-pub const PIAT_GET_COMMAND_LINE_A: i64 = 10;
-pub const PIAT_CREATE_PROCESS_A: i64 = 11;
-pub const PIAT_WAIT_FOR_SINGLE_OBJECT: i64 = 12;
-
+pub const PIAT_GET_STD_HANDLE: i64 = 0; pub const PIAT_WRITE_FILE: i64 = 1; pub const PIAT_EXIT_PROCESS: i64 = 2; pub const PIAT_GET_PROCESS_HEAP: i64 = 3; pub const PIAT_HEAP_ALLOC: i64 = 4; pub const PIAT_HEAP_FREE: i64 = 5; pub const PIAT_CREATE_FILE_A: i64 = 6; pub const PIAT_READ_FILE: i64 = 7; pub const PIAT_CLOSE_HANDLE: i64 = 8; pub const PIAT_GET_FILE_SIZE: i64 = 9; pub const PIAT_GET_COMMAND_LINE_A: i64 = 10; pub const PIAT_CREATE_PROCESS_A: i64 = 11; pub const PIAT_WAIT_FOR_SINGLE_OBJECT: i64 = 12;
 // ===========================================================================
 // PeirRdata — builds the .rdata section: string constants + import table
 // ===========================================================================
@@ -2051,29 +2179,21 @@ pub struct PeirRdata {
 
 pub fn PeirRdata_new() -> PeirRdata {
     return PeirRdata {
-        data: Vec::new(),
-        iat_offsets: Vec::new(),
-        import_dir_offset: 0,
-        string_offsets: HashMap_new(),
-        ilt_offsets: Vec::new(),
-        iat_offset: 0,
-        iat_size: 0,
-        dll_iat_offsets: Vec::new(),
-        dll_name_offs: Vec::new(),
-        import_by_name_offsets: Vec::new(),
+        data: Vec::new(), iat_offsets: Vec::new(), import_dir_offset: 0, string_offsets: HashMap_new(), ilt_offsets: Vec::new(), iat_offset: 0, iat_size: 0, dll_iat_offsets: Vec::new(), dll_name_offs: Vec::new(), import_by_name_offsets: Vec::new(),
     };
 }
 
 /// Add a null-terminated string to .rdata, return its offset
-pub fn PeirRdata_add_string(self: &mut PeirRdata, s: str) -> i64 {
+pub fn PeirRdata_add_string(self: & mut PeirRdata, s: str) -> i64 {
     var prev: i64 = HashMap_get(self.string_offsets, s);
     if prev != 0 {
         return prev - 1;
-    }
-    // [static magic][length] before the bytes, 8-aligned, as core's strings
+    }  // [static magic][length] before the bytes, 8-aligned, as core's strings
     // carry them (release D16): the length is O(1) and comparisons of
     // different lengths stop at once
-    while (self.data.len() % 8) != 0 { self.data.push(0); }
+    while (self.data.len() % 8) != 0 {
+        self.data.push(0);
+    }
     var n: i64 = str_len(s);
     self.data = pe_push_u64(self.data, 0x4649444553545202);
     self.data = pe_push_u64(self.data, n);
@@ -2083,15 +2203,18 @@ pub fn PeirRdata_add_string(self: &mut PeirRdata, s: str) -> i64 {
         self.data.push(str_byte_at(s, i));
         i = i + 1;
     }
-    self.data.push(0); // null terminator
+    self.data.push(0);
+    // null terminator
     HashMap_insert(self.string_offsets, s, offset + 1);
     return offset;
 }
 
 /// Look up a string's .rdata offset, or -1 (Rust Option<usize> -> None).
-pub fn PeirRdata_string_offset(self: &PeirRdata, s: str) -> i64 {
+pub fn PeirRdata_string_offset(self: & PeirRdata, s: str) -> i64 {
     var prev: i64 = HashMap_get(self.string_offsets, s);
-    if prev == 0 { return -1; }
+    if prev == 0 {
+        return - 1;
+    }
     return prev - 1;
 }
 
@@ -2113,7 +2236,7 @@ fn pe_sort_strings(v: Vec<str>) -> Vec<str> {
 }
 
 /// The data of a bare build: the string constants, no import table.
-pub fn PeirRdata_build_strings(self: &mut PeirRdata, string_constants: Vec<str>) -> void {
+pub fn PeirRdata_build_strings(self: & mut PeirRdata, string_constants: Vec<str>) -> void {
     var keys: Vec<str> = pe_sort_strings(string_constants);
     var ki: i64 = 0;
     while ki < keys.len() {
@@ -2129,7 +2252,7 @@ pub fn PeirRdata_build_strings(self: &mut PeirRdata, string_constants: Vec<str>)
 
 /// Build the complete .rdata section
 /// string_constants: all string literals from the IR
-pub fn PeirRdata_build(self: &mut PeirRdata, string_constants: Vec<str>) -> void {
+pub fn PeirRdata_build(self: & mut PeirRdata, string_constants: Vec<str>) -> void {
     // 1. String constants from user code (sorted: HashMap order would
     //    make the .rdata layout, and so the binary, differ per build)
     var keys: Vec<str> = Vec::new();
@@ -2166,24 +2289,27 @@ pub fn PeirRdata_build(self: &mut PeirRdata, string_constants: Vec<str>) -> void
         var i: i64 = 0;
         while i < names.len() {
             if (self.data.len() % 2) != 0 {
-                self.data.push(0); // entries are 2-byte aligned
+                self.data.push(0);
+                // entries are 2-byte aligned
             }
             var off: i64 = self.data.len();
-            self.data.push(0); // hint low
-            self.data.push(0); // hint high
+            self.data.push(0);
+            // hint low
+            self.data.push(0);
+            // hint high
             var name: str = names.get(i);
             var ci: i64 = 0;
             while ci < str_len(name) {
                 self.data.push(str_byte_at(name, ci));
                 ci = ci + 1;
             }
-            self.data.push(0); // null terminator
+            self.data.push(0);
+            // null terminator
             self.import_by_name_offsets.push(off);
             i = i + 1;
         }
         d = d + 1;
     }
-
     // Align to 8 bytes for tables
     while (self.data.len() % 8) != 0 {
         self.data.push(0);
@@ -2198,11 +2324,18 @@ pub fn PeirRdata_build(self: &mut PeirRdata, string_constants: Vec<str>) -> void
         var i: i64 = 0;
         while i < names.len() {
             var z: i64 = 0;
-            while z < 8 { self.data.push(0); z = z + 1; }
+            while z < 8 {
+                self.data.push(0);
+                z = z + 1;
+            }
             i = i + 1;
         }
         var z2: i64 = 0;
-        while z2 < 8 { self.data.push(0); z2 = z2 + 1; } // null terminator
+        while z2 < 8 {
+            self.data.push(0);
+            z2 = z2 + 1;
+        }
+        // null terminator
         d = d + 1;
     }
 
@@ -2223,7 +2356,11 @@ pub fn PeirRdata_build(self: &mut PeirRdata, string_constants: Vec<str>) -> void
             i = i + 1;
         }
         var z3: i64 = 0;
-        while z3 < 8 { self.data.push(0); z3 = z3 + 1; } // null terminator
+        while z3 < 8 {
+            self.data.push(0);
+            z3 = z3 + 1;
+        }
+        // null terminator
         d = d + 1;
     }
     self.iat_size = self.data.len() - self.iat_offset;
@@ -2243,15 +2380,22 @@ pub fn PeirRdata_build(self: &mut PeirRdata, string_constants: Vec<str>) -> void
     d = 0;
     while d < dlls.len() {
         var z4: i64 = 0;
-        while z4 < 20 { self.data.push(0); z4 = z4 + 1; }
+        while z4 < 20 {
+            self.data.push(0);
+            z4 = z4 + 1;
+        }
         d = d + 1;
     }
     var z5: i64 = 0;
-    while z5 < 20 { self.data.push(0); z5 = z5 + 1; } // null terminator descriptor
+    while z5 < 20 {
+        self.data.push(0);
+        z5 = z5 + 1;
+    }
+    // null terminator descriptor
 }
 
 /// Patch RVAs in the import table now that we know the .rdata RVA
-pub fn PeirRdata_patch_rvas(self: &mut PeirRdata, rdata_rva: i64) -> void {
+pub fn PeirRdata_patch_rvas(self: & mut PeirRdata, rdata_rva: i64) -> void {
     var dlls: Vec<PeDllImport> = pe_dll_imports();
     var k: i64 = 0;
     var d: i64 = 0;
@@ -2296,7 +2440,9 @@ pub fn PeirRdata_patch_rvas(self: &mut PeirRdata, rdata_rva: i64) -> void {
 
 /// Lowercase hex of a non-negative i64 (no 0x prefix), for diagnostics/dumps.
 pub fn pe_to_hex(v: i64) -> str {
-    if v == 0 { return "0"; }
+    if v == 0 {
+        return "0";
+    }
     var digits: str = "0123456789abcdef";
     var out: str = "";
     var n: i64 = v;
@@ -2374,12 +2520,8 @@ pub fn pe_push_str(t: Vec<i64>, s: str) -> Vec<i64> {
 // PE file builder
 // ===========================================================================
 
-pub const PE_IMAGE_BASE: i64 = 0x140000000;
-pub const PE_SECTION_ALIGN: i64 = 0x1000;
-pub const PE_FILE_ALIGN: i64 = 0x200;
-pub const PE_TEXT_RVA: i64 = 0x1000;
-
-pub fn pe_align_up(val: i64, align: i64) -> i64 {
+pub const PE_IMAGE_BASE: i64 = 0x140000000; pub const PE_SECTION_ALIGN: i64 = 0x1000; pub const PE_FILE_ALIGN: i64 = 0x200; pub const PE_TEXT_RVA: i64 = 0x1000;
+ pub fn pe_align_up(val: i64, align: i64) -> i64 {
     return (val + align - 1) & (~(align - 1));
 }
 
@@ -2389,7 +2531,8 @@ pub fn pe_build_file(text: Vec<i64>, rdata: Vec<i64>, entry_point_rva: i64, impo
 
     // Header size: DOS(64) + PE sig(4) + COFF(20) + Optional(240) + 2
     // sections(80) = 408 bytes, aligned up to FILE_ALIGN (512).
-    var header_size: i64 = pe_align_up(64 + 4 + 20 + 240 + 2 * 40, PE_FILE_ALIGN); // = 512
+    var header_size: i64 = pe_align_up(64 + 4 + 20 + 240 + 2 * 40, PE_FILE_ALIGN);
+    // = 512
 
     // Section sizes (aligned to FILE_ALIGN for raw data)
     var text_raw_size: i64 = pe_align_up(text.len(), PE_FILE_ALIGN);
@@ -2403,27 +2546,52 @@ pub fn pe_build_file(text: Vec<i64>, rdata: Vec<i64>, entry_point_rva: i64, impo
     var size_of_image: i64 = pe_align_up(header_size, PE_SECTION_ALIGN) + text_virt_size + rdata_virt_size;
 
     // ─── DOS Header (64 bytes) ───
-    pe = pe_push_u16(pe, 0x5A4D); // e_magic = "MZ"
-    pe = pe_push_u16(pe, 0x90); // e_cblp
-    pe = pe_push_u16(pe, 0x03); // e_cp
-    pe = pe_push_u16(pe, 0); // e_crlc
-    pe = pe_push_u16(pe, 0x04); // e_cparhdr
-    pe = pe_push_u16(pe, 0); // e_minalloc
-    pe = pe_push_u16(pe, 0xFFFF); // e_maxalloc
-    pe = pe_push_u16(pe, 0); // e_ss
-    pe = pe_push_u16(pe, 0xB8); // e_sp
-    pe = pe_push_u16(pe, 0); // e_csum
-    pe = pe_push_u16(pe, 0); // e_ip
-    pe = pe_push_u16(pe, 0); // e_cs
-    pe = pe_push_u16(pe, 0x40); // e_lfarlc
-    pe = pe_push_u16(pe, 0); // e_ovno
+    pe = pe_push_u16(pe, 0x5A4D);
+    // e_magic = "MZ"
+    pe = pe_push_u16(pe, 0x90);
+    // e_cblp
+    pe = pe_push_u16(pe, 0x03);
+    // e_cp
+    pe = pe_push_u16(pe, 0);
+    // e_crlc
+    pe = pe_push_u16(pe, 0x04);
+    // e_cparhdr
+    pe = pe_push_u16(pe, 0);
+    // e_minalloc
+    pe = pe_push_u16(pe, 0xFFFF);
+    // e_maxalloc
+    pe = pe_push_u16(pe, 0);
+    // e_ss
+    pe = pe_push_u16(pe, 0xB8);
+    // e_sp
+    pe = pe_push_u16(pe, 0);
+    // e_csum
+    pe = pe_push_u16(pe, 0);
+    // e_ip
+    pe = pe_push_u16(pe, 0);
+    // e_cs
+    pe = pe_push_u16(pe, 0x40);
+    // e_lfarlc
+    pe = pe_push_u16(pe, 0);
+    // e_ovno
     var z: i64 = 0;
-    while z < 8 { pe.push(0); z = z + 1; } // e_res
-    pe = pe_push_u16(pe, 0); // e_oemid
-    pe = pe_push_u16(pe, 0); // e_oeminfo
+    while z < 8 {
+        pe.push(0);
+        z = z + 1;
+    }
+    // e_res
+    pe = pe_push_u16(pe, 0);
+    // e_oemid
+    pe = pe_push_u16(pe, 0);
+    // e_oeminfo
     z = 0;
-    while z < 20 { pe.push(0); z = z + 1; } // e_res2
-    pe = pe_push_u32(pe, 64); // e_lfanew = 64
+    while z < 20 {
+        pe.push(0);
+        z = z + 1;
+    }
+    // e_res2
+    pe = pe_push_u32(pe, 64);
+    // e_lfanew = 64
 
     // ─── PE Signature (4 bytes) ───
     pe = pe_push_str(pe, "PE");
@@ -2431,124 +2599,226 @@ pub fn pe_build_file(text: Vec<i64>, rdata: Vec<i64>, entry_point_rva: i64, impo
     pe.push(0);
 
     // ─── COFF Header (20 bytes) ───
-    pe = pe_push_u16(pe, 0x8664); // Machine = AMD64
-    pe = pe_push_u16(pe, 2); // NumberOfSections = 2 (.text, .rdata)
-    pe = pe_push_u32(pe, 0); // TimeDateStamp
-    pe = pe_push_u32(pe, 0); // PointerToSymbolTable
-    pe = pe_push_u32(pe, 0); // NumberOfSymbols
-    pe = pe_push_u16(pe, 240); // SizeOfOptionalHeader (PE32+)
-    pe = pe_push_u16(pe, 0x0022); // Characteristics: EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
+    pe = pe_push_u16(pe, 0x8664);
+    // Machine = AMD64
+    pe = pe_push_u16(pe, 2);
+    // NumberOfSections = 2 (.text, .rdata)
+    pe = pe_push_u32(pe, 0);
+    // TimeDateStamp
+    pe = pe_push_u32(pe, 0);
+    // PointerToSymbolTable
+    pe = pe_push_u32(pe, 0);
+    // NumberOfSymbols
+    pe = pe_push_u16(pe, 240);
+    // SizeOfOptionalHeader (PE32+)
+    pe = pe_push_u16(pe, 0x0022);
+    // Characteristics: EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
 
     // ─── Optional Header PE32+ (240 bytes) ───
     // Standard fields (24 bytes)
-    pe = pe_push_u16(pe, 0x020B); // Magic = PE32+
-    pe.push(14); // MajorLinkerVersion
-    pe.push(0); // MinorLinkerVersion
-    pe = pe_push_u32(pe, text_raw_size); // SizeOfCode
-    pe = pe_push_u32(pe, rdata_raw_size); // SizeOfInitializedData
-    pe = pe_push_u32(pe, 0); // SizeOfUninitializedData
-    pe = pe_push_u32(pe, entry_point_rva); // AddressOfEntryPoint
-    pe = pe_push_u32(pe, PE_TEXT_RVA); // BaseOfCode
+    pe = pe_push_u16(pe, 0x020B);
+    // Magic = PE32+
+    pe.push(14);
+    // MajorLinkerVersion
+    pe.push(0);
+    // MinorLinkerVersion
+    pe = pe_push_u32(pe, text_raw_size);
+    // SizeOfCode
+    pe = pe_push_u32(pe, rdata_raw_size);
+    // SizeOfInitializedData
+    pe = pe_push_u32(pe, 0);
+    // SizeOfUninitializedData
+    pe = pe_push_u32(pe, entry_point_rva);
+    // AddressOfEntryPoint
+    pe = pe_push_u32(pe, PE_TEXT_RVA);
+    // BaseOfCode
 
     // Windows-specific fields (88 bytes)
-    pe = pe_push_u64(pe, PE_IMAGE_BASE); // ImageBase
-    pe = pe_push_u32(pe, PE_SECTION_ALIGN); // SectionAlignment
-    pe = pe_push_u32(pe, PE_FILE_ALIGN); // FileAlignment
-    pe = pe_push_u16(pe, 6); // MajorOperatingSystemVersion
-    pe = pe_push_u16(pe, 0); // MinorOperatingSystemVersion
-    pe = pe_push_u16(pe, 0); // MajorImageVersion
-    pe = pe_push_u16(pe, 0); // MinorImageVersion
-    pe = pe_push_u16(pe, 6); // MajorSubsystemVersion
-    pe = pe_push_u16(pe, 0); // MinorSubsystemVersion
-    pe = pe_push_u32(pe, 0); // Win32VersionValue
-    pe = pe_push_u32(pe, size_of_image); // SizeOfImage
-    pe = pe_push_u32(pe, header_size); // SizeOfHeaders
-    pe = pe_push_u32(pe, 0); // CheckSum
-    pe = pe_push_u16(pe, 3); // Subsystem = CONSOLE
-    pe = pe_push_u16(pe, 0x0000); // DllCharacteristics: none (testing)
-    pe = pe_push_u64(pe, 0x100000000); // SizeOfStackReserve = 4GB (native frames are large: one slot per IR value, no reuse — deep recursion in checker/parser needs it)
-    pe = pe_push_u64(pe, 0x100000); // SizeOfStackCommit = 1MB
-    pe = pe_push_u64(pe, 0x100000); // SizeOfHeapReserve
-    pe = pe_push_u64(pe, 0x1000); // SizeOfHeapCommit
-    pe = pe_push_u32(pe, 0); // LoaderFlags
-    pe = pe_push_u32(pe, 16); // NumberOfRvaAndSizes
+    pe = pe_push_u64(pe, PE_IMAGE_BASE);
+    // ImageBase
+    pe = pe_push_u32(pe, PE_SECTION_ALIGN);
+    // SectionAlignment
+    pe = pe_push_u32(pe, PE_FILE_ALIGN);
+    // FileAlignment
+    pe = pe_push_u16(pe, 6);
+    // MajorOperatingSystemVersion
+    pe = pe_push_u16(pe, 0);
+    // MinorOperatingSystemVersion
+    pe = pe_push_u16(pe, 0);
+    // MajorImageVersion
+    pe = pe_push_u16(pe, 0);
+    // MinorImageVersion
+    pe = pe_push_u16(pe, 6);
+    // MajorSubsystemVersion
+    pe = pe_push_u16(pe, 0);
+    // MinorSubsystemVersion
+    pe = pe_push_u32(pe, 0);
+    // Win32VersionValue
+    pe = pe_push_u32(pe, size_of_image);
+    // SizeOfImage
+    pe = pe_push_u32(pe, header_size);
+    // SizeOfHeaders
+    pe = pe_push_u32(pe, 0);
+    // CheckSum
+    pe = pe_push_u16(pe, 3);
+    // Subsystem = CONSOLE
+    pe = pe_push_u16(pe, 0x0000);
+    // DllCharacteristics: none (testing)
+    pe = pe_push_u64(pe, 0x100000000);
+    // SizeOfStackReserve = 4GB (native frames are large: one slot per IR value, no reuse — deep recursion in checker/parser needs it)
+    pe = pe_push_u64(pe, 0x100000);
+    // SizeOfStackCommit = 1MB
+    pe = pe_push_u64(pe, 0x100000);
+    // SizeOfHeapReserve
+    pe = pe_push_u64(pe, 0x1000);
+    // SizeOfHeapCommit
+    pe = pe_push_u32(pe, 0);
+    // LoaderFlags
+    pe = pe_push_u32(pe, 16);
+    // NumberOfRvaAndSizes
 
     // Data directories (16 x 8 = 128 bytes)
     // Entry 0: Export Table
     z = 0;
-    while z < 8 { pe.push(0); z = z + 1; }
+    while z < 8 {
+        pe.push(0);
+        z = z + 1;
+    }
     // Entry 1: Import Table
     pe = pe_push_u32(pe, import_dir_rva);
-    pe = pe_push_u32(pe, 20); // size = 1 descriptor + null = 20 bytes
+    pe = pe_push_u32(pe, 20);
+    // size = 1 descriptor + null = 20 bytes
     // Entry 2: Resource Table
     z = 0;
-    while z < 8 { pe.push(0); z = z + 1; }
+    while z < 8 {
+        pe.push(0);
+        z = z + 1;
+    }
     // Entry 3: Exception Table
     z = 0;
-    while z < 8 { pe.push(0); z = z + 1; }
+    while z < 8 {
+        pe.push(0);
+        z = z + 1;
+    }
     // Entry 4: Certificate Table
     z = 0;
-    while z < 8 { pe.push(0); z = z + 1; }
+    while z < 8 {
+        pe.push(0);
+        z = z + 1;
+    }
     // Entry 5: Base Relocation Table
     z = 0;
-    while z < 8 { pe.push(0); z = z + 1; }
+    while z < 8 {
+        pe.push(0);
+        z = z + 1;
+    }
     // Entry 6: Debug
     z = 0;
-    while z < 8 { pe.push(0); z = z + 1; }
+    while z < 8 {
+        pe.push(0);
+        z = z + 1;
+    }
     // Entry 7: Architecture
     z = 0;
-    while z < 8 { pe.push(0); z = z + 1; }
+    while z < 8 {
+        pe.push(0);
+        z = z + 1;
+    }
     // Entry 8: Global Ptr
     z = 0;
-    while z < 8 { pe.push(0); z = z + 1; }
+    while z < 8 {
+        pe.push(0);
+        z = z + 1;
+    }
     // Entry 9: TLS Table
     z = 0;
-    while z < 8 { pe.push(0); z = z + 1; }
+    while z < 8 {
+        pe.push(0);
+        z = z + 1;
+    }
     // Entry 10: Load Config Table
     z = 0;
-    while z < 8 { pe.push(0); z = z + 1; }
+    while z < 8 {
+        pe.push(0);
+        z = z + 1;
+    }
     // Entry 11: Bound Import
     z = 0;
-    while z < 8 { pe.push(0); z = z + 1; }
+    while z < 8 {
+        pe.push(0);
+        z = z + 1;
+    }
     // Entry 12: IAT
     pe = pe_push_u32(pe, iat_rva);
     pe = pe_push_u32(pe, iat_size);
     // Entry 13: Delay Import Descriptor
     z = 0;
-    while z < 8 { pe.push(0); z = z + 1; }
+    while z < 8 {
+        pe.push(0);
+        z = z + 1;
+    }
     // Entry 14: CLR Runtime Header
     z = 0;
-    while z < 8 { pe.push(0); z = z + 1; }
+    while z < 8 {
+        pe.push(0);
+        z = z + 1;
+    }
     // Entry 15: Reserved
     z = 0;
-    while z < 8 { pe.push(0); z = z + 1; }
+    while z < 8 {
+        pe.push(0);
+        z = z + 1;
+    }
 
     // ─── Section Headers ───
     // .text section (40 bytes)
     pe = pe_push_str(pe, ".text");
-    pe.push(0); pe.push(0); pe.push(0); // Name (8 bytes)
-    pe = pe_push_u32(pe, text_virt_size); // VirtualSize
-    pe = pe_push_u32(pe, PE_TEXT_RVA); // VirtualAddress
-    pe = pe_push_u32(pe, text_raw_size); // SizeOfRawData
-    pe = pe_push_u32(pe, PE_FILE_ALIGN); // PointerToRawData
-    pe = pe_push_u32(pe, 0); // PointerToRelocations
-    pe = pe_push_u32(pe, 0); // PointerToLinenumbers
-    pe = pe_push_u16(pe, 0); // NumberOfRelocations
-    pe = pe_push_u16(pe, 0); // NumberOfLinenumbers
-    pe = pe_push_u32(pe, 0x60000020); // Characteristics: CODE|EXECUTE|READ
+    pe.push(0);
+    pe.push(0);
+    pe.push(0);
+    // Name (8 bytes)
+    pe = pe_push_u32(pe, text_virt_size);
+    // VirtualSize
+    pe = pe_push_u32(pe, PE_TEXT_RVA);
+    // VirtualAddress
+    pe = pe_push_u32(pe, text_raw_size);
+    // SizeOfRawData
+    pe = pe_push_u32(pe, PE_FILE_ALIGN);
+    // PointerToRawData
+    pe = pe_push_u32(pe, 0);
+    // PointerToRelocations
+    pe = pe_push_u32(pe, 0);
+    // PointerToLinenumbers
+    pe = pe_push_u16(pe, 0);
+    // NumberOfRelocations
+    pe = pe_push_u16(pe, 0);
+    // NumberOfLinenumbers
+    pe = pe_push_u32(pe, 0x60000020);
+    // Characteristics: CODE|EXECUTE|READ
 
     // .rdata section (40 bytes)
     pe = pe_push_str(pe, ".rdata");
-    pe.push(0); pe.push(0); // Name (8 bytes)
-    pe = pe_push_u32(pe, rdata_virt_size); // VirtualSize
-    pe = pe_push_u32(pe, rdata_rva); // VirtualAddress
-    pe = pe_push_u32(pe, rdata_raw_size); // SizeOfRawData
-    pe = pe_push_u32(pe, PE_FILE_ALIGN + text_raw_size); // PointerToRawData
-    pe = pe_push_u32(pe, 0); // PointerToRelocations
-    pe = pe_push_u32(pe, 0); // PointerToLinenumbers
-    pe = pe_push_u16(pe, 0); // NumberOfRelocations
-    pe = pe_push_u16(pe, 0); // NumberOfLinenumbers
-    pe = pe_push_u32(pe, 0xC0000040); // Characteristics: INITIALIZED_DATA|READ|WRITE (IAT needs write)
+    pe.push(0);
+    pe.push(0);
+    // Name (8 bytes)
+    pe = pe_push_u32(pe, rdata_virt_size);
+    // VirtualSize
+    pe = pe_push_u32(pe, rdata_rva);
+    // VirtualAddress
+    pe = pe_push_u32(pe, rdata_raw_size);
+    // SizeOfRawData
+    pe = pe_push_u32(pe, PE_FILE_ALIGN + text_raw_size);
+    // PointerToRawData
+    pe = pe_push_u32(pe, 0);
+    // PointerToRelocations
+    pe = pe_push_u32(pe, 0);
+    // PointerToLinenumbers
+    pe = pe_push_u16(pe, 0);
+    // NumberOfRelocations
+    pe = pe_push_u16(pe, 0);
+    // NumberOfLinenumbers
+    pe = pe_push_u32(pe, 0xC0000040);
+    // Characteristics: INITIALIZED_DATA|READ|WRITE (IAT needs write)
 
     // Pad headers to FILE_ALIGN
     while pe.len() < header_size {
@@ -2560,8 +2830,7 @@ pub fn pe_build_file(text: Vec<i64>, rdata: Vec<i64>, entry_point_rva: i64, impo
     while ti < text.len() {
         pe.push(text.get(ti));
         ti = ti + 1;
-    }
-    while pe.len() < header_size + text_raw_size {
+    } while pe.len() < header_size + text_raw_size {
         pe.push(0);
     }
 
@@ -2570,8 +2839,7 @@ pub fn pe_build_file(text: Vec<i64>, rdata: Vec<i64>, entry_point_rva: i64, impo
     while ri < rdata.len() {
         pe.push(rdata.get(ri));
         ri = ri + 1;
-    }
-    while pe.len() < header_size + text_raw_size + rdata_raw_size {
+    } while pe.len() < header_size + text_raw_size + rdata_raw_size {
         pe.push(0);
     }
 

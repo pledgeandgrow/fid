@@ -35,59 +35,20 @@
 // worklist): unused code is never emitted.
 
 module compiler::wasm;
-
-use core;
-use vec;
-use string;
-use compiler::ir;
-use compiler::ast;
-use compiler::checks;
-
+ use core; use vec; use string; use compiler::ir; use compiler::ast; use compiler::checks;
 // WASM value types
-const WT_I32: i64 = 0x7F;
-const WT_I64: i64 = 0x7E;
-const WT_VOID: i64 = 0x40;
-
+const WT_I32: i64 = 0x7F; const WT_I64: i64 = 0x7E; const WT_VOID: i64 = 0x40;
 // Section ids
-const SEC_TYPE: i64 = 1;
-const SEC_IMPORT: i64 = 2;
-const SEC_FUNCTION: i64 = 3;
-const SEC_TABLE: i64 = 4;
-const SEC_MEMORY: i64 = 5;
-const SEC_GLOBAL: i64 = 6;
-const SEC_EXPORT: i64 = 7;
-const SEC_ELEM: i64 = 9;
-const SEC_CODE: i64 = 10;
-const SEC_DATA: i64 = 11;
-
+const SEC_TYPE: i64 = 1; const SEC_IMPORT: i64 = 2; const SEC_FUNCTION: i64 = 3; const SEC_TABLE: i64 = 4; const SEC_MEMORY: i64 = 5; const SEC_GLOBAL: i64 = 6; const SEC_EXPORT: i64 = 7; const SEC_ELEM: i64 = 9; const SEC_CODE: i64 = 10; const SEC_DATA: i64 = 11;
 // Memory layout
-const WG_STACK_LO: i64 = 1024;
-const WG_STACK_TOP: i64 = 8389632;     // 1024 + 8 MB
-const WG_DATA_BASE: i64 = 8389632;
-// What nat_ctx_tramp returns: marks a task's first context record
+const WG_STACK_LO: i64 = 1024; const WG_STACK_TOP: i64 = 8389632;  // 1024 + 8 MB
+const WG_DATA_BASE: i64 = 8389632;  // What nat_ctx_tramp returns: marks a task's first context record
 const WG_TRAMP: i64 = 0x7A5E7A5E;
-
 // The arithmetic panics (nat_ir's NP_*)
-const WP_ADD: i64 = 0;
-const WP_SUB: i64 = 1;
-const WP_MUL: i64 = 2;
-const WP_DIV_OVF: i64 = 3;
-const WP_DIV_ZERO: i64 = 4;
-const WP_MOD_ZERO: i64 = 5;
-
+const WP_ADD: i64 = 0; const WP_SUB: i64 = 1; const WP_MUL: i64 = 2; const WP_DIV_OVF: i64 = 3; const WP_DIV_ZERO: i64 = 4; const WP_MOD_ZERO: i64 = 5;
 // Integer compare kinds
-const WCC_EQ: i64 = 0;
-const WCC_NE: i64 = 1;
-const WCC_LT: i64 = 2;
-const WCC_LE: i64 = 3;
-const WCC_GT: i64 = 4;
-const WCC_GE: i64 = 5;
-const WCC_LTU: i64 = 6;
-const WCC_LEU: i64 = 7;
-const WCC_GTU: i64 = 8;
-const WCC_GEU: i64 = 9;
-
-fn wg_panic_messages() -> Vec<str> {
+const WCC_EQ: i64 = 0; const WCC_NE: i64 = 1; const WCC_LT: i64 = 2; const WCC_LE: i64 = 3; const WCC_GT: i64 = 4; const WCC_GE: i64 = 5; const WCC_LTU: i64 = 6; const WCC_LEU: i64 = 7; const WCC_GTU: i64 = 8; const WCC_GEU: i64 = 9;
+ fn wg_panic_messages() -> Vec<str> {
     var v: Vec<str> = Vec::new();
     v.push("Integer overflow on addition");
     v.push("Integer overflow on subtraction");
@@ -163,54 +124,13 @@ pub struct WasmGen {
 
 fn WasmGen_new() -> WasmGen {
     return WasmGen {
-        all_fns: HashMap_new(),
-        fn_index: HashMap_new(),
-        queue: Vec::new(),
-        def_types: Vec::new(),
-        n_imports: 0,
-        imp_names: Vec::new(),
-        imp_sigs: Vec::new(),
-        imp_index: HashMap_new(),
-        type_keys: Vec::new(),
-        type_index: HashMap_new(),
-        table: Vec::new(),
-        table_index: HashMap_new(),
-        data: Vec::new(),
-        str_addr: HashMap_new(),
-        glob_addr: HashMap_new(),
-        globs: Vec::new(),
-        named_fns: Vec::new(),
-        named_seen: HashMap_new(),
-        dyn_types: Vec::new(),
-        c_names: HashMap_new(),
-        c_list: Vec::new(),
-        unresolved: Vec::new(),
-        unresolved_seen: HashMap_new(),
-        b: Vec::new(),
-        cur_name: "",
-        cur_wrapping: false,
-        unchecked: Vec::new(),
-        local_of: Vec::new(),
-        alloca_off: Vec::new(),
-        frame: 0,
-        va_off: 0 - 1,
-        t0: 0,
-        t1: 0,
-        t2: 0,
-        t3: 0,
-        fp: 0,
-        cur: 0,
-        block_index: HashMap_new(),
-        nblocks: 0,
-        k: 0,
-        extra: 0,
-        cur_inst_line: 0,
+        all_fns: HashMap_new(), fn_index: HashMap_new(), queue: Vec::new(), def_types: Vec::new(), n_imports: 0, imp_names: Vec::new(), imp_sigs: Vec::new(), imp_index: HashMap_new(), type_keys: Vec::new(), type_index: HashMap_new(), table: Vec::new(), table_index: HashMap_new(), data: Vec::new(), str_addr: HashMap_new(), glob_addr: HashMap_new(), globs: Vec::new(), named_fns: Vec::new(), named_seen: HashMap_new(), dyn_types: Vec::new(), c_names: HashMap_new(), c_list: Vec::new(), unresolved: Vec::new(), unresolved_seen: HashMap_new(), b: Vec::new(), cur_name: "", cur_wrapping: false, unchecked: Vec::new(), local_of: Vec::new(), alloca_off: Vec::new(), frame: 0, va_off: 0 - 1, t0: 0, t1: 0, t2: 0, t3: 0, fp: 0, cur: 0, block_index: HashMap_new(), nblocks: 0, k: 0, extra: 0, cur_inst_line: 0,
     };
 }
 
 // ─── Bytes ─────────────────────────────────────────────────────────────
 
-fn wb_uleb(out: &mut Vec<i64>, v: i64) {
+fn wb_uleb(out: & mut Vec<i64>, v: i64) {
     var x: i64 = v;
     while true {
         var byte: i64 = x & 0x7F;
@@ -224,7 +144,7 @@ fn wb_uleb(out: &mut Vec<i64>, v: i64) {
     }
 }
 
-fn wb_sleb(out: &mut Vec<i64>, v: i64) {
+fn wb_sleb(out: & mut Vec<i64>, v: i64) {
     var x: i64 = v;
     while true {
         var byte: i64 = x & 0x7F;
@@ -238,7 +158,7 @@ fn wb_sleb(out: &mut Vec<i64>, v: i64) {
     }
 }
 
-fn wb_name(out: &mut Vec<i64>, s: str) {
+fn wb_name(out: & mut Vec<i64>, s: str) {
     var n: i64 = str_len(s);
     wb_uleb(out, n);
     var i: i64 = 0;
@@ -248,7 +168,7 @@ fn wb_name(out: &mut Vec<i64>, s: str) {
     }
 }
 
-fn wb_append(out: &mut Vec<i64>, bs: &Vec<i64>) {
+fn wb_append(out: & mut Vec<i64>, bs: & Vec<i64>) {
     var i: i64 = 0;
     var n: i64 = bs.len();
     while i < n {
@@ -258,7 +178,7 @@ fn wb_append(out: &mut Vec<i64>, bs: &Vec<i64>) {
 }
 
 /// A section: id, size, contents.
-fn wb_section(out: &mut Vec<i64>, id: i64, contents: &Vec<i64>) {
+fn wb_section(out: & mut Vec<i64>, id: i64, contents: & Vec<i64>) {
     out.push(id);
     wb_uleb(out, contents.len());
     wb_append(out, contents);
@@ -266,37 +186,119 @@ fn wb_section(out: &mut Vec<i64>, id: i64, contents: &Vec<i64>) {
 
 // ─── Instructions into the current body ────────────────────────────────
 
-fn w(g: &mut WasmGen, byte: i64) { g.b.push(byte & 0xFF); }
-fn wu(g: &mut WasmGen, v: i64) { wb_uleb(&mut g.b, v); }
-fn wi64(g: &mut WasmGen, v: i64) { w(g, 0x42); wb_sleb(&mut g.b, v); }
-fn wi32(g: &mut WasmGen, v: i64) { w(g, 0x41); wb_sleb(&mut g.b, v); }
-fn wlget(g: &mut WasmGen, l: i64) { w(g, 0x20); wu(g, l); }
-fn wlset(g: &mut WasmGen, l: i64) { w(g, 0x21); wu(g, l); }
-fn wltee(g: &mut WasmGen, l: i64) { w(g, 0x22); wu(g, l); }
-fn wgget(g: &mut WasmGen, x: i64) { w(g, 0x23); wu(g, x); }
-fn wgset(g: &mut WasmGen, x: i64) { w(g, 0x24); wu(g, x); }
-fn wend(g: &mut WasmGen) { w(g, 0x0B); }
-fn wbr(g: &mut WasmGen, depth: i64) { w(g, 0x0C); wu(g, depth); }
-fn wif(g: &mut WasmGen) { w(g, 0x04); w(g, WT_VOID); g.extra = g.extra + 1; }
-fn wif_t(g: &mut WasmGen, t: i64) { w(g, 0x04); w(g, t); g.extra = g.extra + 1; }
-fn welse(g: &mut WasmGen) { w(g, 0x05); }
-fn wendif(g: &mut WasmGen) { w(g, 0x0B); g.extra = g.extra - 1; }
-fn wcall(g: &mut WasmGen, fidx: i64) { w(g, 0x10); wu(g, fidx); }
-fn wwrap(g: &mut WasmGen) { w(g, 0xA7); }
-fn wextu(g: &mut WasmGen) { w(g, 0xAD); }
-fn wexts(g: &mut WasmGen) { w(g, 0xAC); }
+fn w(g: & mut WasmGen, byte: i64) {
+    g.b.push(byte & 0xFF);
+}
+
+fn wu(g: & mut WasmGen, v: i64) {
+    wb_uleb(& mut g.b, v);
+}
+
+fn wi64(g: & mut WasmGen, v: i64) {
+    w(g, 0x42);
+    wb_sleb(& mut g.b, v);
+}
+
+fn wi32(g: & mut WasmGen, v: i64) {
+    w(g, 0x41);
+    wb_sleb(& mut g.b, v);
+}
+
+fn wlget(g: & mut WasmGen, l: i64) {
+    w(g, 0x20);
+    wu(g, l);
+}
+
+fn wlset(g: & mut WasmGen, l: i64) {
+    w(g, 0x21);
+    wu(g, l);
+}
+
+fn wltee(g: & mut WasmGen, l: i64) {
+    w(g, 0x22);
+    wu(g, l);
+}
+
+fn wgget(g: & mut WasmGen, x: i64) {
+    w(g, 0x23);
+    wu(g, x);
+}
+
+fn wgset(g: & mut WasmGen, x: i64) {
+    w(g, 0x24);
+    wu(g, x);
+}
+
+fn wend(g: & mut WasmGen) {
+    w(g, 0x0B);
+}
+
+fn wbr(g: & mut WasmGen, depth: i64) {
+    w(g, 0x0C);
+    wu(g, depth);
+}
+
+fn wif(g: & mut WasmGen) {
+    w(g, 0x04);
+    w(g, WT_VOID);
+    g.extra = g.extra + 1;
+}
+
+fn wif_t(g: & mut WasmGen, t: i64) {
+    w(g, 0x04);
+    w(g, t);
+    g.extra = g.extra + 1;
+}
+
+fn welse(g: & mut WasmGen) {
+    w(g, 0x05);
+}
+
+fn wendif(g: & mut WasmGen) {
+    w(g, 0x0B);
+    g.extra = g.extra - 1;
+}
+
+fn wcall(g: & mut WasmGen, fidx: i64) {
+    w(g, 0x10);
+    wu(g, fidx);
+}
+
+fn wwrap(g: & mut WasmGen) {
+    w(g, 0xA7);
+}
+
+fn wextu(g: & mut WasmGen) {
+    w(g, 0xAD);
+}
+
+fn wexts(g: & mut WasmGen) {
+    w(g, 0xAC);
+}
 
 /// i64 load of `size` bytes at [top-of-stack address + off] (an i64 address)
-fn wload(g: &mut WasmGen, size: i64, signed: bool, off: i64) {
+fn wload(g: & mut WasmGen, size: i64, signed: bool, off: i64) {
     wwrap(g);
     if size == 1 {
-        if signed { w(g, 0x30); } else { w(g, 0x31); }
+        if signed {
+            w(g, 0x30);
+        } else {
+            w(g, 0x31);
+        }
         wu(g, 0);
     } else if size == 2 {
-        if signed { w(g, 0x32); } else { w(g, 0x33); }
+        if signed {
+            w(g, 0x32);
+        } else {
+            w(g, 0x33);
+        }
         wu(g, 1);
     } else if size == 4 {
-        if signed { w(g, 0x34); } else { w(g, 0x35); }
+        if signed {
+            w(g, 0x34);
+        } else {
+            w(g, 0x35);
+        }
         wu(g, 2);
     } else {
         w(g, 0x29);
@@ -306,121 +308,239 @@ fn wload(g: &mut WasmGen, size: i64, signed: bool, off: i64) {
 }
 
 /// i64 store of `size` bytes; the stack is [i32 address, i64 value]
-fn wstore(g: &mut WasmGen, size: i64, off: i64) {
-    if size == 1 { w(g, 0x3C); wu(g, 0); }
-    else if size == 2 { w(g, 0x3D); wu(g, 1); }
-    else if size == 4 { w(g, 0x3E); wu(g, 2); }
-    else { w(g, 0x37); wu(g, 3); }
+fn wstore(g: & mut WasmGen, size: i64, off: i64) {
+    if size == 1 {
+        w(g, 0x3C);
+        wu(g, 0);
+    } else if size == 2 {
+        w(g, 0x3D);
+        wu(g, 1);
+    } else if size == 4 {
+        w(g, 0x3E);
+        wu(g, 2);
+    } else {
+        w(g, 0x37);
+        wu(g, 3);
+    }
     wu(g, off);
 }
 
 /// The local of value `id` (-1: none)
-fn wg_local(g: &WasmGen, id: i64) -> i64 {
-    if id < 0 || id >= g.local_of.len() { return 0 - 1; }
+fn wg_local(g: & WasmGen, id: i64) -> i64 {
+    if id < 0 || id >= g.local_of.len() {
+        return 0 - 1;
+    }
     return g.local_of.get(id);
 }
 
 /// Push value `id` (0 for a value without a local)
-fn wget(g: &mut WasmGen, id: i64) {
+fn wget(g: & mut WasmGen, id: i64) {
     var l: i64 = wg_local(g, id);
-    if l < 0 { wi64(g, 0); } else { wlget(g, l); }
+    if l < 0 {
+        wi64(g, 0);
+    } else {
+        wlget(g, l);
+    }
 }
 
 /// Pop into value `id`
-fn wset(g: &mut WasmGen, id: i64) {
+fn wset(g: & mut WasmGen, id: i64) {
     var l: i64 = wg_local(g, id);
-    if l < 0 { w(g, 0x1A); } else { wlset(g, l); }
+    if l < 0 {
+        w(g, 0x1A);
+    } else {
+        wlset(g, l);
+    }
 }
 
 /// Push value `id` as an i32 address
-fn wget_addr(g: &mut WasmGen, id: i64) {
+fn wget_addr(g: & mut WasmGen, id: i64) {
     wget(g, id);
     wwrap(g);
 }
 
 /// i64 comparison of the two values on the stack -> i64 0/1
-fn wcmp(g: &mut WasmGen, cc: i64) {
-    if cc == WCC_EQ { w(g, 0x51); }
-    else if cc == WCC_NE { w(g, 0x52); }
-    else if cc == WCC_LT { w(g, 0x53); }
-    else if cc == WCC_LTU { w(g, 0x54); }
-    else if cc == WCC_GT { w(g, 0x55); }
-    else if cc == WCC_GTU { w(g, 0x56); }
-    else if cc == WCC_LE { w(g, 0x57); }
-    else if cc == WCC_LEU { w(g, 0x58); }
-    else if cc == WCC_GE { w(g, 0x59); }
-    else { w(g, 0x5A); }
+fn wcmp(g: & mut WasmGen, cc: i64) {
+    if cc == WCC_EQ {
+        w(g, 0x51);
+    } else if cc == WCC_NE {
+        w(g, 0x52);
+    } else if cc == WCC_LT {
+        w(g, 0x53);
+    } else if cc == WCC_LTU {
+        w(g, 0x54);
+    } else if cc == WCC_GT {
+        w(g, 0x55);
+    } else if cc == WCC_GTU {
+        w(g, 0x56);
+    } else if cc == WCC_LE {
+        w(g, 0x57);
+    } else if cc == WCC_LEU {
+        w(g, 0x58);
+    } else if cc == WCC_GE {
+        w(g, 0x59);
+    } else {
+        w(g, 0x5A);
+    }
     wextu(g);
 }
 
 /// Normalize the i64 on the stack to narrow type `ty` (nat_ir's ng_ext)
-fn wnarrow(g: &mut WasmGen, ty: IrType) {
+fn wnarrow(g: & mut WasmGen, ty: IrType) {
     match ty {
-        IrType::I8 => { w(g, 0xC2); }
-        IrType::I16 => { w(g, 0xC3); }
-        IrType::I32 => { w(g, 0xC4); }
-        IrType::U8 => { wi64(g, 0xFF); w(g, 0x83); }
-        IrType::U16 => { wi64(g, 0xFFFF); w(g, 0x83); }
-        IrType::U32 => { wi64(g, 0xFFFFFFFF); w(g, 0x83); }
-        _ => {}
+        IrType::I8 => {
+            w(g, 0xC2);
+        }
+        IrType::I16 => {
+            w(g, 0xC3);
+        }
+        IrType::I32 => {
+            w(g, 0xC4);
+        }
+        IrType::U8 => {
+            wi64(g, 0xFF);
+            w(g, 0x83);
+        }
+        IrType::U16 => {
+            wi64(g, 0xFFFF);
+            w(g, 0x83);
+        }
+        IrType::U32 => {
+            wi64(g, 0xFFFFFFFF);
+            w(g, 0x83);
+        }
+        _ => {
+        }
     }
 }
 
 fn wg_is_narrow(ty: IrType) -> bool {
     match ty {
-        IrType::I8 => { return true; }
-        IrType::I16 => { return true; }
-        IrType::I32 => { return true; }
-        IrType::U8 => { return true; }
-        IrType::U16 => { return true; }
-        IrType::U32 => { return true; }
-        _ => {}
+        IrType::I8 => {
+            return true;
+        }
+        IrType::I16 => {
+            return true;
+        }
+        IrType::I32 => {
+            return true;
+        }
+        IrType::U8 => {
+            return true;
+        }
+        IrType::U16 => {
+            return true;
+        }
+        IrType::U32 => {
+            return true;
+        }
+        _ => {
+        }
     }
     return false;
 }
 
 /// Push value `id` as an f64 (its bits reinterpreted), or an f32
-fn wget_f(g: &mut WasmGen, id: i64, is32: bool) {
+fn wget_f(g: & mut WasmGen, id: i64, is32: bool) {
     wget(g, id);
-    if is32 { wwrap(g); w(g, 0xBE); } else { w(g, 0xBF); }
+    if is32 {
+        wwrap(g);
+        w(g, 0xBE);
+    } else {
+        w(g, 0xBF);
+    }
 }
 
 /// The float on the stack back to bits (i64)
-fn wf_bits(g: &mut WasmGen, is32: bool) {
-    if is32 { w(g, 0xBC); wextu(g); } else { w(g, 0xBD); }
+fn wf_bits(g: & mut WasmGen, is32: bool) {
+    if is32 {
+        w(g, 0xBC);
+        wextu(g);
+    } else {
+        w(g, 0xBD);
+    }
 }
 
 // ─── Names: functions, types, strings, globals ─────────────────────────
 
 /// Parameter count of primitive `name` (written here in WASM), -1 if none.
 fn wg_prim_params(name: str) -> i64 {
-    if name == "nat_syscall" { return 7; }
-    if name == "nat_start_sp" { return 0; }
-    if name == "nat_atomic_load" { return 1; }
-    if name == "nat_atomic_store" { return 2; }
-    if name == "nat_atomic_add" { return 2; }
-    if name == "nat_atomic_cas" { return 3; }
-    if name == "nat_ctx_swap" { return 2; }
-    if name == "nat_ctx_tramp" { return 0; }
-    if name == "nat_clone_thread" { return 5; }
-    if name == "nat_call_fn" { return 3; }
-    if name == "nat_fn_table" { return 0; }
-    if name == "nat_tls_get" { return 0; }
-    if name == "nat_tls_set" { return 1; }
-    if name == "nat_frame_fp" { return 0; }
-    if name == "nat_frame_ret" { return 1; }
-    if name == "nat_frame_next" { return 1; }
-    if name == "nat_fn_names" { return 0; }
-    if name == "nat_sig_handler" { return 0; }
-    if name == "nat_sig_restorer" { return 0; }
-    if name == "nat_fma" { return 3; }
-    if name == "nat_arch" { return 0; }
-    if name == "nat_os" { return 0; }
-    if name == "nat_wasm_grow" { return 1; }
-    if name == "nat_wasm_size" { return 0; }
-    if name == "nat_wasm_zero" { return 2; }
-    if name == "nat_c_sqrt" || name == "nat_c_fabs" || name == "nat_c_floor" || name == "nat_c_ceil"
-        || name == "nat_c_trunc" || name == "nat_c_round" {
+    if name == "nat_syscall" {
+        return 7;
+    }
+    if name == "nat_start_sp" {
+        return 0;
+    }
+    if name == "nat_atomic_load" {
+        return 1;
+    }
+    if name == "nat_atomic_store" {
+        return 2;
+    }
+    if name == "nat_atomic_add" {
+        return 2;
+    }
+    if name == "nat_atomic_cas" {
+        return 3;
+    }
+    if name == "nat_ctx_swap" {
+        return 2;
+    }
+    if name == "nat_ctx_tramp" {
+        return 0;
+    }
+    if name == "nat_clone_thread" {
+        return 5;
+    }
+    if name == "nat_call_fn" {
+        return 3;
+    }
+    if name == "nat_fn_table" {
+        return 0;
+    }
+    if name == "nat_tls_get" {
+        return 0;
+    }
+    if name == "nat_tls_set" {
+        return 1;
+    }
+    if name == "nat_frame_fp" {
+        return 0;
+    }
+    if name == "nat_frame_ret" {
+        return 1;
+    }
+    if name == "nat_frame_next" {
+        return 1;
+    }
+    if name == "nat_fn_names" {
+        return 0;
+    }
+    if name == "nat_sig_handler" {
+        return 0;
+    }
+    if name == "nat_sig_restorer" {
+        return 0;
+    }
+    if name == "nat_fma" {
+        return 3;
+    }
+    if name == "nat_arch" {
+        return 0;
+    }
+    if name == "nat_os" {
+        return 0;
+    }
+    if name == "nat_wasm_grow" {
+        return 1;
+    }
+    if name == "nat_wasm_size" {
+        return 0;
+    }
+    if name == "nat_wasm_zero" {
+        return 2;
+    }
+    if name == "nat_c_sqrt" || name == "nat_c_fabs" || name == "nat_c_floor" || name == "nat_c_ceil" || name == "nat_c_trunc" || name == "nat_c_round" {
         return 1;
     }
     return 0 - 1;
@@ -429,68 +549,108 @@ fn wg_prim_params(name: str) -> i64 {
 /// The WASI preview-1 functions the runtime's `wasi_<name>` externs name,
 /// with their signatures (i: i32, I: i64; after '>' the result).
 fn wg_wasi_sig(name: str) -> str {
-    if name == "fd_write" || name == "fd_read" || name == "poll_oneoff" { return "iiii>i"; }
-    if name == "fd_close" { return "i>i"; }
-    if name == "fd_seek" { return "iIii>i"; }
-    if name == "fd_readdir" { return "iiiIi>i"; }
-    if name == "path_open" { return "iiiiiIIii>i"; }
-    if name == "path_filestat_get" { return "iiiii>i"; }
-    if name == "path_unlink_file" || name == "path_remove_directory" || name == "path_create_directory" { return "iii>i"; }
-    if name == "path_rename" { return "iiiiii>i"; }
-    if name == "proc_exit" { return "i>"; }
-    if name == "clock_time_get" { return "iIi>i"; }
-    if name == "random_get" || name == "args_sizes_get" || name == "args_get"
-        || name == "environ_sizes_get" || name == "environ_get" {
+    if name == "fd_write" || name == "fd_read" || name == "poll_oneoff" {
+        return "iiii>i";
+    }
+    if name == "fd_close" {
+        return "i>i";
+    }
+    if name == "fd_seek" {
+        return "iIii>i";
+    }
+    if name == "fd_readdir" {
+        return "iiiIi>i";
+    }
+    if name == "path_open" {
+        return "iiiiiIIii>i";
+    }
+    if name == "path_filestat_get" {
+        return "iiiii>i";
+    }
+    if name == "path_unlink_file" || name == "path_remove_directory" || name == "path_create_directory" {
+        return "iii>i";
+    }
+    if name == "path_rename" {
+        return "iiiiii>i";
+    }
+    if name == "proc_exit" {
+        return "i>";
+    }
+    if name == "clock_time_get" {
+        return "iIi>i";
+    }
+    if name == "random_get" || name == "args_sizes_get" || name == "args_get" || name == "environ_sizes_get" || name == "environ_get" {
         return "ii>i";
     }
-    if name == "sched_yield" { return ">i"; }
-    if name == "fd_prestat_get" { return "ii>i"; }
-    if name == "fd_prestat_dir_name" { return "iii>i"; }
+    if name == "sched_yield" {
+        return ">i";
+    }
+    if name == "fd_prestat_get" {
+        return "ii>i";
+    }
+    if name == "fd_prestat_dir_name" {
+        return "iii>i";
+    }
     return "";
 }
 
-fn wg_has_fn(g: &WasmGen, name: str) -> bool {
+fn wg_has_fn(g: & WasmGen, name: str) -> bool {
     return HashMap_contains(g.all_fns, name);
 }
 
 /// Parameter count of a function or primitive (-1: neither)
-fn wg_nparams(g: &WasmGen, name: str) -> i64 {
-    if HashMap_contains(g.all_fns, name) { return HashMap_get(g.all_fns, name) - 1; }
+fn wg_nparams(g: & WasmGen, name: str) -> i64 {
+    if HashMap_contains(g.all_fns, name) {
+        return HashMap_get(g.all_fns, name) - 1;
+    }
     return wg_prim_params(name);
 }
 
 /// The type index of signature `key`
-fn wg_type(g: &mut WasmGen, key: str) -> i64 {
-    if HashMap_contains(g.type_index, key) { return HashMap_get(g.type_index, key) - 1; }
+fn wg_type(g: & mut WasmGen, key: str) -> i64 {
+    if HashMap_contains(g.type_index, key) {
+        return HashMap_get(g.type_index, key) - 1;
+    }
     g.type_keys.push(key);
     HashMap_insert(g.type_index, key, g.type_keys.len());
     return g.type_keys.len() - 1;
 }
 
 /// The type of a function of n i64 parameters returning an i64
-fn wg_type_n(g: &mut WasmGen, n: i64) -> i64 {
+fn wg_type_n(g: & mut WasmGen, n: i64) -> i64 {
     var key: str = "";
     var i: i64 = 0;
-    while i < n { key = key + "I"; i = i + 1; }
+    while i < n {
+        key = key + "I";
+        i = i + 1;
+    }
     return wg_type(g, key + ">I");
 }
 
 /// The function a call to `name` runs: an alias (p_vec_* -> core's
 /// Vec_*), the runtime's pert_X for builtin p_X, else `name`.
-fn wg_resolve(g: &WasmGen, name: str) -> str {
+fn wg_resolve(g: & WasmGen, name: str) -> str {
     var alias: str = pe_runtime_alias(name);
-    if alias != name { return alias; }
+    if alias != name {
+        return alias;
+    }
     var p: str = pert_name(name);
-    if p != "" && wg_has_fn(g, p) { return p; }
+    if p != "" && wg_has_fn(g, p) {
+        return p;
+    }
     return name;
 }
 
 /// The index of function `name`, queueing it for compilation; -1 when the
 /// program defines no such function and it is not a primitive.
-fn wg_fn_ref(g: &mut WasmGen, name: str) -> i64 {
-    if HashMap_contains(g.fn_index, name) { return HashMap_get(g.fn_index, name); }
+fn wg_fn_ref(g: & mut WasmGen, name: str) -> i64 {
+    if HashMap_contains(g.fn_index, name) {
+        return HashMap_get(g.fn_index, name);
+    }
     var np: i64 = wg_nparams(g, name);
-    if np < 0 { return 0 - 1; }
+    if np < 0 {
+        return 0 - 1;
+    }
     var idx: i64 = g.n_imports + g.def_types.len();
     HashMap_insert(g.fn_index, name, idx);
     g.def_types.push(wg_type_n(g, np));
@@ -499,29 +659,37 @@ fn wg_fn_ref(g: &mut WasmGen, name: str) -> i64 {
 }
 
 /// The table index of function `name` (0: none)
-fn wg_table_ref(g: &mut WasmGen, name: str) -> i64 {
-    if HashMap_contains(g.table_index, name) { return HashMap_get(g.table_index, name); }
+fn wg_table_ref(g: & mut WasmGen, name: str) -> i64 {
+    if HashMap_contains(g.table_index, name) {
+        return HashMap_get(g.table_index, name);
+    }
     var f: i64 = wg_fn_ref(g, name);
-    if f < 0 { return 0; }
+    if f < 0 {
+        return 0;
+    }
     g.table.push(f);
     HashMap_insert(g.table_index, name, g.table.len());
     return g.table.len();
 }
 
-fn wg_unresolved(g: &mut WasmGen, name: str) {
+fn wg_unresolved(g: & mut WasmGen, name: str) {
     if !HashMap_contains(g.unresolved_seen, name) {
         HashMap_insert(g.unresolved_seen, name, 1);
         g.unresolved.push(name + " (from " + g.cur_name + ")");
     }
 }
 
-fn wg_data_align(g: &mut WasmGen) {
-    while g.data.len() % 8 != 0 { g.data.push(0); }
+fn wg_data_align(g: & mut WasmGen) {
+    while g.data.len() % 8 != 0 {
+        g.data.push(0);
+    }
 }
 
 /// The address of string constant `s` (its bytes and a NUL, 8-aligned)
-fn wg_str(g: &mut WasmGen, s: str) -> i64 {
-    if HashMap_contains(g.str_addr, s) { return HashMap_get(g.str_addr, s); }
+fn wg_str(g: & mut WasmGen, s: str) -> i64 {
+    if HashMap_contains(g.str_addr, s) {
+        return HashMap_get(g.str_addr, s);
+    }
     wg_data_align(g);
     var a: i64 = WG_DATA_BASE + g.data.len();
     HashMap_insert(g.str_addr, s, a);
@@ -536,8 +704,10 @@ fn wg_str(g: &mut WasmGen, s: str) -> i64 {
 }
 
 /// The address of global `name` (its value is written at the end)
-fn wg_glob(g: &mut WasmGen, name: str, module: &IrModule) -> i64 {
-    if HashMap_contains(g.glob_addr, name) { return HashMap_get(g.glob_addr, name); }
+fn wg_glob(g: & mut WasmGen, name: str, module: & IrModule) -> i64 {
+    if HashMap_contains(g.glob_addr, name) {
+        return HashMap_get(g.glob_addr, name);
+    }
     wg_data_align(g);
     var a: i64 = WG_DATA_BASE + g.data.len();
     HashMap_insert(g.glob_addr, name, a);
@@ -546,17 +716,23 @@ fn wg_glob(g: &mut WasmGen, name: str, module: &IrModule) -> i64 {
     match IrModule_get_global(module, name) {
         OptGlobalLookup::Some(gty, _) => {
             size = IrModule_type_size(module, gty);
-            if size < 8 { size = 8; }
+            if size < 8 {
+                size = 8;
+            }
             size = (size + 7) & (0 - 8);
         }
-        OptGlobalLookup::None => {}
+        OptGlobalLookup::None => {
+        }
     }
     var i: i64 = 0;
-    while i < size { g.data.push(0); i = i + 1; }
+    while i < size {
+        g.data.push(0);
+        i = i + 1;
+    }
     return a;
 }
 
-fn wg_data_word(g: &mut WasmGen, addr: i64, v: i64) {
+fn wg_data_word(g: & mut WasmGen, addr: i64, v: i64) {
     var at: i64 = addr - WG_DATA_BASE;
     var i: i64 = 0;
     while i < 8 {
@@ -565,10 +741,12 @@ fn wg_data_word(g: &mut WasmGen, addr: i64, v: i64) {
     }
 }
 
-fn wg_dyn_id(g: &WasmGen, name: str) -> i64 {
+fn wg_dyn_id(g: & WasmGen, name: str) -> i64 {
     var i: i64 = 0;
     while i < g.dyn_types.len() {
-        if g.dyn_types.get(i) == name { return i + 1; }
+        if g.dyn_types.get(i) == name {
+            return i + 1;
+        }
         i = i + 1;
     }
     return 0;
@@ -580,7 +758,9 @@ fn wg_insert_sorted(v: Vec<str>, s: str) -> Vec<str> {
     var i: i64 = 0;
     while i < v.len() {
         var x: str = v.get(i);
-        if x == s { return v; }
+        if x == s {
+            return v;
+        }
         if !placed && str_compare(x, s) > 0 {
             out.push(s);
             placed = true;
@@ -588,45 +768,56 @@ fn wg_insert_sorted(v: Vec<str>, s: str) -> Vec<str> {
         out.push(x);
         i = i + 1;
     }
-    if !placed { out.push(s); }
+    if !placed {
+        out.push(s);
+    }
     return out;
 }
 
-fn wg_meta_ty(func: &IrFunction, id: i64) -> IrType {
+fn wg_meta_ty(func: & IrFunction, id: i64) -> IrType {
     match IrFunction_get_meta(func, id) {
-        OptValueMeta::Some(m) => { return m.ty; }
-        OptValueMeta::None => {}
+        OptValueMeta::Some(m) => {
+            return m.ty;
+        }
+        OptValueMeta::None => {
+        }
     }
     return IrType::I64;
 }
 
-fn wg_meta_line(func: &IrFunction, id: i64) -> i64 {
+fn wg_meta_line(func: & IrFunction, id: i64) -> i64 {
     match IrFunction_get_meta(func, id) {
         OptValueMeta::Some(m) => {
             match m.source_line {
-                OptU64::Some(v) => { return v as i64; }
-                OptU64::None => {}
+                OptU64::Some(v) => {
+                    return v as i64;
+                }
+                OptU64::None => {
+                }
             }
         }
-        OptValueMeta::None => {}
+        OptValueMeta::None => {
+        }
     }
     return 0;
 }
 
 fn wg_is_unsigned_ty(t: IrType) -> bool {
-    return ir_type_eq(t, IrType::U8) || ir_type_eq(t, IrType::U16) || ir_type_eq(t, IrType::U32)
-        || ir_type_eq(t, IrType::U64);
+    return ir_type_eq(t, IrType::U8) || ir_type_eq(t, IrType::U16) || ir_type_eq(t, IrType::U32) || ir_type_eq(t, IrType::U64);
 }
 
 fn wg_is_ptr_ty(t: IrType) -> bool {
     match t {
-        IrType::Ptr(_) => { return true; }
-        _ => {}
+        IrType::Ptr(_) => {
+            return true;
+        }
+        _ => {
+        }
     }
     return false;
 }
 
-fn wg_unchecked(g: &WasmGen, id: i64) -> bool {
+fn wg_unchecked(g: & WasmGen, id: i64) -> bool {
     return id >= 0 && id < g.unchecked.len() && (g.unchecked.get(id) & 1) != 0;
 }
 
@@ -635,36 +826,48 @@ fn wg_unchecked(g: &WasmGen, id: i64) -> bool {
 /// Call function `name` (resolved) with `pushed` arguments on the stack:
 /// extra ones dropped, missing ones 0 (WASM checks arity, machine code
 /// does not). Without a definition: a trap. Leaves its i64 result.
-fn wg_call_named(g: &mut WasmGen, name: str, pushed: i64) {
+fn wg_call_named(g: & mut WasmGen, name: str, pushed: i64) {
     var f: i64 = wg_fn_ref(g, name);
     if f < 0 {
         wg_unresolved(g, name);
         var i: i64 = 0;
-        while i < pushed { w(g, 0x1A); i = i + 1; }
+        while i < pushed {
+            w(g, 0x1A);
+            i = i + 1;
+        }
         w(g, 0x00);
         wi64(g, 0);
         return;
     }
     var np: i64 = wg_nparams(g, name);
     var k: i64 = pushed;
-    while k > np { w(g, 0x1A); k = k - 1; }
-    while k < np { wi64(g, 0); k = k + 1; }
+    while k > np {
+        w(g, 0x1A);
+        k = k - 1;
+    } while k < np {
+        wi64(g, 0);
+        k = k + 1;
+    }
     wcall(g, f);
 }
 
 /// Push values `srcs` (-1: a null `__env`)
-fn wg_push_srcs(g: &mut WasmGen, srcs: &Vec<i64>) {
+fn wg_push_srcs(g: & mut WasmGen, srcs: & Vec<i64>) {
     var i: i64 = 0;
     while i < srcs.len() {
         var s: i64 = srcs.get(i);
-        if s < 0 { wi64(g, 0); } else { wget(g, s); }
+        if s < 0 {
+            wi64(g, 0);
+        } else {
+            wget(g, s);
+        }
         i = i + 1;
     }
 }
 
 /// Start a call of builtin `name`: its null `__env` pushed when it runs
 /// the runtime's Fides function. Returns the function to call.
-fn wg_builtin_begin(g: &mut WasmGen, name: str) -> str {
+fn wg_builtin_begin(g: & mut WasmGen, name: str) -> str {
     var target: str = wg_resolve(g, name);
     if wg_has_fn(g, target) && !wg_has_fn(g, name) {
         wi64(g, 0);
@@ -673,20 +876,25 @@ fn wg_builtin_begin(g: &mut WasmGen, name: str) -> str {
 }
 
 /// Call builtin `name` with the values `args`; leaves the result.
-fn wg_call_builtin(g: &mut WasmGen, name: str, args: &Vec<i64>) {
+fn wg_call_builtin(g: & mut WasmGen, name: str, args: & Vec<i64>) {
     var target: str = wg_resolve(g, name);
     var env: bool = wg_has_fn(g, target) && !wg_has_fn(g, name);
     var n: i64 = args.len();
-    if env { wi64(g, 0); n = n + 1; }
+    if env {
+        wi64(g, 0);
+        n = n + 1;
+    }
     wg_push_srcs(g, args);
     wg_call_named(g, target, n);
 }
 
 /// A panic with `msg` (the runtime prints it, its trace, and exits 1)
-fn wg_panic_msg(g: &mut WasmGen, msg: str) {
+fn wg_panic_msg(g: & mut WasmGen, msg: str) {
     var target: str = wg_builtin_begin(g, "p_panic");
     var env: i64 = 0;
-    if wg_has_fn(g, target) && !wg_has_fn(g, "p_panic") { env = 1; }
+    if wg_has_fn(g, target) && !wg_has_fn(g, "p_panic") {
+        env = 1;
+    }
     wi64(g, wg_str(g, msg));
     wg_call_named(g, target, env + 1);
     w(g, 0x1A);
@@ -695,7 +903,7 @@ fn wg_panic_msg(g: &mut WasmGen, msg: str) {
 
 /// Arithmetic panic `which`: with " at line N" for the division panics
 /// when the instruction has a line (as the interpreter prints them)
-fn wg_panic(g: &mut WasmGen, which: i64) {
+fn wg_panic(g: & mut WasmGen, which: i64) {
     var msg: str = wg_panic_messages().get(which);
     if which >= WP_DIV_OVF && g.cur_inst_line > 0 {
         msg = msg + " at line " + int_to_str(g.cur_inst_line);
@@ -704,31 +912,39 @@ fn wg_panic(g: &mut WasmGen, which: i64) {
 }
 
 /// if (i32 on the stack) { panic which }
-fn wg_panic_if(g: &mut WasmGen, which: i64) {
+fn wg_panic_if(g: & mut WasmGen, which: i64) {
     wif(g);
     wg_panic(g, which);
     wendif(g);
 }
 
 /// A call to a WASI import (C name `wasi_<name>`) with values `args`
-fn wg_call_import(g: &mut WasmGen, ix: i64, args: &Vec<i64>) {
+fn wg_call_import(g: & mut WasmGen, ix: i64, args: & Vec<i64>) {
     var sig: str = g.imp_sigs.get(ix);
     var gt: i64 = str_find(sig, ">");
     var i: i64 = 0;
     while i < gt {
-        if i < args.len() { wget(g, args.get(i)); } else { wi64(g, 0); }
-        if str_byte_at(sig, i) == 105 { wwrap(g); }
+        if i < args.len() {
+            wget(g, args.get(i));
+        } else {
+            wi64(g, 0);
+        }
+        if str_byte_at(sig, i) == 105 {
+            wwrap(g);
+        }
         i = i + 1;
     }
     wcall(g, ix);
     if gt + 1 < str_len(sig) {
-        if str_byte_at(sig, gt + 1) == 105 { wexts(g); }
+        if str_byte_at(sig, gt + 1) == 105 {
+            wexts(g);
+        }
     } else {
         wi64(g, 0);
     }
 }
 
-fn wg_gen_call(g: &mut WasmGen, id: i64, call_name: str, args: Vec<i64>, func: &IrFunction) {
+fn wg_gen_call(g: & mut WasmGen, id: i64, call_name: str, args: Vec<i64>, func: & IrFunction) {
     // An f64 lives in its local as its bits: these copy the word
     if (call_name == "p_f64_to_bits" || call_name == "p_f64_from_bits") && args.len() == 1 {
         wget(g, args.get(0));
@@ -744,7 +960,8 @@ fn wg_gen_call(g: &mut WasmGen, id: i64, call_name: str, args: Vec<i64>, func: &
     }
     if call_name == "p_float_to_int" && args.len() == 1 {
         wget_f(g, args.get(0), false);
-        w(g, 0xFC); wu(g, 6);
+        w(g, 0xFC);
+        wu(g, 6);
         wset(g, id);
         return;
     }
@@ -759,9 +976,16 @@ fn wg_gen_call(g: &mut WasmGen, id: i64, call_name: str, args: Vec<i64>, func: &
     // area and are handed over as an array
     var va_target: str = "";
     var va_first: i64 = 0;
-    if call_name == "p_thread_spawn" { va_target = "pert_thread_spawn_v"; }
-    if call_name == "p_co_async" { va_target = "pert_co_async_v"; }
-    if call_name == "p_executor_spawn" { va_target = "pert_executor_spawn_v"; va_first = 1; }
+    if call_name == "p_thread_spawn" {
+        va_target = "pert_thread_spawn_v";
+    }
+    if call_name == "p_co_async" {
+        va_target = "pert_co_async_v";
+    }
+    if call_name == "p_executor_spawn" {
+        va_target = "pert_executor_spawn_v";
+        va_first = 1;
+    }
     if va_target != "" && wg_has_fn(g, va_target) && args.len() >= va_first + 2 && g.va_off >= 0 {
         var k: i64 = va_first + 2;
         var slot: i64 = 0;
@@ -791,24 +1015,24 @@ fn wg_gen_call(g: &mut WasmGen, id: i64, call_name: str, args: Vec<i64>, func: &
         var prim: str = "nat_c_" + cname;
         if wg_has_fn(g, over) {
             wi64(g, 0);
-            wg_push_srcs(g, &args);
+            wg_push_srcs(g, & args);
             wg_call_named(g, over, args.len() + 1);
             wset(g, id);
             return;
         }
         if wg_prim_params(prim) >= 0 {
-            wg_push_srcs(g, &args);
+            wg_push_srcs(g, & args);
             wg_call_named(g, prim, args.len());
             wset(g, id);
             return;
         }
         if HashMap_contains(g.imp_index, cname) {
-            wg_call_import(g, HashMap_get(g.imp_index, cname) - 1, &args);
+            wg_call_import(g, HashMap_get(g.imp_index, cname) - 1, & args);
             wset(g, id);
             return;
         }
         if wg_prim_params(cname) >= 0 {
-            wg_push_srcs(g, &args);
+            wg_push_srcs(g, & args);
             wg_call_named(g, cname, args.len());
             wset(g, id);
             return;
@@ -819,20 +1043,32 @@ fn wg_gen_call(g: &mut WasmGen, id: i64, call_name: str, args: Vec<i64>, func: &
         target = "p_print_int";
         if args.len() > 0 {
             var aty: IrType = wg_meta_ty(func, args.get(0));
-            if wg_is_ptr_ty(aty) { target = "p_print_str"; }
-            else if ir_type_is_float(aty) { target = "p_print_float"; }
-            else if ir_type_eq(aty, IrType::Bool) { target = "p_print_bool"; }
-            else if ir_type_is_opaque_named(aty, "Vec") { target = "p_print_vec"; }
-            else if ir_type_is_opaque_named(aty, "HashMap") { target = "p_print_map"; }
-            else if ir_type_is_opaque_named(aty, "Tensor") { target = "p_print_tensor"; }
+            if wg_is_ptr_ty(aty) {
+                target = "p_print_str";
+            } else if ir_type_is_float(aty) {
+                target = "p_print_float";
+            } else if ir_type_eq(aty, IrType::Bool) {
+                target = "p_print_bool";
+            } else if ir_type_is_opaque_named(aty, "Vec") {
+                target = "p_print_vec";
+            } else if ir_type_is_opaque_named(aty, "HashMap") {
+                target = "p_print_map";
+            } else if ir_type_is_opaque_named(aty, "Tensor") {
+                target = "p_print_tensor";
+            }
         }
     } else if call_name == "p_to_str" {
         if args.len() > 0 {
             var aty2: IrType = wg_meta_ty(func, args.get(0));
-            if ir_type_is_opaque_named(aty2, "Vec") { target = "p_to_str_vec"; }
-            else if ir_type_is_float(aty2) { target = "p_to_str_float"; }
-            else if wg_is_ptr_ty(aty2) { target = "p_to_str_str"; }
-            else if ir_type_eq(aty2, IrType::Bool) { target = "p_to_str_bool"; }
+            if ir_type_is_opaque_named(aty2, "Vec") {
+                target = "p_to_str_vec";
+            } else if ir_type_is_float(aty2) {
+                target = "p_to_str_float";
+            } else if wg_is_ptr_ty(aty2) {
+                target = "p_to_str_str";
+            } else if ir_type_eq(aty2, IrType::Bool) {
+                target = "p_to_str_bool";
+            }
         }
     }
     var resolved: str = wg_resolve(g, target);
@@ -841,7 +1077,7 @@ fn wg_gen_call(g: &mut WasmGen, id: i64, call_name: str, args: Vec<i64>, func: &
         wi64(g, 0);
         n = n + 1;
     }
-    wg_push_srcs(g, &args);
+    wg_push_srcs(g, & args);
     wg_call_named(g, resolved, n);
     wset(g, id);
 }
@@ -849,15 +1085,23 @@ fn wg_gen_call(g: &mut WasmGen, id: i64, call_name: str, args: Vec<i64>, func: &
 // ─── Integer arithmetic (nat_ir's meaning) ─────────────────────────────
 
 /// t0 / t1 or t0 % t1 in type `ty`, onto the stack
-fn wg_divmod(g: &mut WasmGen, is_mod: bool, ty: IrType, checked: bool) {
+fn wg_divmod(g: & mut WasmGen, is_mod: bool, ty: IrType, checked: bool) {
     // Division by zero panics, even in @wrapping code
     wlget(g, g.t1);
     w(g, 0x50);
-    if is_mod { wg_panic_if(g, WP_MOD_ZERO); } else { wg_panic_if(g, WP_DIV_ZERO); }
+    if is_mod {
+        wg_panic_if(g, WP_MOD_ZERO);
+    } else {
+        wg_panic_if(g, WP_DIV_ZERO);
+    }
     if wg_is_unsigned_ty(ty) {
         wlget(g, g.t0);
         wlget(g, g.t1);
-        if is_mod { w(g, 0x82); } else { w(g, 0x80); }
+        if is_mod {
+            w(g, 0x82);
+        } else {
+            w(g, 0x80);
+        }
         return;
     }
     wlget(g, g.t1);
@@ -880,14 +1124,20 @@ fn wg_divmod(g: &mut WasmGen, is_mod: bool, ty: IrType, checked: bool) {
     welse(g);
     wlget(g, g.t0);
     wlget(g, g.t1);
-    if is_mod { w(g, 0x81); } else { w(g, 0x7F); }
+    if is_mod {
+        w(g, 0x81);
+    } else {
+        w(g, 0x7F);
+    }
     wendif(g);
 }
 
 /// The i64 in t2 normalized to narrow type `ty`; with a panic: one that
 /// does not fit. Leaves it in t2.
-fn wg_narrow_t2(g: &mut WasmGen, ty: IrType, panic: i64) {
-    if !wg_is_narrow(ty) { return; }
+fn wg_narrow_t2(g: & mut WasmGen, ty: IrType, panic: i64) {
+    if !wg_is_narrow(ty) {
+        return;
+    }
     if panic >= 0 {
         wlget(g, g.t2);
         wnarrow(g, ty);
@@ -902,29 +1152,47 @@ fn wg_narrow_t2(g: &mut WasmGen, ty: IrType, panic: i64) {
 }
 
 /// t2 = t0 op t1 for add (0), sub (1), mul (2), with overflow checks
-fn wg_checked(g: &mut WasmGen, kind: i64, ty: IrType, checked: bool) {
+fn wg_checked(g: & mut WasmGen, kind: i64, ty: IrType, checked: bool) {
     var is_i64: bool = ir_type_eq(ty, IrType::I64);
     var is_u64: bool = ir_type_eq(ty, IrType::U64);
     var which: i64 = WP_ADD;
-    if kind == 1 { which = WP_SUB; }
-    if kind == 2 { which = WP_MUL; }
+    if kind == 1 {
+        which = WP_SUB;
+    }
+    if kind == 2 {
+        which = WP_MUL;
+    }
     wlget(g, g.t0);
     wlget(g, g.t1);
-    if kind == 0 { w(g, 0x7C); } else if kind == 1 { w(g, 0x7D); } else { w(g, 0x7E); }
+    if kind == 0 {
+        w(g, 0x7C);
+    } else if kind == 1 {
+        w(g, 0x7D);
+    } else {
+        w(g, 0x7E);
+    }
     wlset(g, g.t2);
     if checked && is_i64 {
         if kind == 0 {
             // ((a ^ r) & (b ^ r)) < 0
-            wlget(g, g.t0); wlget(g, g.t2); w(g, 0x85);
-            wlget(g, g.t1); wlget(g, g.t2); w(g, 0x85);
+            wlget(g, g.t0);
+            wlget(g, g.t2);
+            w(g, 0x85);
+            wlget(g, g.t1);
+            wlget(g, g.t2);
+            w(g, 0x85);
             w(g, 0x83);
             wi64(g, 0);
             w(g, 0x53);
             wg_panic_if(g, which);
         } else if kind == 1 {
             // ((a ^ b) & (a ^ r)) < 0
-            wlget(g, g.t0); wlget(g, g.t1); w(g, 0x85);
-            wlget(g, g.t0); wlget(g, g.t2); w(g, 0x85);
+            wlget(g, g.t0);
+            wlget(g, g.t1);
+            w(g, 0x85);
+            wlget(g, g.t0);
+            wlget(g, g.t2);
+            w(g, 0x85);
             w(g, 0x83);
             wi64(g, 0);
             w(g, 0x53);
@@ -944,7 +1212,9 @@ fn wg_checked(g: &mut WasmGen, kind: i64, ty: IrType, checked: bool) {
             wif_t(g, WT_I32);
             wi32(g, 0);
             welse(g);
-            wlget(g, g.t2); wlget(g, g.t0); w(g, 0x7F);
+            wlget(g, g.t2);
+            wlget(g, g.t0);
+            w(g, 0x7F);
             wlget(g, g.t1);
             w(g, 0x52);
             wendif(g);
@@ -955,10 +1225,14 @@ fn wg_checked(g: &mut WasmGen, kind: i64, ty: IrType, checked: bool) {
     }
     if checked && is_u64 {
         if kind == 0 {
-            wlget(g, g.t2); wlget(g, g.t0); w(g, 0x54);
+            wlget(g, g.t2);
+            wlget(g, g.t0);
+            w(g, 0x54);
             wg_panic_if(g, which);
         } else if kind == 1 {
-            wlget(g, g.t0); wlget(g, g.t1); w(g, 0x54);
+            wlget(g, g.t0);
+            wlget(g, g.t1);
+            w(g, 0x54);
             wg_panic_if(g, which);
         } else {
             wlget(g, g.t0);
@@ -966,7 +1240,9 @@ fn wg_checked(g: &mut WasmGen, kind: i64, ty: IrType, checked: bool) {
             wif_t(g, WT_I32);
             wi32(g, 0);
             welse(g);
-            wlget(g, g.t2); wlget(g, g.t0); w(g, 0x80);
+            wlget(g, g.t2);
+            wlget(g, g.t0);
+            w(g, 0x80);
             wlget(g, g.t1);
             w(g, 0x52);
             wendif(g);
@@ -975,43 +1251,83 @@ fn wg_checked(g: &mut WasmGen, kind: i64, ty: IrType, checked: bool) {
         return;
     }
     // A narrow result that changes did not fit (checked); else normalized
-    if checked { wg_narrow_t2(g, ty, which); } else { wg_narrow_t2(g, ty, 0 - 1); }
+    if checked {
+        wg_narrow_t2(g, ty, which);
+    } else {
+        wg_narrow_t2(g, ty, 0 - 1);
+    }
 }
 
-fn wg_fcmp(g: &mut WasmGen, cc: i64, is32: bool) {
+fn wg_fcmp(g: & mut WasmGen, cc: i64, is32: bool) {
     var op: i64 = 0x61;
-    if cc == WCC_NE { op = 0x62; }
-    if cc == WCC_LT { op = 0x63; }
-    if cc == WCC_GT { op = 0x64; }
-    if cc == WCC_LE { op = 0x65; }
-    if cc == WCC_GE { op = 0x66; }
-    if is32 { op = op - 6; }
+    if cc == WCC_NE {
+        op = 0x62;
+    }
+    if cc == WCC_LT {
+        op = 0x63;
+    }
+    if cc == WCC_GT {
+        op = 0x64;
+    }
+    if cc == WCC_LE {
+        op = 0x65;
+    }
+    if cc == WCC_GE {
+        op = 0x66;
+    }
+    if is32 {
+        op = op - 6;
+    }
     w(g, op);
     wextu(g);
 }
 
-fn wg_gen_binop(g: &mut WasmGen, id: i64, op: BinOp, left: i64, right: i64, ty: IrType, func: &IrFunction) {
+fn wg_gen_binop(g: & mut WasmGen, id: i64, op: BinOp, left: i64, right: i64, ty: IrType, func: & IrFunction) {
     var lty: IrType = wg_meta_ty(func, left);
     var rty: IrType = wg_meta_ty(func, right);
     var float_ty: IrType = ty;
     var is_float: bool = ir_type_is_float(ty);
-    if !is_float && ir_type_is_float(lty) { is_float = true; float_ty = lty; }
+    if !is_float && ir_type_is_float(lty) {
+        is_float = true;
+        float_ty = lty;
+    }
     if is_float {
         var is32: bool = ir_type_eq(float_ty, IrType::F32);
         var arith: i64 = 0;
         var cc: i64 = 0 - 1;
         match op {
-            BinOp::Add => { arith = 0xA0; }
-            BinOp::Sub => { arith = 0xA1; }
-            BinOp::Mul => { arith = 0xA2; }
-            BinOp::Div => { arith = 0xA3; }
-            BinOp::Eq => { cc = WCC_EQ; }
-            BinOp::Neq => { cc = WCC_NE; }
-            BinOp::Lt => { cc = WCC_LT; }
-            BinOp::LtEq => { cc = WCC_LE; }
-            BinOp::Gt => { cc = WCC_GT; }
-            BinOp::GtEq => { cc = WCC_GE; }
-            _ => {}
+            BinOp::Add => {
+                arith = 0xA0;
+            }
+            BinOp::Sub => {
+                arith = 0xA1;
+            }
+            BinOp::Mul => {
+                arith = 0xA2;
+            }
+            BinOp::Div => {
+                arith = 0xA3;
+            }
+            BinOp::Eq => {
+                cc = WCC_EQ;
+            }
+            BinOp::Neq => {
+                cc = WCC_NE;
+            }
+            BinOp::Lt => {
+                cc = WCC_LT;
+            }
+            BinOp::LtEq => {
+                cc = WCC_LE;
+            }
+            BinOp::Gt => {
+                cc = WCC_GT;
+            }
+            BinOp::GtEq => {
+                cc = WCC_GE;
+            }
+            _ => {
+            }
         }
         if arith == 0 && cc < 0 {
             wi64(g, 0);
@@ -1021,7 +1337,11 @@ fn wg_gen_binop(g: &mut WasmGen, id: i64, op: BinOp, left: i64, right: i64, ty: 
         wget_f(g, left, is32);
         wget_f(g, right, is32);
         if arith != 0 {
-            if is32 { w(g, arith - 14); } else { w(g, arith); }
+            if is32 {
+                w(g, arith - 14);
+            } else {
+                w(g, arith);
+            }
             wf_bits(g, is32);
         } else {
             wg_fcmp(g, cc, is32);
@@ -1036,14 +1356,27 @@ fn wg_gen_binop(g: &mut WasmGen, id: i64, op: BinOp, left: i64, right: i64, ty: 
     wget(g, right);
     wlset(g, g.t1);
     match op {
-        BinOp::Add => { wg_checked(g, 0, ty, checked); wlget(g, g.t2); }
-        BinOp::Sub => { wg_checked(g, 1, ty, checked); wlget(g, g.t2); }
-        BinOp::Mul => { wg_checked(g, 2, ty, checked); wlget(g, g.t2); }
+        BinOp::Add => {
+            wg_checked(g, 0, ty, checked);
+            wlget(g, g.t2);
+        }
+        BinOp::Sub => {
+            wg_checked(g, 1, ty, checked);
+            wlget(g, g.t2);
+        }
+        BinOp::Mul => {
+            wg_checked(g, 2, ty, checked);
+            wlget(g, g.t2);
+        }
         BinOp::Div => {
             g.cur_inst_line = wg_meta_line(func, id);
             wg_divmod(g, false, ty, checked);
             wlset(g, g.t2);
-            if checked { wg_narrow_t2(g, ty, WP_DIV_OVF); } else { wg_narrow_t2(g, ty, 0 - 1); }
+            if checked {
+                wg_narrow_t2(g, ty, WP_DIV_OVF);
+            } else {
+                wg_narrow_t2(g, ty, 0 - 1);
+            }
             g.cur_inst_line = 0;
             wlget(g, g.t2);
         }
@@ -1052,41 +1385,107 @@ fn wg_gen_binop(g: &mut WasmGen, id: i64, op: BinOp, left: i64, right: i64, ty: 
             wg_divmod(g, true, ty, checked);
             g.cur_inst_line = 0;
         }
-        BinOp::BitAnd => { wlget(g, g.t0); wlget(g, g.t1); w(g, 0x83); }
-        BinOp::BitOr => { wlget(g, g.t0); wlget(g, g.t1); w(g, 0x84); }
-        BinOp::BitXor => { wlget(g, g.t0); wlget(g, g.t1); w(g, 0x85); }
+        BinOp::BitAnd => {
+            wlget(g, g.t0);
+            wlget(g, g.t1);
+            w(g, 0x83);
+        }
+        BinOp::BitOr => {
+            wlget(g, g.t0);
+            wlget(g, g.t1);
+            w(g, 0x84);
+        }
+        BinOp::BitXor => {
+            wlget(g, g.t0);
+            wlget(g, g.t1);
+            w(g, 0x85);
+        }
         BinOp::Shl => {
-            wlget(g, g.t0); wlget(g, g.t1); w(g, 0x86);
+            wlget(g, g.t0);
+            wlget(g, g.t1);
+            w(g, 0x86);
             wnarrow(g, ty);
         }
         BinOp::Shr => {
-            wlget(g, g.t0); wlget(g, g.t1);
-            if ir_type_eq(ty, IrType::U64) { w(g, 0x88); } else { w(g, 0x87); }
+            wlget(g, g.t0);
+            wlget(g, g.t1);
+            if ir_type_eq(ty, IrType::U64) {
+                w(g, 0x88);
+            } else {
+                w(g, 0x87);
+            }
         }
         BinOp::And => {
-            wlget(g, g.t0); wi64(g, 0); w(g, 0x52);
-            wlget(g, g.t1); wi64(g, 0); w(g, 0x52);
+            wlget(g, g.t0);
+            wi64(g, 0);
+            w(g, 0x52);
+            wlget(g, g.t1);
+            wi64(g, 0);
+            w(g, 0x52);
             w(g, 0x71);
             wextu(g);
         }
         BinOp::Or => {
-            wlget(g, g.t0); wlget(g, g.t1); w(g, 0x84);
-            wi64(g, 0); w(g, 0x52);
+            wlget(g, g.t0);
+            wlget(g, g.t1);
+            w(g, 0x84);
+            wi64(g, 0);
+            w(g, 0x52);
             wextu(g);
         }
-        BinOp::Eq => { wlget(g, g.t0); wlget(g, g.t1); wcmp(g, WCC_EQ); }
-        BinOp::Neq => { wlget(g, g.t0); wlget(g, g.t1); wcmp(g, WCC_NE); }
-        BinOp::Lt => { wlget(g, g.t0); wlget(g, g.t1); if unsigned_cmp { wcmp(g, WCC_LTU); } else { wcmp(g, WCC_LT); } }
-        BinOp::LtEq => { wlget(g, g.t0); wlget(g, g.t1); if unsigned_cmp { wcmp(g, WCC_LEU); } else { wcmp(g, WCC_LE); } }
-        BinOp::Gt => { wlget(g, g.t0); wlget(g, g.t1); if unsigned_cmp { wcmp(g, WCC_GTU); } else { wcmp(g, WCC_GT); } }
-        BinOp::GtEq => { wlget(g, g.t0); wlget(g, g.t1); if unsigned_cmp { wcmp(g, WCC_GEU); } else { wcmp(g, WCC_GE); } }
+        BinOp::Eq => {
+            wlget(g, g.t0);
+            wlget(g, g.t1);
+            wcmp(g, WCC_EQ);
+        }
+        BinOp::Neq => {
+            wlget(g, g.t0);
+            wlget(g, g.t1);
+            wcmp(g, WCC_NE);
+        }
+        BinOp::Lt => {
+            wlget(g, g.t0);
+            wlget(g, g.t1);
+            if unsigned_cmp {
+                wcmp(g, WCC_LTU);
+            } else {
+                wcmp(g, WCC_LT);
+            }
+        }
+        BinOp::LtEq => {
+            wlget(g, g.t0);
+            wlget(g, g.t1);
+            if unsigned_cmp {
+                wcmp(g, WCC_LEU);
+            } else {
+                wcmp(g, WCC_LE);
+            }
+        }
+        BinOp::Gt => {
+            wlget(g, g.t0);
+            wlget(g, g.t1);
+            if unsigned_cmp {
+                wcmp(g, WCC_GTU);
+            } else {
+                wcmp(g, WCC_GT);
+            }
+        }
+        BinOp::GtEq => {
+            wlget(g, g.t0);
+            wlget(g, g.t1);
+            if unsigned_cmp {
+                wcmp(g, WCC_GEU);
+            } else {
+                wcmp(g, WCC_GE);
+            }
+        }
     }
     wset(g, id);
 }
 
 // ─── Instructions ──────────────────────────────────────────────────────
 
-fn wg_block(g: &WasmGen, block_id: i64) -> i64 {
+fn wg_block(g: & WasmGen, block_id: i64) -> i64 {
     if HashMap_contains(g.block_index, int_to_str(block_id)) {
         return HashMap_get(g.block_index, int_to_str(block_id));
     }
@@ -1094,14 +1493,14 @@ fn wg_block(g: &WasmGen, block_id: i64) -> i64 {
 }
 
 /// Branch to the loop: the dispatch enters block `target`
-fn wg_jump(g: &mut WasmGen, target: i64) {
+fn wg_jump(g: & mut WasmGen, target: i64) {
     wi32(g, target);
     wlset(g, g.cur);
     wbr(g, g.nblocks - 1 - g.k + g.extra);
 }
 
 /// The epilogue of a return: the frame given back
-fn wg_epilogue(g: &mut WasmGen) {
+fn wg_epilogue(g: & mut WasmGen) {
     if g.frame > 0 {
         wlget(g, g.fp);
         wi64(g, g.frame);
@@ -1110,14 +1509,18 @@ fn wg_epilogue(g: &mut WasmGen) {
     }
 }
 
-fn wg_gen_inst(g: &mut WasmGen, id: i64, inst: Inst, last: bool, func: &IrFunction, module: &IrModule) {
+fn wg_gen_inst(g: & mut WasmGen, id: i64, inst: Inst, last: bool, func: & IrFunction, module: & IrModule) {
     match inst {
         Inst::ConstInt(value, _) => {
             wi64(g, value);
             wset(g, id);
         }
         Inst::ConstBool(value) => {
-            if value { wi64(g, 1); } else { wi64(g, 0); }
+            if value {
+                wi64(g, 1);
+            } else {
+                wi64(g, 0);
+            }
             wset(g, id);
         }
         Inst::ConstFloat(value, ty) => {
@@ -1186,7 +1589,9 @@ fn wg_gen_inst(g: &mut WasmGen, id: i64, inst: Inst, last: bool, func: &IrFuncti
         }
         Inst::Alloca(_, _) => {
             var off: i64 = 0 - 1;
-            if id >= 0 && id < g.alloca_off.len() { off = g.alloca_off.get(id); }
+            if id >= 0 && id < g.alloca_off.len() {
+                off = g.alloca_off.get(id);
+            }
             if off >= 0 {
                 wlget(g, g.fp);
                 if off != 0 {
@@ -1200,16 +1605,29 @@ fn wg_gen_inst(g: &mut WasmGen, id: i64, inst: Inst, last: bool, func: &IrFuncti
             var size: i64 = IrModule_type_size(module, ty);
             var unsigned: bool = false;
             match ty {
-                IrType::U8 => { unsigned = true; }
-                IrType::U16 => { unsigned = true; }
-                IrType::U32 => { unsigned = true; }
-                IrType::Bool => { unsigned = true; }
-                _ => {}
+                IrType::U8 => {
+                    unsigned = true;
+                }
+                IrType::U16 => {
+                    unsigned = true;
+                }
+                IrType::U32 => {
+                    unsigned = true;
+                }
+                IrType::Bool => {
+                    unsigned = true;
+                }
+                _ => {
+                }
             }
             var lsize: i64 = 8;
-            if size <= 1 { lsize = 1; }
-            else if size == 2 { lsize = 2; }
-            else if size == 4 { lsize = 4; }
+            if size <= 1 {
+                lsize = 1;
+            } else if size == 2 {
+                lsize = 2;
+            } else if size == 4 {
+                lsize = 4;
+            }
             wget(g, ptr);
             wload(g, lsize, !unsigned, 0);
             wset(g, id);
@@ -1220,34 +1638,55 @@ fn wg_gen_inst(g: &mut WasmGen, id: i64, inst: Inst, last: bool, func: &IrFuncti
             var store_ty: IrType = IrType::I64;
             var have: bool = false;
             match explicit_ty {
-                OptIrType::Some(t0) => { store_ty = t0; have = true; }
-                OptIrType::None => {}
+                OptIrType::Some(t0) => {
+                    store_ty = t0;
+                    have = true;
+                }
+                OptIrType::None => {
+                }
             }
             if !have {
                 match wg_meta_ty(func, ptr) {
-                    IrType::Ptr(inner) => { store_ty = box_ir_type_unbox(inner); have = true; }
-                    _ => {}
+                    IrType::Ptr(inner) => {
+                        store_ty = box_ir_type_unbox(inner);
+                        have = true;
+                    }
+                    _ => {
+                    }
                 }
             }
-            if !have { store_ty = wg_meta_ty(func, value); }
+            if !have {
+                store_ty = wg_meta_ty(func, value);
+            }
             var sz: i64 = 8;
             var is_struct: bool = false;
             match store_ty {
-                IrType::Struct(_) => { is_struct = true; }
-                IrType::Array(_, _) => {}
-                IrType::Ptr(_) => {}
-                IrType::Opaque(_) => {}
-                IrType::Generic(_, _) => {}
+                IrType::Struct(_) => {
+                    is_struct = true;
+                }
+                IrType::Array(_, _) => {
+                }
+                IrType::Ptr(_) => {
+                }
+                IrType::Opaque(_) => {
+                }
+                IrType::Generic(_, _) => {
+                }
                 _ => {
                     var s0: i64 = IrModule_type_size(module, store_ty);
-                    if s0 == 1 || s0 == 2 || s0 == 4 { sz = s0; }
+                    if s0 == 1 || s0 == 2 || s0 == 4 {
+                        sz = s0;
+                    }
                 }
             }
             if is_struct {
                 wget_addr(g, ptr);
                 wget_addr(g, value);
                 wi32(g, IrModule_type_size(module, store_ty));
-                w(g, 0xFC); wu(g, 10); w(g, 0); w(g, 0);
+                w(g, 0xFC);
+                wu(g, 10);
+                w(g, 0);
+                w(g, 0);
             } else {
                 wget_addr(g, ptr);
                 wget(g, value);
@@ -1258,7 +1697,10 @@ fn wg_gen_inst(g: &mut WasmGen, id: i64, inst: Inst, last: bool, func: &IrFuncti
             wget_addr(g, dst_v);
             wget_addr(g, src_v);
             wi32(g, IrModule_type_size(module, ty));
-            w(g, 0xFC); wu(g, 10); w(g, 0); w(g, 0);
+            w(g, 0xFC);
+            wu(g, 10);
+            w(g, 0);
+            w(g, 0);
         }
         Inst::GetFieldPtr(struct_ptr, field_index, _) => {
             var offset: i64 = field_index * 8;
@@ -1266,12 +1708,18 @@ fn wg_gen_inst(g: &mut WasmGen, id: i64, inst: Inst, last: bool, func: &IrFuncti
             match wg_meta_ty(func, struct_ptr) {
                 IrType::Ptr(inner) => {
                     match box_ir_type_unbox(inner) {
-                        IrType::Struct(n) => { sname = n; }
-                        _ => {}
+                        IrType::Struct(n) => {
+                            sname = n;
+                        }
+                        _ => {
+                        }
                     }
                 }
-                IrType::Struct(n2) => { sname = n2; }
-                _ => {}
+                IrType::Struct(n2) => {
+                    sname = n2;
+                }
+                _ => {
+                }
             }
             if sname != "" {
                 match IrModule_get_struct(module, sname) {
@@ -1280,7 +1728,8 @@ fn wg_gen_inst(g: &mut WasmGen, id: i64, inst: Inst, last: bool, func: &IrFuncti
                             offset = layout.fields.get(field_index).offset;
                         }
                     }
-                    OptStructLayout::None => {}
+                    OptStructLayout::None => {
+                    }
                 }
             }
             wget(g, struct_ptr);
@@ -1292,7 +1741,9 @@ fn wg_gen_inst(g: &mut WasmGen, id: i64, inst: Inst, last: bool, func: &IrFuncti
         }
         Inst::GetElemPtr(array_ptr, index, elem_ty) => {
             var esize: i64 = IrModule_type_size(module, elem_ty);
-            if esize < 1 { esize = 1; }
+            if esize < 1 {
+                esize = 1;
+            }
             wget(g, array_ptr);
             wget(g, index);
             if esize != 1 {
@@ -1304,7 +1755,9 @@ fn wg_gen_inst(g: &mut WasmGen, id: i64, inst: Inst, last: bool, func: &IrFuncti
         }
         Inst::Jump(target) => {
             var t: i64 = wg_block(g, target);
-            if !(last && t == g.k + 1) { wg_jump(g, t); }
+            if !(last && t == g.k + 1) {
+                wg_jump(g, t);
+            }
         }
         Inst::Branch(cond, then, else_) => {
             var tb: i64 = wg_block(g, then);
@@ -1335,8 +1788,12 @@ fn wg_gen_inst(g: &mut WasmGen, id: i64, inst: Inst, last: bool, func: &IrFuncti
         }
         Inst::Return(ret) => {
             match ret {
-                OptValueId::Some(v) => { wget(g, v); }
-                OptValueId::None => { wi64(g, 0); }
+                OptValueId::Some(v) => {
+                    wget(g, v);
+                }
+                OptValueId::None => {
+                    wi64(g, 0);
+                }
             }
             wg_epilogue(g);
             w(g, 0x0F);
@@ -1356,7 +1813,7 @@ fn wg_gen_inst(g: &mut WasmGen, id: i64, inst: Inst, last: bool, func: &IrFuncti
                 srcs.push(args.get(ai));
                 ai = ai + 1;
             }
-            wg_push_srcs(g, &srcs);
+            wg_push_srcs(g, & srcs);
             wget(g, fn_ptr);
             wload(g, 8, false, 0);
             wwrap(g);
@@ -1368,7 +1825,8 @@ fn wg_gen_inst(g: &mut WasmGen, id: i64, inst: Inst, last: bool, func: &IrFuncti
         Inst::DynCall(_, method, args, _, _) => {
             // env 0, the receiver, then args[1..]; the dyn value is
             // {type id, receiver}
-            w(g, 0x02); w(g, WT_VOID);
+            w(g, 0x02);
+            w(g, WT_VOID);
             g.extra = g.extra + 1;
             var ti: i64 = 0;
             while ti < g.dyn_types.len() {
@@ -1395,14 +1853,17 @@ fn wg_gen_inst(g: &mut WasmGen, id: i64, inst: Inst, last: bool, func: &IrFuncti
                 }
                 ti = ti + 1;
             }
-            w(g, 0x00); // no implementation for this type
+            w(g, 0x00);
+            // no implementation for this type
             wend(g);
             g.extra = g.extra - 1;
         }
         Inst::MakeDyn(value, type_name, _) => {
             var target: str = wg_builtin_begin(g, "p_malloc");
             var n: i64 = 1;
-            if wg_has_fn(g, target) && !wg_has_fn(g, "p_malloc") { n = 2; }
+            if wg_has_fn(g, target) && !wg_has_fn(g, "p_malloc") {
+                n = 2;
+            }
             wi64(g, 16);
             wg_call_named(g, target, n);
             wlset(g, g.t0);
@@ -1424,39 +1885,72 @@ fn wg_gen_inst(g: &mut WasmGen, id: i64, inst: Inst, last: bool, func: &IrFuncti
         Inst::IntExtend(value, from, _) => {
             wget(g, value);
             match from {
-                IrType::I8 => { w(g, 0xC2); }
-                IrType::I16 => { w(g, 0xC3); }
-                IrType::I32 => { w(g, 0xC4); }
-                _ => {}
+                IrType::I8 => {
+                    w(g, 0xC2);
+                }
+                IrType::I16 => {
+                    w(g, 0xC3);
+                }
+                IrType::I32 => {
+                    w(g, 0xC4);
+                }
+                _ => {
+                }
             }
             wset(g, id);
         }
         Inst::IntTrunc(value, _, to) => {
             wget(g, value);
             match to {
-                IrType::I8 => { wi64(g, 0xFF); w(g, 0x83); }
-                IrType::U8 => { wi64(g, 0xFF); w(g, 0x83); }
-                IrType::I16 => { wi64(g, 0xFFFF); w(g, 0x83); }
-                IrType::U16 => { wi64(g, 0xFFFF); w(g, 0x83); }
-                IrType::I32 => { wi64(g, 0xFFFFFFFF); w(g, 0x83); }
-                IrType::U32 => { wi64(g, 0xFFFFFFFF); w(g, 0x83); }
-                _ => {}
+                IrType::I8 => {
+                    wi64(g, 0xFF);
+                    w(g, 0x83);
+                }
+                IrType::U8 => {
+                    wi64(g, 0xFF);
+                    w(g, 0x83);
+                }
+                IrType::I16 => {
+                    wi64(g, 0xFFFF);
+                    w(g, 0x83);
+                }
+                IrType::U16 => {
+                    wi64(g, 0xFFFF);
+                    w(g, 0x83);
+                }
+                IrType::I32 => {
+                    wi64(g, 0xFFFFFFFF);
+                    w(g, 0x83);
+                }
+                IrType::U32 => {
+                    wi64(g, 0xFFFFFFFF);
+                    w(g, 0x83);
+                }
+                _ => {
+                }
             }
             wset(g, id);
         }
         Inst::IntToFloat(value, _, to) => {
             wget(g, value);
-            if ir_type_eq(to, IrType::F32) { w(g, 0xB4); wf_bits(g, true); }
-            else { w(g, 0xB9); wf_bits(g, false); }
+            if ir_type_eq(to, IrType::F32) {
+                w(g, 0xB4);
+                wf_bits(g, true);
+            } else {
+                w(g, 0xB9);
+                wf_bits(g, false);
+            }
             wset(g, id);
         }
         Inst::FloatToInt(value, from, _) => {
             if ir_type_eq(from, IrType::F32) {
                 wget_f(g, value, true);
-                w(g, 0xFC); wu(g, 4);
+                w(g, 0xFC);
+                wu(g, 4);
             } else {
                 wget_f(g, value, false);
-                w(g, 0xFC); wu(g, 6);
+                w(g, 0xFC);
+                wu(g, 6);
             }
             wset(g, id);
         }
@@ -1466,7 +1960,9 @@ fn wg_gen_inst(g: &mut WasmGen, id: i64, inst: Inst, last: bool, func: &IrFuncti
                 // Collections print through their Fides formatter
                 var ptarget: str = wg_builtin_begin(g, "p_print_str");
                 var pn: i64 = 1;
-                if wg_has_fn(g, ptarget) && !wg_has_fn(g, "p_print_str") { pn = 2; }
+                if wg_has_fn(g, ptarget) && !wg_has_fn(g, "p_print_str") {
+                    pn = 2;
+                }
                 wi64(g, 0);
                 wget(g, value);
                 wg_call_named(g, wg_resolve(g, formatter), 2);
@@ -1475,16 +1971,31 @@ fn wg_gen_inst(g: &mut WasmGen, id: i64, inst: Inst, last: bool, func: &IrFuncti
             } else {
                 var print_fn: str = "p_print_int";
                 match ty {
-                    IrType::Ptr(_) => { print_fn = "p_print_str"; }
-                    IrType::Opaque(oname) => { if oname == "String" { print_fn = "p_print_str"; } }
-                    IrType::F64 => { print_fn = "p_print_float"; }
-                    IrType::F32 => { print_fn = "p_print_float"; }
-                    IrType::Bool => { print_fn = "p_print_bool"; }
-                    _ => {}
+                    IrType::Ptr(_) => {
+                        print_fn = "p_print_str";
+                    }
+                    IrType::Opaque(oname) => {
+                        if oname == "String" {
+                            print_fn = "p_print_str";
+                        }
+                    }
+                    IrType::F64 => {
+                        print_fn = "p_print_float";
+                    }
+                    IrType::F32 => {
+                        print_fn = "p_print_float";
+                    }
+                    IrType::Bool => {
+                        print_fn = "p_print_bool";
+                    }
+                    _ => {
+                    }
                 }
                 var target2: str = wg_builtin_begin(g, print_fn);
                 var n2: i64 = 1;
-                if wg_has_fn(g, target2) && !wg_has_fn(g, print_fn) { n2 = 2; }
+                if wg_has_fn(g, target2) && !wg_has_fn(g, print_fn) {
+                    n2 = 2;
+                }
                 if ir_type_eq(ty, IrType::F32) {
                     // the runtime prints an f64
                     wget_f(g, value, true);
@@ -1504,28 +2015,34 @@ fn wg_gen_inst(g: &mut WasmGen, id: i64, inst: Inst, last: bool, func: &IrFuncti
             wget(g, default);
             wset(g, id);
         }
-        Inst::PersistSave(_, _) => {}
-        Inst::TxnBegin => {}
-        Inst::TxnEnd => {}
-        Inst::UnsafeBegin => {}
-        Inst::UnsafeEnd => {}
+        Inst::PersistSave(_, _) => {
+        }
+        Inst::TxnBegin => {
+        }
+        Inst::TxnEnd => {
+        }
+        Inst::UnsafeBegin => {
+        }
+        Inst::UnsafeEnd => {
+        }
         Inst::GradBegin(_) => {
             var gargs: Vec<i64> = Vec::new();
-            wg_call_builtin(g, pe_ir_autograd_builtin(inst), &gargs);
+            wg_call_builtin(g, pe_ir_autograd_builtin(inst), & gargs);
             w(g, 0x1A);
         }
         Inst::GradEnd => {
             var eargs: Vec<i64> = Vec::new();
-            wg_call_builtin(g, pe_ir_autograd_builtin(inst), &eargs);
+            wg_call_builtin(g, pe_ir_autograd_builtin(inst), & eargs);
             w(g, 0x1A);
         }
         Inst::Backward(v) => {
             var bargs: Vec<i64> = Vec::new();
             bargs.push(v);
-            wg_call_builtin(g, pe_ir_autograd_builtin(inst), &bargs);
+            wg_call_builtin(g, pe_ir_autograd_builtin(inst), & bargs);
             w(g, 0x1A);
         }
-        Inst::TryUnwrap(_, _, _, _) => {}
+        Inst::TryUnwrap(_, _, _, _) => {
+        }
         Inst::Asm(_, _, _, _) => {
             // A WASI program runs no inline assembly (as on the C path)
             wi64(g, 0);
@@ -1535,35 +2052,51 @@ fn wg_gen_inst(g: &mut WasmGen, id: i64, inst: Inst, last: bool, func: &IrFuncti
             wi64(g, 0);
             wset(g, id);
         }
-        Inst::RegionEnd(_, _, _) => {}
+        Inst::RegionEnd(_, _, _) => {
+        }
     }
 }
 
 // ─── Functions ─────────────────────────────────────────────────────────
 
 fn wg_note_id(maxid: i64, id: i64) -> i64 {
-    if id > maxid { return id; }
+    if id > maxid {
+        return id;
+    }
     return maxid;
 }
 
 /// The body of IR function `func`: its locals, the frame, the blocks.
-fn wg_gen_function(g: &mut WasmGen, name: str, func: &IrFunction, module: &IrModule) {
+fn wg_gen_function(g: & mut WasmGen, name: str, func: & IrFunction, module: & IrModule) {
     g.cur_name = name;
     // The runtime's arithmetic wraps, as pe_ir's and nat_ir's does
     g.cur_wrapping = func.is_wrapping || is_pe_runtime_fn(name);
     g.unchecked = peir_unchecked_ops(func, func.value_metas.len() + func.insts.len() + 16);
     var maxid: i64 = 0;
     var i: i64 = 0;
-    while i < func.value_metas.len() { maxid = wg_note_id(maxid, func.value_metas.get(i).id); i = i + 1; }
+    while i < func.value_metas.len() {
+        maxid = wg_note_id(maxid, func.value_metas.get(i).id);
+        i = i + 1;
+    }
     i = 0;
-    while i < func.insts.len() { maxid = wg_note_id(maxid, func.insts.get(i).id); i = i + 1; }
+    while i < func.insts.len() {
+        maxid = wg_note_id(maxid, func.insts.get(i).id);
+        i = i + 1;
+    }
     i = 0;
-    while i < func.params.len() { maxid = wg_note_id(maxid, func.params.get(i).id); i = i + 1; }
+    while i < func.params.len() {
+        maxid = wg_note_id(maxid, func.params.get(i).id);
+        i = i + 1;
+    }
     var np: i64 = func.params.len();
     var local_of: Vec<i64> = Vec::new();
     var aoff: Vec<i64> = Vec::new();
     i = 0;
-    while i <= maxid { local_of.push(np + i); aoff.push(0 - 1); i = i + 1; }
+    while i <= maxid {
+        local_of.push(np + i);
+        aoff.push(0 - 1);
+        i = i + 1;
+    }
     i = 0;
     while i < np {
         local_of.set(func.params.get(i).id, i);
@@ -1585,7 +2118,9 @@ fn wg_gen_function(g: &mut WasmGen, name: str, func: &IrFunction, module: &IrMod
         match ve.inst {
             Inst::Alloca(aty, _) => {
                 var dsize: i64 = IrModule_type_size(module, aty);
-                if dsize < 8 { dsize = 8; }
+                if dsize < 8 {
+                    dsize = 8;
+                }
                 dsize = (dsize + 7) & (0 - 8);
                 aoff.set(ve.id, cur);
                 cur = cur + dsize;
@@ -1595,7 +2130,8 @@ fn wg_gen_function(g: &mut WasmGen, name: str, func: &IrFunction, module: &IrMod
                     g.va_off = 0 - 2;
                 }
             }
-            _ => {}
+            _ => {
+            }
         }
         i = i + 1;
     }
@@ -1649,14 +2185,22 @@ fn wg_gen_function(g: &mut WasmGen, name: str, func: &IrFunction, module: &IrMod
     }
     g.nblocks = nb;
     // loop { block_{N-1} { ... block_0 { br_table } code_0 } ... code_{N-1} }
-    w(g, 0x03); w(g, WT_VOID);
+    w(g, 0x03);
+    w(g, WT_VOID);
     bi = 0;
-    while bi < nb { w(g, 0x02); w(g, WT_VOID); bi = bi + 1; }
+    while bi < nb {
+        w(g, 0x02);
+        w(g, WT_VOID);
+        bi = bi + 1;
+    }
     wlget(g, g.cur);
     w(g, 0x0E);
     wu(g, nb);
     bi = 0;
-    while bi < nb { wu(g, bi); bi = bi + 1; }
+    while bi < nb {
+        wu(g, bi);
+        bi = bi + 1;
+    }
     wu(g, 0);
     wend(g);
     bi = 0;
@@ -1669,8 +2213,11 @@ fn wg_gen_function(g: &mut WasmGen, name: str, func: &IrFunction, module: &IrMod
         while ii < ninst {
             var iid: i64 = block.instructions.get(ii);
             match IrFunction_get_inst(func, iid) {
-                OptInst::Some(inst) => { wg_gen_inst(g, iid, inst, ii == ninst - 1, func, module); }
-                OptInst::None => {}
+                OptInst::Some(inst) => {
+                    wg_gen_inst(g, iid, inst, ii == ninst - 1, func, module);
+                }
+                OptInst::None => {
+                }
             }
             ii = ii + 1;
         }
@@ -1684,7 +2231,7 @@ fn wg_gen_function(g: &mut WasmGen, name: str, func: &IrFunction, module: &IrMod
 }
 
 /// The body of primitive `name` (its parameters are locals 0..n)
-fn wg_gen_primitive(g: &mut WasmGen, name: str) {
+fn wg_gen_primitive(g: & mut WasmGen, name: str) {
     g.cur_name = name;
     g.b = Vec::new();
     g.extra = 0;
@@ -1702,7 +2249,10 @@ fn wg_gen_primitive(g: &mut WasmGen, name: str) {
         if wg_has_fn(g, "pe_wasi_syscall") {
             wi64(g, 0);
             var k: i64 = 0;
-            while k < 7 { wlget(g, k); k = k + 1; }
+            while k < 7 {
+                wlget(g, k);
+                k = k + 1;
+            }
             wg_call_named(g, "pe_wasi_syscall", 8);
         } else {
             wi64(g, 0 - 38);
@@ -1715,22 +2265,36 @@ fn wg_gen_primitive(g: &mut WasmGen, name: str) {
             wi64(g, 0);
         }
     } else if name == "nat_atomic_load" {
-        wlget(g, 0); wload(g, 8, false, 0);
+        wlget(g, 0);
+        wload(g, 8, false, 0);
     } else if name == "nat_atomic_store" {
-        wlget(g, 0); wwrap(g); wlget(g, 1); wstore(g, 8, 0);
+        wlget(g, 0);
+        wwrap(g);
+        wlget(g, 1);
+        wstore(g, 8, 0);
         wi64(g, 0);
     } else if name == "nat_atomic_add" {
-        wlget(g, 0); wwrap(g);
-        wlget(g, 0); wload(g, 8, false, 0);
-        wlget(g, 1); w(g, 0x7C);
+        wlget(g, 0);
+        wwrap(g);
+        wlget(g, 0);
+        wload(g, 8, false, 0);
+        wlget(g, 1);
+        w(g, 0x7C);
         wstore(g, 8, 0);
-        wlget(g, 0); wload(g, 8, false, 0);
-        wlget(g, 1); w(g, 0x7D);
+        wlget(g, 0);
+        wload(g, 8, false, 0);
+        wlget(g, 1);
+        w(g, 0x7D);
     } else if name == "nat_atomic_cas" {
-        wlget(g, 0); wload(g, 8, false, 0);
-        wlget(g, 1); w(g, 0x51);
+        wlget(g, 0);
+        wload(g, 8, false, 0);
+        wlget(g, 1);
+        w(g, 0x51);
         wif_t(g, WT_I64);
-        wlget(g, 0); wwrap(g); wlget(g, 2); wstore(g, 8, 0);
+        wlget(g, 0);
+        wwrap(g);
+        wlget(g, 2);
+        wstore(g, 8, 0);
         wi64(g, 1);
         welse(g);
         wi64(g, 0);
@@ -1743,25 +2307,38 @@ fn wg_gen_primitive(g: &mut WasmGen, name: str) {
         // (save = its block + 104, sp = [block + 168]; done at block + 80):
         // run another queued
         // task meanwhile (pe_co_step), then go on. Anything else: nothing.
-        wlget(g, 1); wload(g, 8, false, 104);
+        wlget(g, 1);
+        wload(g, 8, false, 104);
         wi64(g, WG_TRAMP);
         w(g, 0x51);
         wif(g);
-        wlget(g, 1); wwrap(g); wi64(g, 0); wstore(g, 8, 104);
+        wlget(g, 1);
+        wwrap(g);
         wi64(g, 0);
-        wlget(g, 1); wload(g, 8, false, 120);
-        wlget(g, 1); wload(g, 8, false, 112); wwrap(g);
-        w(g, 0x11); wu(g, wg_type_n(g, 2)); wu(g, 0);
+        wstore(g, 8, 104);
+        wi64(g, 0);
+        wlget(g, 1);
+        wload(g, 8, false, 120);
+        wlget(g, 1);
+        wload(g, 8, false, 112);
+        wwrap(g);
+        w(g, 0x11);
+        wu(g, wg_type_n(g, 2));
+        wu(g, 0);
         w(g, 0x1A);
         wi64(g, 0);
         w(g, 0x0F);
         wendif(g);
         if wg_has_fn(g, "pe_co_step") {
             // a leave: sp is the enterer's record, kept at block + 168
-            wlget(g, 0); wload(g, 8, false, 64);
-            wlget(g, 1); w(g, 0x51);
+            wlget(g, 0);
+            wload(g, 8, false, 64);
+            wlget(g, 1);
+            w(g, 0x51);
             wif(g);
-            wlget(g, 0); wi64(g, 24); w(g, 0x7D);
+            wlget(g, 0);
+            wi64(g, 24);
+            w(g, 0x7D);
             wload(g, 8, false, 0);
             w(g, 0x50);
             wif(g);
@@ -1791,33 +2368,55 @@ fn wg_gen_primitive(g: &mut WasmGen, name: str) {
             w(g, 0x0F);
             wendif(g);
         }
-        wgget(g, 1); wlset(g, 9);
-        wlget(g, 4); wgset(g, 1);
+        wgget(g, 1);
+        wlset(g, 9);
+        wlget(g, 4);
+        wgset(g, 1);
         wi64(g, 0);
         wlget(g, 1);
-        wlget(g, 0); wwrap(g);
-        w(g, 0x11); wu(g, wg_type_n(g, 2)); wu(g, 0);
+        wlget(g, 0);
+        wwrap(g);
+        w(g, 0x11);
+        wu(g, wg_type_n(g, 2));
+        wu(g, 0);
         w(g, 0x1A);
-        wlget(g, 9); wgset(g, 1);
-        wlget(g, 3); wwrap(g); wi64(g, 0); wstore(g, 4, 0);
+        wlget(g, 9);
+        wgset(g, 1);
+        wlget(g, 3);
+        wwrap(g);
+        wi64(g, 0);
+        wstore(g, 4, 0);
         wi64(g, 1000);
     } else if name == "nat_wasm_zero" {
-        wlget(g, 0); wwrap(g);
+        wlget(g, 0);
+        wwrap(g);
         wi32(g, 0);
-        wlget(g, 1); wwrap(g);
-        w(g, 0xFC); wu(g, 11); w(g, 0);
+        wlget(g, 1);
+        wwrap(g);
+        w(g, 0xFC);
+        wu(g, 11);
+        w(g, 0);
         wi64(g, 0);
     } else if name == "nat_call_fn" {
         // addr(env 0, argv[0..nargs])
         var k2: i64 = 0;
         while k2 <= 8 {
-            wlget(g, 1); wi64(g, k2); w(g, 0x51);
+            wlget(g, 1);
+            wi64(g, k2);
+            w(g, 0x51);
             wif(g);
             wi64(g, 0);
             var j: i64 = 0;
-            while j < k2 { wlget(g, 2); wload(g, 8, false, j * 8); j = j + 1; }
-            wlget(g, 0); wwrap(g);
-            w(g, 0x11); wu(g, wg_type_n(g, k2 + 1)); wu(g, 0);
+            while j < k2 {
+                wlget(g, 2);
+                wload(g, 8, false, j * 8);
+                j = j + 1;
+            }
+            wlget(g, 0);
+            wwrap(g);
+            w(g, 0x11);
+            wu(g, wg_type_n(g, k2 + 1));
+            wu(g, 0);
             w(g, 0x0F);
             wendif(g);
             k2 = k2 + 1;
@@ -1831,35 +2430,51 @@ fn wg_gen_primitive(g: &mut WasmGen, name: str) {
     } else if name == "nat_tls_get" {
         wgget(g, 1);
     } else if name == "nat_tls_set" {
-        wlget(g, 0); wgset(g, 1);
+        wlget(g, 0);
+        wgset(g, 1);
         wi64(g, 0);
     } else if name == "nat_arch" {
         // The generic Linux layouts (struct stat): as AArch64
         wi64(g, 1);
     } else if name == "nat_fma" {
-        wlget(g, 0); w(g, 0xBF);
-        wlget(g, 1); w(g, 0xBF);
+        wlget(g, 0);
+        w(g, 0xBF);
+        wlget(g, 1);
+        w(g, 0xBF);
         w(g, 0xA2);
-        wlget(g, 2); w(g, 0xBF);
+        wlget(g, 2);
+        w(g, 0xBF);
         w(g, 0xA0);
         w(g, 0xBD);
     } else if name == "nat_wasm_grow" {
-        wlget(g, 0); wwrap(g);
-        w(g, 0x40); w(g, 0);
+        wlget(g, 0);
+        wwrap(g);
+        w(g, 0x40);
+        w(g, 0);
         wexts(g);
     } else if name == "nat_wasm_size" {
-        w(g, 0x3F); w(g, 0);
+        w(g, 0x3F);
+        w(g, 0);
         wextu(g);
     } else if name == "nat_c_round" {
         // half away from zero: t = trunc(x); |x - t| >= 0.5 -> t + sign(x)
-        wlget(g, 0); w(g, 0xBF); wlset(g, x);
-        wlget(g, x); w(g, 0x9D); wlset(g, t);
-        wlget(g, x); wlget(g, t); w(g, 0xA1); w(g, 0x99);
-        w(g, 0x44); wb_f64_half(&mut g.b);
+        wlget(g, 0);
+        w(g, 0xBF);
+        wlset(g, x);
+        wlget(g, x);
+        w(g, 0x9D);
+        wlset(g, t);
+        wlget(g, x);
+        wlget(g, t);
+        w(g, 0xA1);
+        w(g, 0x99);
+        w(g, 0x44);
+        wb_f64_half(& mut g.b);
         w(g, 0x66);
         wif_t(g, 0x7C);
         wlget(g, t);
-        w(g, 0x44); wb_f64_one(&mut g.b);
+        w(g, 0x44);
+        wb_f64_one(& mut g.b);
         wlget(g, x);
         w(g, 0xA6);
         w(g, 0xA0);
@@ -1868,12 +2483,23 @@ fn wg_gen_primitive(g: &mut WasmGen, name: str) {
         wendif(g);
         w(g, 0xBD);
     } else if str_starts_with(name, "nat_c_") {
-        wlget(g, 0); w(g, 0xBF);
-        if name == "nat_c_sqrt" { w(g, 0x9F); }
-        if name == "nat_c_fabs" { w(g, 0x99); }
-        if name == "nat_c_floor" { w(g, 0x9C); }
-        if name == "nat_c_ceil" { w(g, 0x9B); }
-        if name == "nat_c_trunc" { w(g, 0x9D); }
+        wlget(g, 0);
+        w(g, 0xBF);
+        if name == "nat_c_sqrt" {
+            w(g, 0x9F);
+        }
+        if name == "nat_c_fabs" {
+            w(g, 0x99);
+        }
+        if name == "nat_c_floor" {
+            w(g, 0x9C);
+        }
+        if name == "nat_c_ceil" {
+            w(g, 0x9B);
+        }
+        if name == "nat_c_trunc" {
+            w(g, 0x9D);
+        }
         w(g, 0xBD);
     } else {
         // nat_ctx_tramp, nat_frame_*, nat_sig_handler, nat_sig_restorer,
@@ -1883,7 +2509,7 @@ fn wg_gen_primitive(g: &mut WasmGen, name: str) {
     wend(g);
 }
 
-fn wb_f64_bits(out: &mut Vec<i64>, bits: i64) {
+fn wb_f64_bits(out: & mut Vec<i64>, bits: i64) {
     var i: i64 = 0;
     while i < 8 {
         out.push((bits >> (i * 8)) & 0xFF);
@@ -1891,11 +2517,16 @@ fn wb_f64_bits(out: &mut Vec<i64>, bits: i64) {
     }
 }
 
-fn wb_f64_half(out: &mut Vec<i64>) { wb_f64_bits(out, 4602678819172646912); }
-fn wb_f64_one(out: &mut Vec<i64>) { wb_f64_bits(out, 4607182418800017408); }
+fn wb_f64_half(out: & mut Vec<i64>) {
+    wb_f64_bits(out, 4602678819172646912);
+}
+
+fn wb_f64_one(out: & mut Vec<i64>) {
+    wb_f64_bits(out, 4607182418800017408);
+}
 
 /// _start: pe_rt_init, main(env 0), proc_exit(its result)
-fn wg_gen_start(g: &mut WasmGen, exit_ix: i64) {
+fn wg_gen_start(g: & mut WasmGen, exit_ix: i64) {
     g.cur_name = "_start";
     g.b = Vec::new();
     g.extra = 0;
@@ -1918,7 +2549,7 @@ fn wg_gen_start(g: &mut WasmGen, exit_ix: i64) {
 
 /// The dyn types: every type made into a dyn value or named by a trait
 /// impl, sorted (as pe_ir and nat_ir find DynCall candidates).
-fn wg_collect_dyn_types(g: &mut WasmGen, module: &IrModule) {
+fn wg_collect_dyn_types(g: & mut WasmGen, module: & IrModule) {
     var types: Vec<str> = Vec::new();
     var ti: i64 = 0;
     while ti < module.trait_impls.len() {
@@ -1936,8 +2567,11 @@ fn wg_collect_dyn_types(g: &mut WasmGen, module: &IrModule) {
         var k: i64 = 0;
         while k < f.insts.len() {
             match f.insts.get(k).inst {
-                Inst::MakeDyn(_, tname, _) => { types = wg_insert_sorted(types, tname); }
-                _ => {}
+                Inst::MakeDyn(_, tname, _) => {
+                    types = wg_insert_sorted(types, tname);
+                }
+                _ => {
+                }
             }
             k = k + 1;
         }
@@ -1948,7 +2582,7 @@ fn wg_collect_dyn_types(g: &mut WasmGen, module: &IrModule) {
 
 /// The values of the globals, the panic-trace table (empty: no frames to
 /// walk here) and the table of functions named by strings.
-fn wg_finish_data(g: &mut WasmGen, module: &IrModule) -> Vec<i64> {
+fn wg_finish_data(g: & mut WasmGen, module: & IrModule) -> Vec<i64> {
     var gi: i64 = 0;
     while gi < g.globs.len() {
         var gname: str = g.globs.get(gi);
@@ -1957,17 +2591,30 @@ fn wg_finish_data(g: &mut WasmGen, module: &IrModule) -> Vec<i64> {
         match IrModule_get_global(module, gname) {
             OptGlobalLookup::Some(gty, init_expr) => {
                 match init_expr {
-                    Expr::IntLit(v) => { bits = v; }
-                    Expr::BoolLit(bv) => { if bv { bits = 1; } }
-                    Expr::FloatLit(f) => {
-                        if ir_type_eq(gty, IrType::F32) { bits = p_f32_to_bits(f) & 0xFFFFFFFF; }
-                        else { bits = p_f64_to_bits(f); }
+                    Expr::IntLit(v) => {
+                        bits = v;
                     }
-                    Expr::StringLit(s) => { bits = wg_str(g, s); }
-                    _ => {}
+                    Expr::BoolLit(bv) => {
+                        if bv {
+                            bits = 1;
+                        }
+                    }
+                    Expr::FloatLit(f) => {
+                        if ir_type_eq(gty, IrType::F32) {
+                            bits = p_f32_to_bits(f) & 0xFFFFFFFF;
+                        } else {
+                            bits = p_f64_to_bits(f);
+                        }
+                    }
+                    Expr::StringLit(s) => {
+                        bits = wg_str(g, s);
+                    }
+                    _ => {
+                    }
                 }
             }
-            OptGlobalLookup::None => {}
+            OptGlobalLookup::None => {
+            }
         }
         wg_data_word(g, addr, bits);
         gi = gi + 1;
@@ -1976,7 +2623,10 @@ fn wg_finish_data(g: &mut WasmGen, module: &IrModule) -> Vec<i64> {
     wg_data_align(g);
     var names: i64 = WG_DATA_BASE + g.data.len();
     var z: i64 = 0;
-    while z < 32 { g.data.push(0); z = z + 1; }
+    while z < 32 {
+        g.data.push(0);
+        z = z + 1;
+    }
     out.push(names);
     // [name, table index] pairs, then 0, 0
     var ti: i64 = 0;
@@ -1992,9 +2642,14 @@ fn wg_finish_data(g: &mut WasmGen, module: &IrModule) -> Vec<i64> {
     var pi: i64 = 0;
     while pi < pairs.len() + 2 {
         var v: i64 = 0;
-        if pi < pairs.len() { v = pairs.get(pi); }
+        if pi < pairs.len() {
+            v = pairs.get(pi);
+        }
         var bi: i64 = 0;
-        while bi < 8 { g.data.push((v >> (bi * 8)) & 0xFF); bi = bi + 1; }
+        while bi < 8 {
+            g.data.push((v >> (bi * 8)) & 0xFF);
+            bi = bi + 1;
+        }
         pi = pi + 1;
     }
     out.push(table_addr);
@@ -2002,27 +2657,39 @@ fn wg_finish_data(g: &mut WasmGen, module: &IrModule) -> Vec<i64> {
 }
 
 /// The type section's entry for signature key `key`
-fn wb_functype(out: &mut Vec<i64>, key: str) {
+fn wb_functype(out: & mut Vec<i64>, key: str) {
     var gt: i64 = str_find(key, ">");
     out.push(0x60);
     wb_uleb(out, gt);
     var i: i64 = 0;
     while i < gt {
-        if str_byte_at(key, i) == 105 { out.push(WT_I32); } else { out.push(WT_I64); }
+        if str_byte_at(key, i) == 105 {
+            out.push(WT_I32);
+        } else {
+            out.push(WT_I64);
+        }
         i = i + 1;
     }
     var nr: i64 = str_len(key) - gt - 1;
     wb_uleb(out, nr);
     i = gt + 1;
     while i < str_len(key) {
-        if str_byte_at(key, i) == 105 { out.push(WT_I32); } else { out.push(WT_I64); }
+        if str_byte_at(key, i) == 105 {
+            out.push(WT_I32);
+        } else {
+            out.push(WT_I64);
+        }
         i = i + 1;
     }
 }
 
-fn wb_global_i64(out: &mut Vec<i64>, mutable: bool, v: i64) {
+fn wb_global_i64(out: & mut Vec<i64>, mutable: bool, v: i64) {
     out.push(WT_I64);
-    if mutable { out.push(1); } else { out.push(0); }
+    if mutable {
+        out.push(1);
+    } else {
+        out.push(0);
+    }
     out.push(0x42);
     wb_sleb(out, v);
     out.push(0x0B);
@@ -2033,7 +2700,7 @@ fn wb_global_i64(out: &mut Vec<i64>, mutable: bool, v: i64) {
 /// A WASI module from an IR module that has the Linux runtime and its
 /// WASI layer (stdlib/linux_runtime/wasi.fd) merged in.
 pub fn wasm_generate(module: IrModule) -> ResultBytes {
-    if !pe_module_has_fn(&module, "main") {
+    if !pe_module_has_fn(& module, "main") {
         return ResultBytes::Err(c_vec1("wasm backend: the program has no `main` function"));
     }
     var g: WasmGen = WasmGen_new();
@@ -2043,10 +2710,10 @@ pub fn wasm_generate(module: IrModule) -> ResultBytes {
         HashMap_insert(g.all_fns, fe.name, fe.func.params.len() + 1);
         fi = fi + 1;
     }
-    if !wg_has_fn(&g, "pe_wasi_syscall") {
+    if !wg_has_fn(& g, "pe_wasi_syscall") {
         return ResultBytes::Err(c_vec1("wasm backend: the WASI layer of the runtime (stdlib/linux_runtime/wasi.fd) is not merged"));
     }
-    wg_collect_dyn_types(&mut g, &module);
+    wg_collect_dyn_types(& mut g, & module);
     // extern "C" functions; the WASI ones are imports, proc_exit always
     var ei: i64 = 0;
     while ei < module.extern_decls.len() {
@@ -2075,161 +2742,169 @@ pub fn wasm_generate(module: IrModule) -> ResultBytes {
     var imp_types: Vec<i64> = Vec::new();
     var ii: i64 = 0;
     while ii < g.imp_names.len() {
-        imp_types.push(wg_type(&mut g, g.imp_sigs.get(ii)));
+        imp_types.push(wg_type(& mut g, g.imp_sigs.get(ii)));
         ii = ii + 1;
     }
     // _start is the first function defined
-    var start_type: i64 = wg_type(&mut g, ">");
+    var start_type: i64 = wg_type(& mut g, ">");
     HashMap_insert(g.fn_index, "_start", g.n_imports);
     g.def_types.push(start_type);
     var code: Vec<i64> = Vec::new();
     var nbodies: i64 = 0;
-    wg_gen_start(&mut g, HashMap_get(g.imp_index, "wasi_proc_exit") - 1);
-    wb_uleb(&mut code, g.b.len());
-    wb_append(&mut code, &g.b);
+    wg_gen_start(& mut g, HashMap_get(g.imp_index, "wasi_proc_exit") - 1);
+    wb_uleb(& mut code, g.b.len());
+    wb_append(& mut code, & g.b);
     nbodies = nbodies + 1;
     // Compile what _start reaches, as calls are met
     var qi: i64 = 0;
     while qi < g.queue.len() {
         var name: str = g.queue.get(qi);
-        if wg_has_fn(&g, name) {
-            match IrModule_get_function(&module, name) {
-                OptIrFunction::Some(func) => { wg_gen_function(&mut g, name, &func, &module); }
+        if wg_has_fn(& g, name) {
+            match IrModule_get_function(& module, name) {
+                OptIrFunction::Some(func) => {
+                    wg_gen_function(& mut g, name, & func, & module);
+                }
                 OptIrFunction::None => {
                     g.b = Vec::new();
-                    wu(&mut g, 0);
-                    w(&mut g, 0x00);
-                    wend(&mut g);
+                    wu(& mut g, 0);
+                    w(& mut g, 0x00);
+                    wend(& mut g);
                 }
             }
         } else {
-            wg_gen_primitive(&mut g, name);
+            wg_gen_primitive(& mut g, name);
         }
-        wb_uleb(&mut code, g.b.len());
-        wb_append(&mut code, &g.b);
+        wb_uleb(& mut code, g.b.len());
+        wb_append(& mut code, & g.b);
         nbodies = nbodies + 1;
         qi = qi + 1;
     }
-    var tabs: Vec<i64> = wg_finish_data(&mut g, &module);
+    var tabs: Vec<i64> = wg_finish_data(& mut g, & module);
     // The panic trace table and the named-function table may queue no
     // functions (their entries were queued when named)
     if g.unresolved.len() > 0 {
-        return ResultBytes::Err(c_vec1("wasm backend: not available in WebAssembly yet: "
-            + str_join(g.unresolved, ", ") + " (build with `fid ccompile --target wasm32-wasi` instead)"));
+        return ResultBytes::Err(c_vec1("wasm backend: not available in WebAssembly yet: " + str_join(g.unresolved, ", ") + " (build with `fid ccompile --target wasm32-wasi` instead)"));
     }
     if nbodies != g.def_types.len() {
-        return ResultBytes::Err(c_vec1("wasm backend: internal error: " + int_to_str(nbodies)
-            + " bodies for " + int_to_str(g.def_types.len()) + " functions"));
+        return ResultBytes::Err(c_vec1("wasm backend: internal error: " + int_to_str(nbodies) + " bodies for " + int_to_str(g.def_types.len()) + " functions"));
     }
 
     var m: Vec<i64> = Vec::new();
-    m.push(0); m.push(0x61); m.push(0x73); m.push(0x6D);
-    m.push(1); m.push(0); m.push(0); m.push(0);
+    m.push(0);
+    m.push(0x61);
+    m.push(0x73);
+    m.push(0x6D);
+    m.push(1);
+    m.push(0);
+    m.push(0);
+    m.push(0);
     // Types
     var sec: Vec<i64> = Vec::new();
-    wb_uleb(&mut sec, g.type_keys.len());
+    wb_uleb(& mut sec, g.type_keys.len());
     var ti: i64 = 0;
     while ti < g.type_keys.len() {
-        wb_functype(&mut sec, g.type_keys.get(ti));
+        wb_functype(& mut sec, g.type_keys.get(ti));
         ti = ti + 1;
     }
-    wb_section(&mut m, SEC_TYPE, &sec);
+    wb_section(& mut m, SEC_TYPE, & sec);
     // Imports
     sec = Vec::new();
-    wb_uleb(&mut sec, g.n_imports);
+    wb_uleb(& mut sec, g.n_imports);
     ii = 0;
     while ii < g.n_imports {
-        wb_name(&mut sec, "wasi_snapshot_preview1");
-        wb_name(&mut sec, g.imp_names.get(ii));
+        wb_name(& mut sec, "wasi_snapshot_preview1");
+        wb_name(& mut sec, g.imp_names.get(ii));
         sec.push(0x00);
-        wb_uleb(&mut sec, imp_types.get(ii));
+        wb_uleb(& mut sec, imp_types.get(ii));
         ii = ii + 1;
     }
-    wb_section(&mut m, SEC_IMPORT, &sec);
+    wb_section(& mut m, SEC_IMPORT, & sec);
     // Functions
     sec = Vec::new();
-    wb_uleb(&mut sec, g.def_types.len());
+    wb_uleb(& mut sec, g.def_types.len());
     var di: i64 = 0;
     while di < g.def_types.len() {
-        wb_uleb(&mut sec, g.def_types.get(di));
+        wb_uleb(& mut sec, g.def_types.get(di));
         di = di + 1;
     }
-    wb_section(&mut m, SEC_FUNCTION, &sec);
+    wb_section(& mut m, SEC_FUNCTION, & sec);
     // Table (funcref; index 0 is null)
     sec = Vec::new();
-    wb_uleb(&mut sec, 1);
+    wb_uleb(& mut sec, 1);
     sec.push(0x70);
     sec.push(0x00);
-    wb_uleb(&mut sec, g.table.len() + 1);
-    wb_section(&mut m, SEC_TABLE, &sec);
+    wb_uleb(& mut sec, g.table.len() + 1);
+    wb_section(& mut m, SEC_TABLE, & sec);
     // Memory: the stack, the data, a page to spare
     var data_end: i64 = WG_DATA_BASE + g.data.len();
     var pages: i64 = (data_end + 65535) / 65536 + 1;
     sec = Vec::new();
-    wb_uleb(&mut sec, 1);
+    wb_uleb(& mut sec, 1);
     sec.push(0x00);
-    wb_uleb(&mut sec, pages);
-    wb_section(&mut m, SEC_MEMORY, &sec);
+    wb_uleb(& mut sec, pages);
+    wb_section(& mut m, SEC_MEMORY, & sec);
     // Globals: 0 the stack pointer, 1 the thread block, 2 the named
     // functions' table, 3 the panic-trace table
     sec = Vec::new();
-    wb_uleb(&mut sec, 4);
-    wb_global_i64(&mut sec, true, WG_STACK_TOP);
-    wb_global_i64(&mut sec, true, 0);
-    wb_global_i64(&mut sec, false, tabs.get(1));
-    wb_global_i64(&mut sec, false, tabs.get(0));
-    wb_section(&mut m, SEC_GLOBAL, &sec);
+    wb_uleb(& mut sec, 4);
+    wb_global_i64(& mut sec, true, WG_STACK_TOP);
+    wb_global_i64(& mut sec, true, 0);
+    wb_global_i64(& mut sec, false, tabs.get(1));
+    wb_global_i64(& mut sec, false, tabs.get(0));
+    wb_section(& mut m, SEC_GLOBAL, & sec);
     // Exports
     sec = Vec::new();
-    wb_uleb(&mut sec, 2);
-    wb_name(&mut sec, "memory");
+    wb_uleb(& mut sec, 2);
+    wb_name(& mut sec, "memory");
     sec.push(0x02);
-    wb_uleb(&mut sec, 0);
-    wb_name(&mut sec, "_start");
+    wb_uleb(& mut sec, 0);
+    wb_name(& mut sec, "_start");
     sec.push(0x00);
-    wb_uleb(&mut sec, g.n_imports);
-    wb_section(&mut m, SEC_EXPORT, &sec);
+    wb_uleb(& mut sec, g.n_imports);
+    wb_section(& mut m, SEC_EXPORT, & sec);
     // Elements: the table from index 1
     if g.table.len() > 0 {
         sec = Vec::new();
-        wb_uleb(&mut sec, 1);
+        wb_uleb(& mut sec, 1);
         sec.push(0x00);
         sec.push(0x41);
         sec.push(0x01);
         sec.push(0x0B);
-        wb_uleb(&mut sec, g.table.len());
+        wb_uleb(& mut sec, g.table.len());
         var tj: i64 = 0;
         while tj < g.table.len() {
-            wb_uleb(&mut sec, g.table.get(tj));
+            wb_uleb(& mut sec, g.table.get(tj));
             tj = tj + 1;
         }
-        wb_section(&mut m, SEC_ELEM, &sec);
+        wb_section(& mut m, SEC_ELEM, & sec);
     }
     // Code
     sec = Vec::new();
-    wb_uleb(&mut sec, nbodies);
-    wb_append(&mut sec, &code);
-    wb_section(&mut m, SEC_CODE, &sec);
+    wb_uleb(& mut sec, nbodies);
+    wb_append(& mut sec, & code);
+    wb_section(& mut m, SEC_CODE, & sec);
     // Data: one segment at WG_DATA_BASE
     sec = Vec::new();
-    wb_uleb(&mut sec, 1);
+    wb_uleb(& mut sec, 1);
     sec.push(0x00);
     sec.push(0x41);
-    wb_sleb(&mut sec, WG_DATA_BASE);
+    wb_sleb(& mut sec, WG_DATA_BASE);
     sec.push(0x0B);
-    wb_uleb(&mut sec, g.data.len());
-    wb_append(&mut sec, &g.data);
-    wb_section(&mut m, SEC_DATA, &sec);
-    p_eprint_str("[wasm] " + int_to_str(nbodies) + " functions, " + int_to_str(g.data.len()) + " bytes of data, "
-        + int_to_str(m.len()) + " bytes\n");
+    wb_uleb(& mut sec, g.data.len());
+    wb_append(& mut sec, & g.data);
+    wb_section(& mut m, SEC_DATA, & sec);
+    p_eprint_str("[wasm] " + int_to_str(nbodies) + " functions, " + int_to_str(g.data.len()) + " bytes of data, " + int_to_str(m.len()) + " bytes\n");
     return ResultBytes::Ok(m);
 }
 
 /// Lower an IR module to a WASM binary (empty when it cannot be built).
 pub fn generate_wasm(module: IrModule) -> Vec<i64> {
     match wasm_generate(module) {
-        ResultBytes::Ok(bytes) => { return bytes; }
-        ResultBytes::Err(_) => {}
+        ResultBytes::Ok(bytes) => {
+            return bytes;
+        }
+        ResultBytes::Err(_) => {
+        }
     }
     return Vec::new();
 }
@@ -2246,10 +2921,18 @@ pub fn dump_wat(module: IrModule) -> str {
     var bytes: Vec<i64> = generate_wasm(module);
     var out: str = "; WASM module (" + int_to_str(bytes.len()) + " bytes)\n";
     var sec_names: Vec<str> = Vec::new();
-    sec_names.push("custom"); sec_names.push("type"); sec_names.push("import");
-    sec_names.push("function"); sec_names.push("table"); sec_names.push("memory");
-    sec_names.push("global"); sec_names.push("export"); sec_names.push("start");
-    sec_names.push("element"); sec_names.push("code"); sec_names.push("data");
+    sec_names.push("custom");
+    sec_names.push("type");
+    sec_names.push("import");
+    sec_names.push("function");
+    sec_names.push("table");
+    sec_names.push("memory");
+    sec_names.push("global");
+    sec_names.push("export");
+    sec_names.push("start");
+    sec_names.push("element");
+    sec_names.push("code");
+    sec_names.push("data");
     sec_names.push("datacount");
     var i: i64 = 8;
     while i < bytes.len() {
@@ -2262,10 +2945,14 @@ pub fn dump_wat(module: IrModule) -> str {
             i = i + 1;
             size = size | ((b & 0x7F) << shift);
             shift = shift + 7;
-            if (b & 0x80) == 0 { break; }
+            if (b & 0x80) == 0 {
+                break;
+            }
         }
         var name: str = "?";
-        if id >= 0 && id < sec_names.len() { name = sec_names.get(id); }
+        if id >= 0 && id < sec_names.len() {
+            name = sec_names.get(id);
+        }
         out = out + "; section " + int_to_str(id) + " (" + name + ") size=" + int_to_str(size) + "\n";
         i = i + size;
     }

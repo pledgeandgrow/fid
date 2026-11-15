@@ -9,30 +9,22 @@
 // (NAT_IMAGE_BASE), so every reference is PC-relative or absolute within it.
 
 module compiler::nat_enc;
-
-use core;
-use vec;
-use string;
-
-pub const NAT_A64: i64 = 1;
-pub const NAT_RV64: i64 = 2;
-
+ use core; use vec; use string;
+ pub const NAT_A64: i64 = 1; pub const NAT_RV64: i64 = 2;
 /// Where the image (code, then data) is mapped: file offset 0x1000 holds
 /// it, the ELF header is in front, one segment maps the file at 0x400000.
 pub const NAT_IMAGE_BASE: i64 = 0x401000;
-
 /// The address NATFIX_ABS64 adds to an image offset: NAT_IMAGE_BASE for
 /// ELF and PE; the Mach-O writer (F7) sets the unslid address of its image
 /// (NAT_MACHO_IMAGE) and dyld rebases each such word by the slide.
 pub var g_nat_abs_base: i64 = 0x401000;
-
 // Fixup kinds
-pub const NATFIX_A64_B26: i64 = 1;      // B, BL: imm26 words
-pub const NATFIX_A64_B19: i64 = 2;      // B.cond, CBZ, CBNZ: imm19 at bit 5
-pub const NATFIX_A64_ADRP_ADD: i64 = 3; // ADRP + ADD lo12: the label's address
-pub const NATFIX_RV_JAL: i64 = 4;       // JAL: J-type imm20
-pub const NATFIX_RV_AUIPC_I: i64 = 5;   // AUIPC + I-type (ADDI, JALR): pc-relative
-pub const NATFIX_ABS64: i64 = 6;        // 8 data bytes: the label's absolute address
+pub const NATFIX_A64_B26: i64 = 1;  // B, BL: imm26 words
+pub const NATFIX_A64_B19: i64 = 2;  // B.cond, CBZ, CBNZ: imm19 at bit 5
+pub const NATFIX_A64_ADRP_ADD: i64 = 3;  // ADRP + ADD lo12: the label's address
+pub const NATFIX_RV_JAL: i64 = 4;  // JAL: J-type imm20
+pub const NATFIX_RV_AUIPC_I: i64 = 5;  // AUIPC + I-type (ADDI, JALR): pc-relative
+pub const NATFIX_ABS64: i64 = 6;  // 8 data bytes: the label's absolute address
 
 pub struct NatFix {
     pub pos: i64,
@@ -50,35 +42,37 @@ pub struct NatEnc {
 
 pub fn NatEnc_new() -> NatEnc {
     var labels: Vec<i64> = Vec::new();
-    labels.push(-1);
-    return NatEnc { code: Vec::new(), labels: labels, fixups: Vec::new() };
+    labels.push(- 1);
+    return NatEnc {
+        code: Vec::new(), labels: labels, fixups: Vec::new()
+    };
 }
 
-pub fn NatEnc_pos(e: &NatEnc) -> i64 {
+pub fn NatEnc_pos(e: & NatEnc) -> i64 {
     return e.code.len();
 }
 
-pub fn NatEnc_label(e: &mut NatEnc) -> i64 {
-    e.labels.push(-1);
+pub fn NatEnc_label(e: & mut NatEnc) -> i64 {
+    e.labels.push(- 1);
     return e.labels.len() - 1;
 }
 
-pub fn NatEnc_place(e: &mut NatEnc, label: i64) {
+pub fn NatEnc_place(e: & mut NatEnc, label: i64) {
     e.labels.set(label, e.code.len());
 }
 
-pub fn NatEnc_byte(e: &mut NatEnc, b: i64) {
+pub fn NatEnc_byte(e: & mut NatEnc, b: i64) {
     e.code.push(b & 0xFF);
 }
 
-pub fn NatEnc_word(e: &mut NatEnc, w: i64) {
+pub fn NatEnc_word(e: & mut NatEnc, w: i64) {
     e.code.push(w & 0xFF);
     e.code.push((w >> 8) & 0xFF);
     e.code.push((w >> 16) & 0xFF);
     e.code.push((w >> 24) & 0xFF);
 }
 
-pub fn NatEnc_quad(e: &mut NatEnc, v: i64) {
+pub fn NatEnc_quad(e: & mut NatEnc, v: i64) {
     var i: i64 = 0;
     while i < 8 {
         e.code.push((v >> (i * 8)) & 0xFF);
@@ -86,41 +80,45 @@ pub fn NatEnc_quad(e: &mut NatEnc, v: i64) {
     }
 }
 
-pub fn NatEnc_align(e: &mut NatEnc, n: i64) {
+pub fn NatEnc_align(e: & mut NatEnc, n: i64) {
     while e.code.len() % n != 0 {
         e.code.push(0);
     }
 }
 
 /// Record that the word(s) at the current position refer to `label`.
-pub fn NatEnc_fix(e: &mut NatEnc, label: i64, kind: i64) {
-    e.fixups.push(NatFix { pos: e.code.len(), label: label, kind: kind });
+pub fn NatEnc_fix(e: & mut NatEnc, label: i64, kind: i64) {
+    e.fixups.push(NatFix {
+        pos: e.code.len(), label: label, kind: kind
+    });
 }
 
 /// Record that the word(s) at `pos` refer to `label` — the CS6 function
 /// cache replays fixups whose patch site is not the current position.
-pub fn NatEnc_fix_at(e: &mut NatEnc, pos: i64, label: i64, kind: i64) {
-    e.fixups.push(NatFix { pos: pos, label: label, kind: kind });
+pub fn NatEnc_fix_at(e: & mut NatEnc, pos: i64, label: i64, kind: i64) {
+    e.fixups.push(NatFix {
+        pos: pos, label: label, kind: kind
+    });
 }
 
-fn nat_read32(e: &NatEnc, pos: i64) -> i64 {
+fn nat_read32(e: & NatEnc, pos: i64) -> i64 {
     return e.code.get(pos) | (e.code.get(pos + 1) << 8) | (e.code.get(pos + 2) << 16) | (e.code.get(pos + 3) << 24);
 }
 
-fn nat_write32(e: &mut NatEnc, pos: i64, w: i64) {
+fn nat_write32(e: & mut NatEnc, pos: i64, w: i64) {
     e.code.set(pos, w & 0xFF);
     e.code.set(pos + 1, (w >> 8) & 0xFF);
     e.code.set(pos + 2, (w >> 16) & 0xFF);
     e.code.set(pos + 3, (w >> 24) & 0xFF);
 }
 
-fn nat_or32(e: &mut NatEnc, pos: i64, bits: i64) {
+fn nat_or32(e: & mut NatEnc, pos: i64, bits: i64) {
     nat_write32(e, pos, nat_read32(e, pos) | (bits & 0xFFFFFFFF));
 }
 
 /// Patch every fixup. Returns "" or the first error (a label never placed,
 /// or a target out of an instruction's range).
-@wrapping pub fn NatEnc_resolve(e: &mut NatEnc) -> str {
+@wrapping pub fn NatEnc_resolve(e: & mut NatEnc) -> str {
     var i: i64 = 0;
     while i < e.fixups.len() {
         var f: NatFix = e.fixups.get(i);
@@ -130,10 +128,14 @@ fn nat_or32(e: &mut NatEnc, pos: i64, bits: i64) {
         }
         var delta: i64 = target - f.pos;
         if f.kind == NATFIX_A64_B26 {
-            if delta < 0 - 134217728 || delta >= 134217728 { return "native backend: branch out of range"; }
+            if delta < 0 - 134217728 || delta >= 134217728 {
+                return "native backend: branch out of range";
+            }
             nat_or32(e, f.pos, (delta >> 2) & 0x3FFFFFF);
         } else if f.kind == NATFIX_A64_B19 {
-            if delta < 0 - 1048576 || delta >= 1048576 { return "native backend: conditional branch out of range"; }
+            if delta < 0 - 1048576 || delta >= 1048576 {
+                return "native backend: conditional branch out of range";
+            }
             nat_or32(e, f.pos, ((delta >> 2) & 0x7FFFF) << 5);
         } else if f.kind == NATFIX_A64_ADRP_ADD {
             // The image base is page-aligned: pages follow from offsets
@@ -141,9 +143,10 @@ fn nat_or32(e: &mut NatEnc, pos: i64, bits: i64) {
             nat_or32(e, f.pos, ((pd & 3) << 29) | (((pd >> 2) & 0x7FFFF) << 5));
             nat_or32(e, f.pos + 4, (target & 0xFFF) << 10);
         } else if f.kind == NATFIX_RV_JAL {
-            if delta < 0 - 1048576 || delta >= 1048576 { return "native backend: jump out of range"; }
-            var j: i64 = (((delta >> 20) & 1) << 31) | (((delta >> 1) & 0x3FF) << 21)
-                | (((delta >> 11) & 1) << 20) | (((delta >> 12) & 0xFF) << 12);
+            if delta < 0 - 1048576 || delta >= 1048576 {
+                return "native backend: jump out of range";
+            }
+            var j: i64 = (((delta >> 20) & 1) << 31) | (((delta >> 1) & 0x3FF) << 21) | (((delta >> 11) & 1) << 20) | (((delta >> 12) & 0xFF) << 12);
             nat_or32(e, f.pos, j);
         } else if f.kind == NATFIX_RV_AUIPC_I {
             var hi: i64 = (delta + 0x800) >> 12;
@@ -184,112 +187,154 @@ fn nat_or32(e: &mut NatEnc, pos: i64, bits: i64) {
 // by instruction. Floating point: 0..31 = d0..d31 (s0..s31 for f32).
 // ===========================================================================
 
-pub const A64_SP: i64 = 31;
-pub const A64_ZR: i64 = 31;
-pub const A64_FP: i64 = 29;
-pub const A64_LR: i64 = 30;
-
+pub const A64_SP: i64 = 31; pub const A64_ZR: i64 = 31; pub const A64_FP: i64 = 29; pub const A64_LR: i64 = 30;
 // Condition codes
-pub const A64_EQ: i64 = 0;
-pub const A64_NE: i64 = 1;
-pub const A64_HS: i64 = 2;
-pub const A64_LO: i64 = 3;
-pub const A64_MI: i64 = 4;
-pub const A64_VS: i64 = 6;
-pub const A64_HI: i64 = 8;
-pub const A64_LS: i64 = 9;
-pub const A64_GE: i64 = 10;
-pub const A64_LT: i64 = 11;
-pub const A64_GT: i64 = 12;
-pub const A64_LE: i64 = 13;
-
+pub const A64_EQ: i64 = 0; pub const A64_NE: i64 = 1; pub const A64_HS: i64 = 2; pub const A64_LO: i64 = 3; pub const A64_MI: i64 = 4; pub const A64_VS: i64 = 6; pub const A64_HI: i64 = 8; pub const A64_LS: i64 = 9; pub const A64_GE: i64 = 10; pub const A64_LT: i64 = 11; pub const A64_GT: i64 = 12; pub const A64_LE: i64 = 13;
 /// Three-register data processing: base | m << 16 | n << 5 | d.
-pub fn a64_rrr(e: &mut NatEnc, base: i64, d: i64, n: i64, m: i64) {
+pub fn a64_rrr(e: & mut NatEnc, base: i64, d: i64, n: i64, m: i64) {
     NatEnc_word(e, base | (m << 16) | (n << 5) | d);
 }
 
-pub fn a64_add(e: &mut NatEnc, d: i64, n: i64, m: i64) { a64_rrr(e, 0x8B000000, d, n, m); }
-pub fn a64_adds(e: &mut NatEnc, d: i64, n: i64, m: i64) { a64_rrr(e, 0xAB000000, d, n, m); }
-pub fn a64_sub(e: &mut NatEnc, d: i64, n: i64, m: i64) { a64_rrr(e, 0xCB000000, d, n, m); }
-pub fn a64_subs(e: &mut NatEnc, d: i64, n: i64, m: i64) { a64_rrr(e, 0xEB000000, d, n, m); }
-pub fn a64_and(e: &mut NatEnc, d: i64, n: i64, m: i64) { a64_rrr(e, 0x8A000000, d, n, m); }
-pub fn a64_orr(e: &mut NatEnc, d: i64, n: i64, m: i64) { a64_rrr(e, 0xAA000000, d, n, m); }
-pub fn a64_eor(e: &mut NatEnc, d: i64, n: i64, m: i64) { a64_rrr(e, 0xCA000000, d, n, m); }
-pub fn a64_mul(e: &mut NatEnc, d: i64, n: i64, m: i64) { a64_rrr(e, 0x9B007C00, d, n, m); }
-pub fn a64_smulh(e: &mut NatEnc, d: i64, n: i64, m: i64) { a64_rrr(e, 0x9B407C00, d, n, m); }
-pub fn a64_umulh(e: &mut NatEnc, d: i64, n: i64, m: i64) { a64_rrr(e, 0x9BC07C00, d, n, m); }
-pub fn a64_sdiv(e: &mut NatEnc, d: i64, n: i64, m: i64) { a64_rrr(e, 0x9AC00C00, d, n, m); }
-pub fn a64_udiv(e: &mut NatEnc, d: i64, n: i64, m: i64) { a64_rrr(e, 0x9AC00800, d, n, m); }
-pub fn a64_lslv(e: &mut NatEnc, d: i64, n: i64, m: i64) { a64_rrr(e, 0x9AC02000, d, n, m); }
-pub fn a64_lsrv(e: &mut NatEnc, d: i64, n: i64, m: i64) { a64_rrr(e, 0x9AC02400, d, n, m); }
-pub fn a64_asrv(e: &mut NatEnc, d: i64, n: i64, m: i64) { a64_rrr(e, 0x9AC02800, d, n, m); }
+pub fn a64_add(e: & mut NatEnc, d: i64, n: i64, m: i64) {
+    a64_rrr(e, 0x8B000000, d, n, m);
+}
+pub fn a64_adds(e: & mut NatEnc, d: i64, n: i64, m: i64) {
+    a64_rrr(e, 0xAB000000, d, n, m);
+}
+pub fn a64_sub(e: & mut NatEnc, d: i64, n: i64, m: i64) {
+    a64_rrr(e, 0xCB000000, d, n, m);
+}
+pub fn a64_subs(e: & mut NatEnc, d: i64, n: i64, m: i64) {
+    a64_rrr(e, 0xEB000000, d, n, m);
+}
+pub fn a64_and(e: & mut NatEnc, d: i64, n: i64, m: i64) {
+    a64_rrr(e, 0x8A000000, d, n, m);
+}
+pub fn a64_orr(e: & mut NatEnc, d: i64, n: i64, m: i64) {
+    a64_rrr(e, 0xAA000000, d, n, m);
+}
+pub fn a64_eor(e: & mut NatEnc, d: i64, n: i64, m: i64) {
+    a64_rrr(e, 0xCA000000, d, n, m);
+}
+pub fn a64_mul(e: & mut NatEnc, d: i64, n: i64, m: i64) {
+    a64_rrr(e, 0x9B007C00, d, n, m);
+}
+pub fn a64_smulh(e: & mut NatEnc, d: i64, n: i64, m: i64) {
+    a64_rrr(e, 0x9B407C00, d, n, m);
+}
+pub fn a64_umulh(e: & mut NatEnc, d: i64, n: i64, m: i64) {
+    a64_rrr(e, 0x9BC07C00, d, n, m);
+}
+pub fn a64_sdiv(e: & mut NatEnc, d: i64, n: i64, m: i64) {
+    a64_rrr(e, 0x9AC00C00, d, n, m);
+}
+pub fn a64_udiv(e: & mut NatEnc, d: i64, n: i64, m: i64) {
+    a64_rrr(e, 0x9AC00800, d, n, m);
+}
+pub fn a64_lslv(e: & mut NatEnc, d: i64, n: i64, m: i64) {
+    a64_rrr(e, 0x9AC02000, d, n, m);
+}
+pub fn a64_lsrv(e: & mut NatEnc, d: i64, n: i64, m: i64) {
+    a64_rrr(e, 0x9AC02400, d, n, m);
+}
+pub fn a64_asrv(e: & mut NatEnc, d: i64, n: i64, m: i64) {
+    a64_rrr(e, 0x9AC02800, d, n, m);
+}
 
 /// d = a - n * m
-pub fn a64_msub(e: &mut NatEnc, d: i64, n: i64, m: i64, a: i64) {
+pub fn a64_msub(e: & mut NatEnc, d: i64, n: i64, m: i64, a: i64) {
     NatEnc_word(e, 0x9B008000 | (m << 16) | (a << 10) | (n << 5) | d);
 }
 
 /// ADD d, n, #imm (0..4095); n and d may be sp.
-pub fn a64_add_imm(e: &mut NatEnc, d: i64, n: i64, imm: i64) {
+pub fn a64_add_imm(e: & mut NatEnc, d: i64, n: i64, imm: i64) {
     NatEnc_word(e, 0x91000000 | ((imm & 0xFFF) << 10) | (n << 5) | d);
 }
 
-pub fn a64_sub_imm(e: &mut NatEnc, d: i64, n: i64, imm: i64) {
+pub fn a64_sub_imm(e: & mut NatEnc, d: i64, n: i64, imm: i64) {
     NatEnc_word(e, 0xD1000000 | ((imm & 0xFFF) << 10) | (n << 5) | d);
 }
 
 /// ADD d, n, m, UXTX: n and d may be sp (the extended-register form).
-pub fn a64_add_ext(e: &mut NatEnc, d: i64, n: i64, m: i64) {
+pub fn a64_add_ext(e: & mut NatEnc, d: i64, n: i64, m: i64) {
     NatEnc_word(e, 0x8B206000 | (m << 16) | (n << 5) | d);
 }
 
-pub fn a64_sub_ext(e: &mut NatEnc, d: i64, n: i64, m: i64) {
+pub fn a64_sub_ext(e: & mut NatEnc, d: i64, n: i64, m: i64) {
     NatEnc_word(e, 0xCB206000 | (m << 16) | (n << 5) | d);
 }
 
 /// MOV d, m (ORR d, xzr, m): not for sp.
-pub fn a64_mov(e: &mut NatEnc, d: i64, m: i64) {
-    if d == m { return; }
+pub fn a64_mov(e: & mut NatEnc, d: i64, m: i64) {
+    if d == m {
+        return;
+    }
     a64_rrr(e, 0xAA000000, d, A64_ZR, m);
 }
 
-pub fn a64_mvn(e: &mut NatEnc, d: i64, m: i64) { a64_rrr(e, 0xAA200000, d, A64_ZR, m); }
-pub fn a64_neg(e: &mut NatEnc, d: i64, m: i64) { a64_rrr(e, 0xCB000000, d, A64_ZR, m); }
-pub fn a64_negs(e: &mut NatEnc, d: i64, m: i64) { a64_rrr(e, 0xEB000000, d, A64_ZR, m); }
-pub fn a64_cmp(e: &mut NatEnc, n: i64, m: i64) { a64_rrr(e, 0xEB000000, A64_ZR, n, m); }
+pub fn a64_mvn(e: & mut NatEnc, d: i64, m: i64) {
+    a64_rrr(e, 0xAA200000, d, A64_ZR, m);
+}
+pub fn a64_neg(e: & mut NatEnc, d: i64, m: i64) {
+    a64_rrr(e, 0xCB000000, d, A64_ZR, m);
+}
+pub fn a64_negs(e: & mut NatEnc, d: i64, m: i64) {
+    a64_rrr(e, 0xEB000000, d, A64_ZR, m);
+}
+pub fn a64_cmp(e: & mut NatEnc, n: i64, m: i64) {
+    a64_rrr(e, 0xEB000000, A64_ZR, n, m);
+}
 
 /// CMP n, m, ASR #63 (SUBS xzr, n, m, ASR #63): the high half of a signed
 /// product against the sign of its low half.
-pub fn a64_cmp_asr63(e: &mut NatEnc, n: i64, m: i64) {
+pub fn a64_cmp_asr63(e: & mut NatEnc, n: i64, m: i64) {
     NatEnc_word(e, 0xEB800000 | (m << 16) | (63 << 10) | (n << 5) | A64_ZR);
 }
 
 /// CSET d, cond (CSINC d, xzr, xzr, !cond)
-pub fn a64_cset(e: &mut NatEnc, d: i64, cond: i64) {
+pub fn a64_cset(e: & mut NatEnc, d: i64, cond: i64) {
     NatEnc_word(e, 0x9A9F07E0 | ((cond ^ 1) << 12) | d);
 }
 
 // Sign and zero extension (SBFM / UBFM)
-pub fn a64_sxtb(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0x93401C00 | (n << 5) | d); }
-pub fn a64_sxth(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0x93403C00 | (n << 5) | d); }
-pub fn a64_sxtw(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0x93407C00 | (n << 5) | d); }
-pub fn a64_uxtb(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0xD3401C00 | (n << 5) | d); }
-pub fn a64_uxth(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0xD3403C00 | (n << 5) | d); }
-pub fn a64_uxtw(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0xD3407C00 | (n << 5) | d); }
+pub fn a64_sxtb(e: & mut NatEnc, d: i64, n: i64) {
+    NatEnc_word(e, 0x93401C00 | (n << 5) | d);
+}
+pub fn a64_sxth(e: & mut NatEnc, d: i64, n: i64) {
+    NatEnc_word(e, 0x93403C00 | (n << 5) | d);
+}
+pub fn a64_sxtw(e: & mut NatEnc, d: i64, n: i64) {
+    NatEnc_word(e, 0x93407C00 | (n << 5) | d);
+}
+pub fn a64_uxtb(e: & mut NatEnc, d: i64, n: i64) {
+    NatEnc_word(e, 0xD3401C00 | (n << 5) | d);
+}
+pub fn a64_uxth(e: & mut NatEnc, d: i64, n: i64) {
+    NatEnc_word(e, 0xD3403C00 | (n << 5) | d);
+}
+pub fn a64_uxtw(e: & mut NatEnc, d: i64, n: i64) {
+    NatEnc_word(e, 0xD3407C00 | (n << 5) | d);
+}
 
 /// d = n >> 63 (arithmetic): 0 or -1
-pub fn a64_asr63(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0x937FFC00 | (n << 5) | d); }
+pub fn a64_asr63(e: & mut NatEnc, d: i64, n: i64) {
+    NatEnc_word(e, 0x937FFC00 | (n << 5) | d);
+}
 
 /// Any 64-bit constant: MOVZ (or MOVN) and MOVKs.
-@wrapping pub fn a64_li(e: &mut NatEnc, d: i64, v: i64) {
+@wrapping pub fn a64_li(e: & mut NatEnc, d: i64, v: i64) {
     // Count the 16-bit pieces that differ from 0 and from 0xFFFF
     var zeros: i64 = 0;
     var ones: i64 = 0;
     var k: i64 = 0;
     while k < 4 {
         var h: i64 = (v >> (k * 16)) & 0xFFFF;
-        if h == 0 { zeros = zeros + 1; }
-        if h == 0xFFFF { ones = ones + 1; }
+        if h == 0 {
+            zeros = zeros + 1;
+        }
+        if h == 0xFFFF {
+            ones = ones + 1;
+        }
         k = k + 1;
     }
     var inverted: bool = ones > zeros;
@@ -298,7 +343,11 @@ pub fn a64_asr63(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0x937FFC00 | (
     while k < 4 {
         var h2: i64 = (v >> (k * 16)) & 0xFFFF;
         var skip: bool = false;
-        if inverted { skip = h2 == 0xFFFF; } else { skip = h2 == 0; }
+        if inverted {
+            skip = h2 == 0xFFFF;
+        } else {
+            skip = h2 == 0;
+        }
         if !skip {
             if first {
                 if inverted {
@@ -330,110 +379,192 @@ pub fn a64_ldst_fits(size: i64, imm: i64) -> bool {
     return imm >= 0 && imm % size == 0 && imm / size < 4096;
 }
 
-pub fn a64_ldr_sized(e: &mut NatEnc, t: i64, n: i64, imm: i64, size: i64, signed: bool) {
-    var base: i64 = 0xF9400000; // LDR x
+pub fn a64_ldr_sized(e: & mut NatEnc, t: i64, n: i64, imm: i64, size: i64, signed: bool) {
+    var base: i64 = 0xF9400000;
+    // LDR x
     if size == 1 {
-        if signed { base = 0x39800000; } else { base = 0x39400000; }
+        if signed {
+            base = 0x39800000;
+        } else {
+            base = 0x39400000;
+        }
     } else if size == 2 {
-        if signed { base = 0x79800000; } else { base = 0x79400000; }
+        if signed {
+            base = 0x79800000;
+        } else {
+            base = 0x79400000;
+        }
     } else if size == 4 {
-        if signed { base = 0xB9800000; } else { base = 0xB9400000; }
+        if signed {
+            base = 0xB9800000;
+        } else {
+            base = 0xB9400000;
+        }
     }
     NatEnc_word(e, base | ((imm / size) << 10) | (n << 5) | t);
 }
 
-pub fn a64_str_sized(e: &mut NatEnc, t: i64, n: i64, imm: i64, size: i64) {
+pub fn a64_str_sized(e: & mut NatEnc, t: i64, n: i64, imm: i64, size: i64) {
     var base: i64 = 0xF9000000;
-    if size == 1 { base = 0x39000000; }
-    if size == 2 { base = 0x79000000; }
-    if size == 4 { base = 0xB9000000; }
+    if size == 1 {
+        base = 0x39000000;
+    }
+    if size == 2 {
+        base = 0x79000000;
+    }
+    if size == 4 {
+        base = 0xB9000000;
+    }
     NatEnc_word(e, base | ((imm / size) << 10) | (n << 5) | t);
 }
 
-pub fn a64_ldr(e: &mut NatEnc, t: i64, n: i64, imm: i64) { a64_ldr_sized(e, t, n, imm, 8, false); }
-pub fn a64_str(e: &mut NatEnc, t: i64, n: i64, imm: i64) { a64_str_sized(e, t, n, imm, 8); }
+pub fn a64_ldr(e: & mut NatEnc, t: i64, n: i64, imm: i64) {
+    a64_ldr_sized(e, t, n, imm, 8, false);
+}
+pub fn a64_str(e: & mut NatEnc, t: i64, n: i64, imm: i64) {
+    a64_str_sized(e, t, n, imm, 8);
+}
 
 // Branches (targets are labels)
-pub fn a64_b(e: &mut NatEnc, label: i64) {
+pub fn a64_b(e: & mut NatEnc, label: i64) {
     NatEnc_fix(e, label, NATFIX_A64_B26);
     NatEnc_word(e, 0x14000000);
 }
 
-pub fn a64_bl(e: &mut NatEnc, label: i64) {
+pub fn a64_bl(e: & mut NatEnc, label: i64) {
     NatEnc_fix(e, label, NATFIX_A64_B26);
     NatEnc_word(e, 0x94000000);
 }
 
-pub fn a64_bcond(e: &mut NatEnc, cond: i64, label: i64) {
+pub fn a64_bcond(e: & mut NatEnc, cond: i64, label: i64) {
     NatEnc_fix(e, label, NATFIX_A64_B19);
     NatEnc_word(e, 0x54000000 | cond);
 }
 
-pub fn a64_cbz(e: &mut NatEnc, t: i64, label: i64) {
+pub fn a64_cbz(e: & mut NatEnc, t: i64, label: i64) {
     NatEnc_fix(e, label, NATFIX_A64_B19);
     NatEnc_word(e, 0xB4000000 | t);
 }
 
-pub fn a64_cbnz(e: &mut NatEnc, t: i64, label: i64) {
+pub fn a64_cbnz(e: & mut NatEnc, t: i64, label: i64) {
     NatEnc_fix(e, label, NATFIX_A64_B19);
     NatEnc_word(e, 0xB5000000 | t);
 }
 
 /// B.cond over the next instruction (+8): the inverse of a far branch.
-pub fn a64_bcond_skip1(e: &mut NatEnc, cond: i64) {
+pub fn a64_bcond_skip1(e: & mut NatEnc, cond: i64) {
     NatEnc_word(e, 0x54000000 | (2 << 5) | cond);
 }
 
-pub fn a64_blr(e: &mut NatEnc, n: i64) { NatEnc_word(e, 0xD63F0000 | (n << 5)); }
-pub fn a64_ret(e: &mut NatEnc) { NatEnc_word(e, 0xD65F03C0); }
-pub fn a64_svc0(e: &mut NatEnc) { NatEnc_word(e, 0xD4000001); }
-pub fn a64_brk(e: &mut NatEnc) { NatEnc_word(e, 0xD4200000); }
+pub fn a64_blr(e: & mut NatEnc, n: i64) {
+    NatEnc_word(e, 0xD63F0000 | (n << 5));
+}
+pub fn a64_ret(e: & mut NatEnc) {
+    NatEnc_word(e, 0xD65F03C0);
+}
+pub fn a64_svc0(e: & mut NatEnc) {
+    NatEnc_word(e, 0xD4000001);
+}
+pub fn a64_brk(e: & mut NatEnc) {
+    NatEnc_word(e, 0xD4200000);
+}
 
 /// d = the address of `label` (ADRP + ADD).
-pub fn a64_addr(e: &mut NatEnc, d: i64, label: i64) {
+pub fn a64_addr(e: & mut NatEnc, d: i64, label: i64) {
     NatEnc_fix(e, label, NATFIX_A64_ADRP_ADD);
     NatEnc_word(e, 0x90000000 | d);
     NatEnc_word(e, 0x91000000 | (d << 5) | d);
 }
 
 // Floating point (double unless named _s)
-pub fn a64_fmov_dx(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0x9E670000 | (n << 5) | d); }
-pub fn a64_fmov_xd(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0x9E660000 | (n << 5) | d); }
-pub fn a64_fmov_sw(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0x1E270000 | (n << 5) | d); }
-pub fn a64_fmov_ws(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0x1E260000 | (n << 5) | d); }
-pub fn a64_fadd(e: &mut NatEnc, d: i64, n: i64, m: i64) { a64_rrr(e, 0x1E602800, d, n, m); }
-pub fn a64_fsub(e: &mut NatEnc, d: i64, n: i64, m: i64) { a64_rrr(e, 0x1E603800, d, n, m); }
-pub fn a64_fmul(e: &mut NatEnc, d: i64, n: i64, m: i64) { a64_rrr(e, 0x1E600800, d, n, m); }
-pub fn a64_fdiv(e: &mut NatEnc, d: i64, n: i64, m: i64) { a64_rrr(e, 0x1E601800, d, n, m); }
-pub fn a64_fcmp(e: &mut NatEnc, n: i64, m: i64) { NatEnc_word(e, 0x1E602000 | (m << 16) | (n << 5)); }
-pub fn a64_fcvt_ds(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0x1E22C000 | (n << 5) | d); }
-pub fn a64_fcvt_sd(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0x1E624000 | (n << 5) | d); }
-pub fn a64_scvtf(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0x9E620000 | (n << 5) | d); }
-pub fn a64_fcvtzs(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0x9E780000 | (n << 5) | d); }
-pub fn a64_fsqrt(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0x1E61C000 | (n << 5) | d); }
-pub fn a64_fabs(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0x1E60C000 | (n << 5) | d); }
-pub fn a64_frintm(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0x1E654000 | (n << 5) | d); }
-pub fn a64_frintp(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0x1E64C000 | (n << 5) | d); }
-pub fn a64_frintz(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0x1E65C000 | (n << 5) | d); }
-pub fn a64_frinta(e: &mut NatEnc, d: i64, n: i64) { NatEnc_word(e, 0x1E664000 | (n << 5) | d); }
+pub fn a64_fmov_dx(e: & mut NatEnc, d: i64, n: i64) {
+    NatEnc_word(e, 0x9E670000 | (n << 5) | d);
+}
+pub fn a64_fmov_xd(e: & mut NatEnc, d: i64, n: i64) {
+    NatEnc_word(e, 0x9E660000 | (n << 5) | d);
+}
+pub fn a64_fmov_sw(e: & mut NatEnc, d: i64, n: i64) {
+    NatEnc_word(e, 0x1E270000 | (n << 5) | d);
+}
+pub fn a64_fmov_ws(e: & mut NatEnc, d: i64, n: i64) {
+    NatEnc_word(e, 0x1E260000 | (n << 5) | d);
+}
+pub fn a64_fadd(e: & mut NatEnc, d: i64, n: i64, m: i64) {
+    a64_rrr(e, 0x1E602800, d, n, m);
+}
+pub fn a64_fsub(e: & mut NatEnc, d: i64, n: i64, m: i64) {
+    a64_rrr(e, 0x1E603800, d, n, m);
+}
+pub fn a64_fmul(e: & mut NatEnc, d: i64, n: i64, m: i64) {
+    a64_rrr(e, 0x1E600800, d, n, m);
+}
+pub fn a64_fdiv(e: & mut NatEnc, d: i64, n: i64, m: i64) {
+    a64_rrr(e, 0x1E601800, d, n, m);
+}
+pub fn a64_fcmp(e: & mut NatEnc, n: i64, m: i64) {
+    NatEnc_word(e, 0x1E602000 | (m << 16) | (n << 5));
+}
+pub fn a64_fcvt_ds(e: & mut NatEnc, d: i64, n: i64) {
+    NatEnc_word(e, 0x1E22C000 | (n << 5) | d);
+}
+pub fn a64_fcvt_sd(e: & mut NatEnc, d: i64, n: i64) {
+    NatEnc_word(e, 0x1E624000 | (n << 5) | d);
+}
+pub fn a64_scvtf(e: & mut NatEnc, d: i64, n: i64) {
+    NatEnc_word(e, 0x9E620000 | (n << 5) | d);
+}
+pub fn a64_fcvtzs(e: & mut NatEnc, d: i64, n: i64) {
+    NatEnc_word(e, 0x9E780000 | (n << 5) | d);
+}
+pub fn a64_fsqrt(e: & mut NatEnc, d: i64, n: i64) {
+    NatEnc_word(e, 0x1E61C000 | (n << 5) | d);
+}
+pub fn a64_fabs(e: & mut NatEnc, d: i64, n: i64) {
+    NatEnc_word(e, 0x1E60C000 | (n << 5) | d);
+}
+pub fn a64_frintm(e: & mut NatEnc, d: i64, n: i64) {
+    NatEnc_word(e, 0x1E654000 | (n << 5) | d);
+}
+pub fn a64_frintp(e: & mut NatEnc, d: i64, n: i64) {
+    NatEnc_word(e, 0x1E64C000 | (n << 5) | d);
+}
+pub fn a64_frintz(e: & mut NatEnc, d: i64, n: i64) {
+    NatEnc_word(e, 0x1E65C000 | (n << 5) | d);
+}
+pub fn a64_frinta(e: & mut NatEnc, d: i64, n: i64) {
+    NatEnc_word(e, 0x1E664000 | (n << 5) | d);
+}
 
 // Atomics (exclusive and acquire/release forms)
-pub fn a64_ldaxr(e: &mut NatEnc, t: i64, n: i64) { NatEnc_word(e, 0xC85FFC00 | (n << 5) | t); }
+pub fn a64_ldaxr(e: & mut NatEnc, t: i64, n: i64) {
+    NatEnc_word(e, 0xC85FFC00 | (n << 5) | t);
+}
 /// STLXR Ws, Xt, [Xn]: Ws = 0 on success
-pub fn a64_stlxr(e: &mut NatEnc, s: i64, t: i64, n: i64) { NatEnc_word(e, 0xC800FC00 | (s << 16) | (n << 5) | t); }
-pub fn a64_ldar(e: &mut NatEnc, t: i64, n: i64) { NatEnc_word(e, 0xC8DFFC00 | (n << 5) | t); }
-pub fn a64_stlr(e: &mut NatEnc, t: i64, n: i64) { NatEnc_word(e, 0xC89FFC00 | (n << 5) | t); }
-pub fn a64_clrex(e: &mut NatEnc) { NatEnc_word(e, 0xD5033F5F); }    // clrex (#15)
-pub fn a64_dmb(e: &mut NatEnc) { NatEnc_word(e, 0xD5033BBF); }
+pub fn a64_stlxr(e: & mut NatEnc, s: i64, t: i64, n: i64) {
+    NatEnc_word(e, 0xC800FC00 | (s << 16) | (n << 5) | t);
+}
+pub fn a64_ldar(e: & mut NatEnc, t: i64, n: i64) {
+    NatEnc_word(e, 0xC8DFFC00 | (n << 5) | t);
+}
+pub fn a64_stlr(e: & mut NatEnc, t: i64, n: i64) {
+    NatEnc_word(e, 0xC89FFC00 | (n << 5) | t);
+}
+pub fn a64_clrex(e: & mut NatEnc) {
+    NatEnc_word(e, 0xD5033F5F);
+}
+// clrex (#15)
+pub fn a64_dmb(e: & mut NatEnc) {
+    NatEnc_word(e, 0xD5033BBF);
+}
 /// CBNZ Wt by a fixed word count (no fixup); negative jumps back
-pub fn a64_cbnz_w_words(e: &mut NatEnc, t: i64, words: i64) {
+pub fn a64_cbnz_w_words(e: & mut NatEnc, t: i64, words: i64) {
     NatEnc_word(e, 0x35000000 | ((words & 0x7FFFF) << 5) | t);
 }
 /// B.cond / CBNZ X by a fixed word count
-pub fn a64_bcond_words(e: &mut NatEnc, cond: i64, words: i64) {
+pub fn a64_bcond_words(e: & mut NatEnc, cond: i64, words: i64) {
     NatEnc_word(e, 0x54000000 | ((words & 0x7FFFF) << 5) | cond);
 }
-pub fn a64_cbnz_words(e: &mut NatEnc, t: i64, words: i64) {
+pub fn a64_cbnz_words(e: & mut NatEnc, t: i64, words: i64) {
     NatEnc_word(e, 0xB5000000 | ((words & 0x7FFFF) << 5) | t);
 }
 
@@ -442,92 +573,163 @@ pub fn a64_cbnz_words(e: &mut NatEnc, t: i64, words: i64) {
 // floating point f0..f31.
 // ===========================================================================
 
-pub const RV_ZERO: i64 = 0;
-pub const RV_RA: i64 = 1;
-pub const RV_SP: i64 = 2;
-pub const RV_S0: i64 = 8;
-pub const RV_A0: i64 = 10;
-pub const RV_A7: i64 = 17;
-pub const RV_T0: i64 = 5;
-pub const RV_T6: i64 = 31;
-
-pub fn rv_r(e: &mut NatEnc, f7: i64, rs2: i64, rs1: i64, f3: i64, rd: i64, op: i64) {
+pub const RV_ZERO: i64 = 0; pub const RV_RA: i64 = 1; pub const RV_SP: i64 = 2; pub const RV_S0: i64 = 8; pub const RV_A0: i64 = 10; pub const RV_A7: i64 = 17; pub const RV_T0: i64 = 5; pub const RV_T6: i64 = 31;
+ pub fn rv_r(e: & mut NatEnc, f7: i64, rs2: i64, rs1: i64, f3: i64, rd: i64, op: i64) {
     NatEnc_word(e, (f7 << 25) | (rs2 << 20) | (rs1 << 15) | (f3 << 12) | (rd << 7) | op);
 }
 
-pub fn rv_i(e: &mut NatEnc, imm: i64, rs1: i64, f3: i64, rd: i64, op: i64) {
+pub fn rv_i(e: & mut NatEnc, imm: i64, rs1: i64, f3: i64, rd: i64, op: i64) {
     NatEnc_word(e, ((imm & 0xFFF) << 20) | (rs1 << 15) | (f3 << 12) | (rd << 7) | op);
 }
 
-pub fn rv_s(e: &mut NatEnc, imm: i64, rs2: i64, rs1: i64, f3: i64) {
+pub fn rv_s(e: & mut NatEnc, imm: i64, rs2: i64, rs1: i64, f3: i64) {
     NatEnc_word(e, (((imm >> 5) & 0x7F) << 25) | (rs2 << 20) | (rs1 << 15) | (f3 << 12) | ((imm & 0x1F) << 7) | 0x23);
 }
 
 /// A conditional branch by a fixed byte offset (no fixup): -4096..4094.
-pub fn rv_b_off(e: &mut NatEnc, f3: i64, rs1: i64, rs2: i64, off: i64) {
-    var w: i64 = (((off >> 12) & 1) << 31) | (((off >> 5) & 0x3F) << 25) | (rs2 << 20) | (rs1 << 15)
-        | (f3 << 12) | (((off >> 1) & 0xF) << 8) | (((off >> 11) & 1) << 7) | 0x63;
+pub fn rv_b_off(e: & mut NatEnc, f3: i64, rs1: i64, rs2: i64, off: i64) {
+    var w: i64 = (((off >> 12) & 1) << 31) | (((off >> 5) & 0x3F) << 25) | (rs2 << 20) | (rs1 << 15) | (f3 << 12) | (((off >> 1) & 0xF) << 8) | (((off >> 11) & 1) << 7) | 0x63;
     NatEnc_word(e, w);
 }
 
-pub const RV_BEQ: i64 = 0;
-pub const RV_BNE: i64 = 1;
-pub const RV_BLT: i64 = 4;
-pub const RV_BGE: i64 = 5;
-pub const RV_BLTU: i64 = 6;
-pub const RV_BGEU: i64 = 7;
+pub const RV_BEQ: i64 = 0; pub const RV_BNE: i64 = 1; pub const RV_BLT: i64 = 4; pub const RV_BGE: i64 = 5; pub const RV_BLTU: i64 = 6; pub const RV_BGEU: i64 = 7;
+ pub fn rv_add(e: & mut NatEnc, d: i64, a: i64, b: i64) {
+    rv_r(e, 0, b, a, 0, d, 0x33);
+}
+pub fn rv_sub(e: & mut NatEnc, d: i64, a: i64, b: i64) {
+    rv_r(e, 0x20, b, a, 0, d, 0x33);
+}
+pub fn rv_sll(e: & mut NatEnc, d: i64, a: i64, b: i64) {
+    rv_r(e, 0, b, a, 1, d, 0x33);
+}
+pub fn rv_slt(e: & mut NatEnc, d: i64, a: i64, b: i64) {
+    rv_r(e, 0, b, a, 2, d, 0x33);
+}
+pub fn rv_sltu(e: & mut NatEnc, d: i64, a: i64, b: i64) {
+    rv_r(e, 0, b, a, 3, d, 0x33);
+}
+pub fn rv_xor(e: & mut NatEnc, d: i64, a: i64, b: i64) {
+    rv_r(e, 0, b, a, 4, d, 0x33);
+}
+pub fn rv_srl(e: & mut NatEnc, d: i64, a: i64, b: i64) {
+    rv_r(e, 0, b, a, 5, d, 0x33);
+}
+pub fn rv_sra(e: & mut NatEnc, d: i64, a: i64, b: i64) {
+    rv_r(e, 0x20, b, a, 5, d, 0x33);
+}
+pub fn rv_or(e: & mut NatEnc, d: i64, a: i64, b: i64) {
+    rv_r(e, 0, b, a, 6, d, 0x33);
+}
+pub fn rv_and(e: & mut NatEnc, d: i64, a: i64, b: i64) {
+    rv_r(e, 0, b, a, 7, d, 0x33);
+}
+pub fn rv_mul(e: & mut NatEnc, d: i64, a: i64, b: i64) {
+    rv_r(e, 1, b, a, 0, d, 0x33);
+}
+pub fn rv_mulh(e: & mut NatEnc, d: i64, a: i64, b: i64) {
+    rv_r(e, 1, b, a, 1, d, 0x33);
+}
+pub fn rv_mulhu(e: & mut NatEnc, d: i64, a: i64, b: i64) {
+    rv_r(e, 1, b, a, 3, d, 0x33);
+}
+pub fn rv_div(e: & mut NatEnc, d: i64, a: i64, b: i64) {
+    rv_r(e, 1, b, a, 4, d, 0x33);
+}
+pub fn rv_divu(e: & mut NatEnc, d: i64, a: i64, b: i64) {
+    rv_r(e, 1, b, a, 5, d, 0x33);
+}
+pub fn rv_rem(e: & mut NatEnc, d: i64, a: i64, b: i64) {
+    rv_r(e, 1, b, a, 6, d, 0x33);
+}
+pub fn rv_remu(e: & mut NatEnc, d: i64, a: i64, b: i64) {
+    rv_r(e, 1, b, a, 7, d, 0x33);
+}
 
-pub fn rv_add(e: &mut NatEnc, d: i64, a: i64, b: i64) { rv_r(e, 0, b, a, 0, d, 0x33); }
-pub fn rv_sub(e: &mut NatEnc, d: i64, a: i64, b: i64) { rv_r(e, 0x20, b, a, 0, d, 0x33); }
-pub fn rv_sll(e: &mut NatEnc, d: i64, a: i64, b: i64) { rv_r(e, 0, b, a, 1, d, 0x33); }
-pub fn rv_slt(e: &mut NatEnc, d: i64, a: i64, b: i64) { rv_r(e, 0, b, a, 2, d, 0x33); }
-pub fn rv_sltu(e: &mut NatEnc, d: i64, a: i64, b: i64) { rv_r(e, 0, b, a, 3, d, 0x33); }
-pub fn rv_xor(e: &mut NatEnc, d: i64, a: i64, b: i64) { rv_r(e, 0, b, a, 4, d, 0x33); }
-pub fn rv_srl(e: &mut NatEnc, d: i64, a: i64, b: i64) { rv_r(e, 0, b, a, 5, d, 0x33); }
-pub fn rv_sra(e: &mut NatEnc, d: i64, a: i64, b: i64) { rv_r(e, 0x20, b, a, 5, d, 0x33); }
-pub fn rv_or(e: &mut NatEnc, d: i64, a: i64, b: i64) { rv_r(e, 0, b, a, 6, d, 0x33); }
-pub fn rv_and(e: &mut NatEnc, d: i64, a: i64, b: i64) { rv_r(e, 0, b, a, 7, d, 0x33); }
-pub fn rv_mul(e: &mut NatEnc, d: i64, a: i64, b: i64) { rv_r(e, 1, b, a, 0, d, 0x33); }
-pub fn rv_mulh(e: &mut NatEnc, d: i64, a: i64, b: i64) { rv_r(e, 1, b, a, 1, d, 0x33); }
-pub fn rv_mulhu(e: &mut NatEnc, d: i64, a: i64, b: i64) { rv_r(e, 1, b, a, 3, d, 0x33); }
-pub fn rv_div(e: &mut NatEnc, d: i64, a: i64, b: i64) { rv_r(e, 1, b, a, 4, d, 0x33); }
-pub fn rv_divu(e: &mut NatEnc, d: i64, a: i64, b: i64) { rv_r(e, 1, b, a, 5, d, 0x33); }
-pub fn rv_rem(e: &mut NatEnc, d: i64, a: i64, b: i64) { rv_r(e, 1, b, a, 6, d, 0x33); }
-pub fn rv_remu(e: &mut NatEnc, d: i64, a: i64, b: i64) { rv_r(e, 1, b, a, 7, d, 0x33); }
-
-pub fn rv_addi(e: &mut NatEnc, d: i64, a: i64, imm: i64) { rv_i(e, imm, a, 0, d, 0x13); }
-pub fn rv_xori(e: &mut NatEnc, d: i64, a: i64, imm: i64) { rv_i(e, imm, a, 4, d, 0x13); }
-pub fn rv_andi(e: &mut NatEnc, d: i64, a: i64, imm: i64) { rv_i(e, imm, a, 7, d, 0x13); }
-pub fn rv_sltiu(e: &mut NatEnc, d: i64, a: i64, imm: i64) { rv_i(e, imm, a, 3, d, 0x13); }
-pub fn rv_slli(e: &mut NatEnc, d: i64, a: i64, sh: i64) { rv_i(e, sh & 63, a, 1, d, 0x13); }
-pub fn rv_srli(e: &mut NatEnc, d: i64, a: i64, sh: i64) { rv_i(e, sh & 63, a, 5, d, 0x13); }
-pub fn rv_srai(e: &mut NatEnc, d: i64, a: i64, sh: i64) { rv_i(e, 0x400 | (sh & 63), a, 5, d, 0x13); }
-pub fn rv_addiw(e: &mut NatEnc, d: i64, a: i64, imm: i64) { rv_i(e, imm, a, 0, d, 0x1B); }
-pub fn rv_mv(e: &mut NatEnc, d: i64, a: i64) {
-    if d == a { return; }
+pub fn rv_addi(e: & mut NatEnc, d: i64, a: i64, imm: i64) {
+    rv_i(e, imm, a, 0, d, 0x13);
+}
+pub fn rv_xori(e: & mut NatEnc, d: i64, a: i64, imm: i64) {
+    rv_i(e, imm, a, 4, d, 0x13);
+}
+pub fn rv_andi(e: & mut NatEnc, d: i64, a: i64, imm: i64) {
+    rv_i(e, imm, a, 7, d, 0x13);
+}
+pub fn rv_sltiu(e: & mut NatEnc, d: i64, a: i64, imm: i64) {
+    rv_i(e, imm, a, 3, d, 0x13);
+}
+pub fn rv_slli(e: & mut NatEnc, d: i64, a: i64, sh: i64) {
+    rv_i(e, sh & 63, a, 1, d, 0x13);
+}
+pub fn rv_srli(e: & mut NatEnc, d: i64, a: i64, sh: i64) {
+    rv_i(e, sh & 63, a, 5, d, 0x13);
+}
+pub fn rv_srai(e: & mut NatEnc, d: i64, a: i64, sh: i64) {
+    rv_i(e, 0x400 | (sh & 63), a, 5, d, 0x13);
+}
+pub fn rv_addiw(e: & mut NatEnc, d: i64, a: i64, imm: i64) {
+    rv_i(e, imm, a, 0, d, 0x1B);
+}
+pub fn rv_mv(e: & mut NatEnc, d: i64, a: i64) {
+    if d == a {
+        return;
+    }
     rv_addi(e, d, a, 0);
 }
 
-pub fn rv_lui(e: &mut NatEnc, d: i64, imm20: i64) { NatEnc_word(e, ((imm20 & 0xFFFFF) << 12) | (d << 7) | 0x37); }
-pub fn rv_jalr(e: &mut NatEnc, d: i64, a: i64, imm: i64) { rv_i(e, imm, a, 0, d, 0x67); }
-pub fn rv_ret(e: &mut NatEnc) { rv_jalr(e, RV_ZERO, RV_RA, 0); }
-pub fn rv_ecall(e: &mut NatEnc) { NatEnc_word(e, 0x00000073); }
-pub fn rv_ebreak(e: &mut NatEnc) { NatEnc_word(e, 0x00100073); }
+pub fn rv_lui(e: & mut NatEnc, d: i64, imm20: i64) {
+    NatEnc_word(e, ((imm20 & 0xFFFFF) << 12) | (d << 7) | 0x37);
+}
+pub fn rv_jalr(e: & mut NatEnc, d: i64, a: i64, imm: i64) {
+    rv_i(e, imm, a, 0, d, 0x67);
+}
+pub fn rv_ret(e: & mut NatEnc) {
+    rv_jalr(e, RV_ZERO, RV_RA, 0);
+}
+pub fn rv_ecall(e: & mut NatEnc) {
+    NatEnc_word(e, 0x00000073);
+}
+pub fn rv_ebreak(e: & mut NatEnc) {
+    NatEnc_word(e, 0x00100073);
+}
 
 // Loads (funct3: lb 0, lh 1, lw 2, ld 3, lbu 4, lhu 5, lwu 6) and stores
-pub fn rv_load(e: &mut NatEnc, d: i64, a: i64, imm: i64, size: i64, signed: bool) {
+pub fn rv_load(e: & mut NatEnc, d: i64, a: i64, imm: i64, size: i64, signed: bool) {
     var f3: i64 = 3;
-    if size == 1 { if signed { f3 = 0; } else { f3 = 4; } }
-    if size == 2 { if signed { f3 = 1; } else { f3 = 5; } }
-    if size == 4 { if signed { f3 = 2; } else { f3 = 6; } }
+    if size == 1 {
+        if signed {
+            f3 = 0;
+        } else {
+            f3 = 4;
+        }
+    }
+    if size == 2 {
+        if signed {
+            f3 = 1;
+        } else {
+            f3 = 5;
+        }
+    }
+    if size == 4 {
+        if signed {
+            f3 = 2;
+        } else {
+            f3 = 6;
+        }
+    }
     rv_i(e, imm, a, f3, d, 0x03);
 }
 
-pub fn rv_store(e: &mut NatEnc, v: i64, a: i64, imm: i64, size: i64) {
+pub fn rv_store(e: & mut NatEnc, v: i64, a: i64, imm: i64, size: i64) {
     var f3: i64 = 3;
-    if size == 1 { f3 = 0; }
-    if size == 2 { f3 = 1; }
-    if size == 4 { f3 = 2; }
+    if size == 1 {
+        f3 = 0;
+    }
+    if size == 2 {
+        f3 = 1;
+    }
+    if size == 4 {
+        f3 = 2;
+    }
     rv_s(e, imm, v, a, f3);
 }
 
@@ -536,92 +738,138 @@ pub fn rv_fits12(v: i64) -> bool {
 }
 
 /// Any 64-bit constant (LUI/ADDI(W)/SLLI sequences).
-@wrapping pub fn rv_li(e: &mut NatEnc, d: i64, v: i64) {
+@wrapping pub fn rv_li(e: & mut NatEnc, d: i64, v: i64) {
     if rv_fits12(v) {
         rv_addi(e, d, RV_ZERO, v);
         return;
     }
     if v >= 0 - 2147483648 && v <= 2147483647 {
-        var lo: i64 = ((v & 0xFFF) ^ 0x800) - 0x800;  // sign-extended low 12 bits
+        var lo: i64 = ((v & 0xFFF) ^ 0x800) - 0x800;
+        // sign-extended low 12 bits
         var hi: i64 = (v - lo) >> 12;
         rv_lui(e, d, hi);
-        if lo != 0 { rv_addiw(e, d, d, lo); }
-        else { rv_addiw(e, d, d, 0); }
+        if lo != 0 {
+            rv_addiw(e, d, d, lo);
+        } else {
+            rv_addiw(e, d, d, 0);
+        }
         return;
     }
     var lo12: i64 = ((v & 0xFFF) ^ 0x800) - 0x800;
     var rest: i64 = (v - lo12) >> 12;
     rv_li(e, d, rest);
     rv_slli(e, d, d, 12);
-    if lo12 != 0 { rv_addi(e, d, d, lo12); }
+    if lo12 != 0 {
+        rv_addi(e, d, d, lo12);
+    }
 }
 
 /// JAL d, label (+-1 MB)
-pub fn rv_jal(e: &mut NatEnc, d: i64, label: i64) {
+pub fn rv_jal(e: & mut NatEnc, d: i64, label: i64) {
     NatEnc_fix(e, label, NATFIX_RV_JAL);
     NatEnc_word(e, (d << 7) | 0x6F);
 }
 
 /// d = the address of `label` (AUIPC + ADDI).
-pub fn rv_addr(e: &mut NatEnc, d: i64, label: i64) {
+pub fn rv_addr(e: & mut NatEnc, d: i64, label: i64) {
     NatEnc_fix(e, label, NATFIX_RV_AUIPC_I);
     NatEnc_word(e, (d << 7) | 0x17);
     rv_addi(e, d, d, 0);
 }
 
 /// A call anywhere in the image: AUIPC ra + JALR ra.
-pub fn rv_call(e: &mut NatEnc, label: i64) {
+pub fn rv_call(e: & mut NatEnc, label: i64) {
     NatEnc_fix(e, label, NATFIX_RV_AUIPC_I);
     NatEnc_word(e, (RV_RA << 7) | 0x17);
     rv_jalr(e, RV_RA, RV_RA, 0);
 }
 
 /// A jump anywhere in the image through t6: AUIPC t6 + JALR zero.
-pub fn rv_far_jump(e: &mut NatEnc, label: i64) {
+pub fn rv_far_jump(e: & mut NatEnc, label: i64) {
     NatEnc_fix(e, label, NATFIX_RV_AUIPC_I);
     NatEnc_word(e, (RV_T6 << 7) | 0x17);
     rv_jalr(e, RV_ZERO, RV_T6, 0);
 }
 
 // Floating point (D, with F for f32 moves and conversions)
-pub fn rv_fmv_dx(e: &mut NatEnc, fd: i64, rs: i64) { NatEnc_word(e, 0xF2000053 | (rs << 15) | (fd << 7)); }
-pub fn rv_fmv_xd(e: &mut NatEnc, rd: i64, fs: i64) { NatEnc_word(e, 0xE2000053 | (fs << 15) | (rd << 7)); }
-pub fn rv_fmv_wx(e: &mut NatEnc, fd: i64, rs: i64) { NatEnc_word(e, 0xF0000053 | (rs << 15) | (fd << 7)); }
-pub fn rv_fmv_xw(e: &mut NatEnc, rd: i64, fs: i64) { NatEnc_word(e, 0xE0000053 | (fs << 15) | (rd << 7)); }
+pub fn rv_fmv_dx(e: & mut NatEnc, fd: i64, rs: i64) {
+    NatEnc_word(e, 0xF2000053 | (rs << 15) | (fd << 7));
+}
+pub fn rv_fmv_xd(e: & mut NatEnc, rd: i64, fs: i64) {
+    NatEnc_word(e, 0xE2000053 | (fs << 15) | (rd << 7));
+}
+pub fn rv_fmv_wx(e: & mut NatEnc, fd: i64, rs: i64) {
+    NatEnc_word(e, 0xF0000053 | (rs << 15) | (fd << 7));
+}
+pub fn rv_fmv_xw(e: & mut NatEnc, rd: i64, fs: i64) {
+    NatEnc_word(e, 0xE0000053 | (fs << 15) | (rd << 7));
+}
 // rm = 7: the dynamic rounding mode (round to nearest even at start)
-pub fn rv_fop_d(e: &mut NatEnc, base: i64, fd: i64, a: i64, b: i64) {
+pub fn rv_fop_d(e: & mut NatEnc, base: i64, fd: i64, a: i64, b: i64) {
     NatEnc_word(e, base | (b << 20) | (a << 15) | (7 << 12) | (fd << 7));
 }
-pub fn rv_fadd_d(e: &mut NatEnc, fd: i64, a: i64, b: i64) { rv_fop_d(e, 0x02000053, fd, a, b); }
-pub fn rv_fsub_d(e: &mut NatEnc, fd: i64, a: i64, b: i64) { rv_fop_d(e, 0x0A000053, fd, a, b); }
-pub fn rv_fmul_d(e: &mut NatEnc, fd: i64, a: i64, b: i64) { rv_fop_d(e, 0x12000053, fd, a, b); }
-pub fn rv_fdiv_d(e: &mut NatEnc, fd: i64, a: i64, b: i64) { rv_fop_d(e, 0x1A000053, fd, a, b); }
-pub fn rv_feq_d(e: &mut NatEnc, rd: i64, a: i64, b: i64) { NatEnc_word(e, 0xA2002053 | (b << 20) | (a << 15) | (rd << 7)); }
-pub fn rv_flt_d(e: &mut NatEnc, rd: i64, a: i64, b: i64) { NatEnc_word(e, 0xA2001053 | (b << 20) | (a << 15) | (rd << 7)); }
-pub fn rv_fle_d(e: &mut NatEnc, rd: i64, a: i64, b: i64) { NatEnc_word(e, 0xA2000053 | (b << 20) | (a << 15) | (rd << 7)); }
-pub fn rv_fcvt_dl(e: &mut NatEnc, fd: i64, rs: i64) { NatEnc_word(e, 0xD2200053 | (rs << 15) | (7 << 12) | (fd << 7)); }
+pub fn rv_fadd_d(e: & mut NatEnc, fd: i64, a: i64, b: i64) {
+    rv_fop_d(e, 0x02000053, fd, a, b);
+}
+pub fn rv_fsub_d(e: & mut NatEnc, fd: i64, a: i64, b: i64) {
+    rv_fop_d(e, 0x0A000053, fd, a, b);
+}
+pub fn rv_fmul_d(e: & mut NatEnc, fd: i64, a: i64, b: i64) {
+    rv_fop_d(e, 0x12000053, fd, a, b);
+}
+pub fn rv_fdiv_d(e: & mut NatEnc, fd: i64, a: i64, b: i64) {
+    rv_fop_d(e, 0x1A000053, fd, a, b);
+}
+pub fn rv_feq_d(e: & mut NatEnc, rd: i64, a: i64, b: i64) {
+    NatEnc_word(e, 0xA2002053 | (b << 20) | (a << 15) | (rd << 7));
+}
+pub fn rv_flt_d(e: & mut NatEnc, rd: i64, a: i64, b: i64) {
+    NatEnc_word(e, 0xA2001053 | (b << 20) | (a << 15) | (rd << 7));
+}
+pub fn rv_fle_d(e: & mut NatEnc, rd: i64, a: i64, b: i64) {
+    NatEnc_word(e, 0xA2000053 | (b << 20) | (a << 15) | (rd << 7));
+}
+pub fn rv_fcvt_dl(e: & mut NatEnc, fd: i64, rs: i64) {
+    NatEnc_word(e, 0xD2200053 | (rs << 15) | (7 << 12) | (fd << 7));
+}
 // fcvt.l.d with rtz (round toward zero), as a C cast
-pub fn rv_fcvt_ld(e: &mut NatEnc, rd: i64, fs: i64) { NatEnc_word(e, 0xC2200053 | (fs << 15) | (1 << 12) | (rd << 7)); }
-pub fn rv_fcvt_ds(e: &mut NatEnc, fd: i64, fs: i64) { NatEnc_word(e, 0x42000053 | (fs << 15) | (fd << 7)); }
+pub fn rv_fcvt_ld(e: & mut NatEnc, rd: i64, fs: i64) {
+    NatEnc_word(e, 0xC2200053 | (fs << 15) | (1 << 12) | (rd << 7));
+}
+pub fn rv_fcvt_ds(e: & mut NatEnc, fd: i64, fs: i64) {
+    NatEnc_word(e, 0x42000053 | (fs << 15) | (fd << 7));
+}
 /// fcvt.l.d with an explicit rounding mode (1 rtz, 2 rdn, 3 rup, 4 rmm)
-pub fn rv_fcvt_ld_rm(e: &mut NatEnc, rd: i64, fs: i64, rm: i64) { NatEnc_word(e, 0xC2200053 | (fs << 15) | (rm << 12) | (rd << 7)); }
-pub fn rv_fsqrt_d(e: &mut NatEnc, fd: i64, fs: i64) { NatEnc_word(e, 0x5A000053 | (fs << 15) | (7 << 12) | (fd << 7)); }
-pub fn rv_fsgnj_d(e: &mut NatEnc, fd: i64, a: i64, b: i64) { NatEnc_word(e, 0x22000053 | (b << 20) | (a << 15) | (fd << 7)); }
-pub fn rv_fsgnjx_d(e: &mut NatEnc, fd: i64, a: i64, b: i64) { NatEnc_word(e, 0x22002053 | (b << 20) | (a << 15) | (fd << 7)); }
+pub fn rv_fcvt_ld_rm(e: & mut NatEnc, rd: i64, fs: i64, rm: i64) {
+    NatEnc_word(e, 0xC2200053 | (fs << 15) | (rm << 12) | (rd << 7));
+}
+pub fn rv_fsqrt_d(e: & mut NatEnc, fd: i64, fs: i64) {
+    NatEnc_word(e, 0x5A000053 | (fs << 15) | (7 << 12) | (fd << 7));
+}
+pub fn rv_fsgnj_d(e: & mut NatEnc, fd: i64, a: i64, b: i64) {
+    NatEnc_word(e, 0x22000053 | (b << 20) | (a << 15) | (fd << 7));
+}
+pub fn rv_fsgnjx_d(e: & mut NatEnc, fd: i64, a: i64, b: i64) {
+    NatEnc_word(e, 0x22002053 | (b << 20) | (a << 15) | (fd << 7));
+}
 
 // Atomics (A extension), acquire + release
-pub fn rv_amoadd_d(e: &mut NatEnc, rd: i64, rs2: i64, rs1: i64) {
+pub fn rv_amoadd_d(e: & mut NatEnc, rd: i64, rs2: i64, rs1: i64) {
     NatEnc_word(e, (0 << 27) | (1 << 26) | (1 << 25) | (rs2 << 20) | (rs1 << 15) | (3 << 12) | (rd << 7) | 0x2F);
 }
-pub fn rv_lr_d(e: &mut NatEnc, rd: i64, rs1: i64) {
+pub fn rv_lr_d(e: & mut NatEnc, rd: i64, rs1: i64) {
     NatEnc_word(e, (2 << 27) | (1 << 26) | (1 << 25) | (rs1 << 15) | (3 << 12) | (rd << 7) | 0x2F);
 }
 /// sc.d rd, rs2, (rs1): rd = 0 on success
-pub fn rv_sc_d(e: &mut NatEnc, rd: i64, rs2: i64, rs1: i64) {
+pub fn rv_sc_d(e: & mut NatEnc, rd: i64, rs2: i64, rs1: i64) {
     NatEnc_word(e, (3 << 27) | (1 << 26) | (1 << 25) | (rs2 << 20) | (rs1 << 15) | (3 << 12) | (rd << 7) | 0x2F);
 }
-pub fn rv_fence(e: &mut NatEnc) { NatEnc_word(e, 0x0330000F); }
-pub fn rv_fcvt_sd(e: &mut NatEnc, fd: i64, fs: i64) { NatEnc_word(e, 0x40100053 | (fs << 15) | (7 << 12) | (fd << 7)); }
+pub fn rv_fence(e: & mut NatEnc) {
+    NatEnc_word(e, 0x0330000F);
+}
+pub fn rv_fcvt_sd(e: & mut NatEnc, fd: i64, fs: i64) {
+    NatEnc_word(e, 0x40100053 | (fs << 15) | (7 << 12) | (fd << 7));
+}
 
 // ===========================================================================
 // ELF: one PT_LOAD segment, the whole file at 0x400000, read/write/execute;
@@ -659,39 +907,73 @@ fn nat_push_u64(out: Vec<i64>, v: i64) -> Vec<i64> {
 pub fn nat_elf(arch: i64, image: Vec<i64>, entry: i64) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     var total: i64 = 0x1000 + image.len();
-    out.push(0x7F); out.push(0x45); out.push(0x4C); out.push(0x46);
-    out.push(2); out.push(1); out.push(1); out.push(0);   // ELF64, LE, v1, SysV
-    out = nat_push_u64(out, 0);                            // padding
-    out = nat_push_u16(out, 2);                            // ET_EXEC
+    out.push(0x7F);
+    out.push(0x45);
+    out.push(0x4C);
+    out.push(0x46);
+    out.push(2);
+    out.push(1);
+    out.push(1);
+    out.push(0);
+    // ELF64, LE, v1, SysV
+    out = nat_push_u64(out, 0);
+    // padding
+    out = nat_push_u16(out, 2);
+    // ET_EXEC
     var flags: i64 = 0;
     if arch == NAT_A64 {
-        out = nat_push_u16(out, 183);                      // EM_AARCH64
+        out = nat_push_u16(out, 183);
+        // EM_AARCH64
     } else if arch == NAT_X64 {
-        out = nat_push_u16(out, 62);                       // EM_X86_64
+        out = nat_push_u16(out, 62);
+        // EM_X86_64
     } else {
-        out = nat_push_u16(out, 243);                      // EM_RISCV
-        flags = 4;                                         // double-float ABI
+        out = nat_push_u16(out, 243);
+        // EM_RISCV
+        flags = 4;
+        // double-float ABI
     }
-    out = nat_push_u32(out, 1);                            // e_version
-    out = nat_push_u64(out, NAT_IMAGE_BASE + entry);       // e_entry
-    out = nat_push_u64(out, 64);                           // e_phoff
-    out = nat_push_u64(out, 0);                            // e_shoff
-    out = nat_push_u32(out, flags);                        // e_flags
-    out = nat_push_u16(out, 64);                           // e_ehsize
-    out = nat_push_u16(out, 56);                           // e_phentsize
-    out = nat_push_u16(out, 1);                            // e_phnum
-    out = nat_push_u16(out, 64);                           // e_shentsize
-    out = nat_push_u16(out, 0);                            // e_shnum
-    out = nat_push_u16(out, 0);                            // e_shstrndx
-    out = nat_push_u32(out, 1);                            // PT_LOAD
-    out = nat_push_u32(out, 7);                            // RWX
-    out = nat_push_u64(out, 0);                            // p_offset
-    out = nat_push_u64(out, 0x400000);                     // p_vaddr
-    out = nat_push_u64(out, 0x400000);                     // p_paddr
-    out = nat_push_u64(out, total);                        // p_filesz
-    out = nat_push_u64(out, total);                        // p_memsz
-    out = nat_push_u64(out, 0x10000);                      // p_align (64 KB pages too)
-    while out.len() < 0x1000 { out.push(0); }
+    out = nat_push_u32(out, 1);
+    // e_version
+    out = nat_push_u64(out, NAT_IMAGE_BASE + entry);
+    // e_entry
+    out = nat_push_u64(out, 64);
+    // e_phoff
+    out = nat_push_u64(out, 0);
+    // e_shoff
+    out = nat_push_u32(out, flags);
+    // e_flags
+    out = nat_push_u16(out, 64);
+    // e_ehsize
+    out = nat_push_u16(out, 56);
+    // e_phentsize
+    out = nat_push_u16(out, 1);
+    // e_phnum
+    out = nat_push_u16(out, 64);
+    // e_shentsize
+    out = nat_push_u16(out, 0);
+    // e_shnum
+    out = nat_push_u16(out, 0);
+    // e_shstrndx
+    out = nat_push_u32(out, 1);
+    // PT_LOAD
+    out = nat_push_u32(out, 7);
+    // RWX
+    out = nat_push_u64(out, 0);
+    // p_offset
+    out = nat_push_u64(out, 0x400000);
+    // p_vaddr
+    out = nat_push_u64(out, 0x400000);
+    // p_paddr
+    out = nat_push_u64(out, total);
+    // p_filesz
+    out = nat_push_u64(out, total);
+    // p_memsz
+    out = nat_push_u64(out, 0x10000);
+    // p_align (64 KB pages too)
+    while out.len() < 0x1000 {
+        out.push(0);
+    }
     var i: i64 = 0;
     while i < image.len() {
         out.push(image.get(i));
@@ -710,10 +992,14 @@ pub fn nat_elf(arch: i64, image: Vec<i64>, entry: i64) -> Vec<i64> {
 // the import address table are inside the image (ng_win_imports).
 // ---------------------------------------------------------------------------
 
-fn nat_pe_section(out: &mut Vec<i64>, name: Vec<i64>, vsize: i64, rva: i64, raw_size: i64, raw_off: i64, flags: i64) {
+fn nat_pe_section(out: & mut Vec<i64>, name: Vec<i64>, vsize: i64, rva: i64, raw_size: i64, raw_off: i64, flags: i64) {
     var i: i64 = 0;
     while i < 8 {
-        if i < name.len() { out.push(name.get(i)); } else { out.push(0); }
+        if i < name.len() {
+            out.push(name.get(i));
+        } else {
+            out.push(0);
+        }
         i = i + 1;
     }
     nat_put_u32(out, vsize);
@@ -730,66 +1016,125 @@ fn nat_pe_section(out: &mut Vec<i64>, name: Vec<i64>, vsize: i64, rva: i64, raw_
 pub fn nat_pe(image: Vec<i64>, entry: i64, data_off: i64, imp_off: i64, imp_size: i64, iat_off: i64, iat_size: i64) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     // DOS header: "MZ", e_lfanew = 0x40
-    out.push(0x4D); out.push(0x5A);
-    while out.len() < 0x3C { out.push(0); }
-    nat_put_u32(&mut out, 0x40);
-    out.push(0x50); out.push(0x45); out.push(0); out.push(0);      // "PE" and two zero bytes
-    nat_put_u16(&mut out, 0x8664);                                // AMD64
-    nat_put_u16(&mut out, 2);                                     // sections
-    nat_put_u32(&mut out, 0);                                     // time stamp
-    nat_put_u32(&mut out, 0);
-    nat_put_u32(&mut out, 0);
-    nat_put_u16(&mut out, 240);                                   // optional header size
-    nat_put_u16(&mut out, 0x0023);                                // RELOCS_STRIPPED | EXECUTABLE | LARGE_ADDRESS_AWARE
+    out.push(0x4D);
+    out.push(0x5A);
+    while out.len() < 0x3C {
+        out.push(0);
+    }
+    nat_put_u32(& mut out, 0x40);
+    out.push(0x50);
+    out.push(0x45);
+    out.push(0);
+    out.push(0);
+    // "PE" and two zero bytes
+    nat_put_u16(& mut out, 0x8664);
+    // AMD64
+    nat_put_u16(& mut out, 2);
+    // sections
+    nat_put_u32(& mut out, 0);
+    // time stamp
+    nat_put_u32(& mut out, 0);
+    nat_put_u32(& mut out, 0);
+    nat_put_u16(& mut out, 240);
+    // optional header size
+    nat_put_u16(& mut out, 0x0023);
+    // RELOCS_STRIPPED | EXECUTABLE | LARGE_ADDRESS_AWARE
     var vsize: i64 = (image.len() + 0xFFF) & (0 - 0x1000);
     var fsize: i64 = (image.len() + 0x1FF) & (0 - 0x200);
     var dsize: i64 = image.len() - data_off;
-    nat_put_u16(&mut out, 0x20B);                                 // PE32+
-    out.push(0); out.push(0);                                     // linker version
-    nat_put_u32(&mut out, data_off);                              // SizeOfCode
-    nat_put_u32(&mut out, (dsize + 0x1FF) & (0 - 0x200));         // SizeOfInitializedData
-    nat_put_u32(&mut out, 0);
-    nat_put_u32(&mut out, 0x1000 + entry);                        // AddressOfEntryPoint
-    nat_put_u32(&mut out, 0x1000);                                // BaseOfCode
-    nat_put_u64(&mut out, 0x400000);                              // ImageBase
-    nat_put_u32(&mut out, 0x1000);                                // SectionAlignment
-    nat_put_u32(&mut out, 0x200);                                 // FileAlignment
-    nat_put_u16(&mut out, 6); nat_put_u16(&mut out, 0);           // OS version
-    nat_put_u16(&mut out, 0); nat_put_u16(&mut out, 0);           // image version
-    nat_put_u16(&mut out, 6); nat_put_u16(&mut out, 0);           // subsystem version
-    nat_put_u32(&mut out, 0);
-    nat_put_u32(&mut out, 0x1000 + vsize);                        // SizeOfImage
-    nat_put_u32(&mut out, 0x200);                                 // SizeOfHeaders
-    nat_put_u32(&mut out, 0);                                     // CheckSum
-    nat_put_u16(&mut out, 3);                                     // console
-    nat_put_u16(&mut out, 0x8100);                                // NX_COMPAT | TERMINAL_SERVER_AWARE
-    nat_put_u64(&mut out, 0x800000);                              // stack reserve: 8 MB, as Linux
-    nat_put_u64(&mut out, 0x10000);                               // stack commit
-    nat_put_u64(&mut out, 0x100000);                              // heap reserve
-    nat_put_u64(&mut out, 0x1000);                                // heap commit
-    nat_put_u32(&mut out, 0);                                     // loader flags
-    nat_put_u32(&mut out, 16);                                    // data directories
+    nat_put_u16(& mut out, 0x20B);
+    // PE32+
+    out.push(0);
+    out.push(0);
+    // linker version
+    nat_put_u32(& mut out, data_off);
+    // SizeOfCode
+    nat_put_u32(& mut out, (dsize + 0x1FF) & (0 - 0x200));
+    // SizeOfInitializedData
+    nat_put_u32(& mut out, 0);
+    nat_put_u32(& mut out, 0x1000 + entry);
+    // AddressOfEntryPoint
+    nat_put_u32(& mut out, 0x1000);
+    // BaseOfCode
+    nat_put_u64(& mut out, 0x400000);
+    // ImageBase
+    nat_put_u32(& mut out, 0x1000);
+    // SectionAlignment
+    nat_put_u32(& mut out, 0x200);
+    // FileAlignment
+    nat_put_u16(& mut out, 6);
+    nat_put_u16(& mut out, 0);
+    // OS version
+    nat_put_u16(& mut out, 0);
+    nat_put_u16(& mut out, 0);
+    // image version
+    nat_put_u16(& mut out, 6);
+    nat_put_u16(& mut out, 0);
+    // subsystem version
+    nat_put_u32(& mut out, 0);
+    nat_put_u32(& mut out, 0x1000 + vsize);
+    // SizeOfImage
+    nat_put_u32(& mut out, 0x200);
+    // SizeOfHeaders
+    nat_put_u32(& mut out, 0);
+    // CheckSum
+    nat_put_u16(& mut out, 3);
+    // console
+    nat_put_u16(& mut out, 0x8100);
+    // NX_COMPAT | TERMINAL_SERVER_AWARE
+    nat_put_u64(& mut out, 0x800000);
+    // stack reserve: 8 MB, as Linux
+    nat_put_u64(& mut out, 0x10000);
+    // stack commit
+    nat_put_u64(& mut out, 0x100000);
+    // heap reserve
+    nat_put_u64(& mut out, 0x1000);
+    // heap commit
+    nat_put_u32(& mut out, 0);
+    // loader flags
+    nat_put_u32(& mut out, 16);
+    // data directories
     var d: i64 = 0;
     while d < 16 {
-        if d == 1 { nat_put_u32(&mut out, 0x1000 + imp_off); nat_put_u32(&mut out, imp_size); }
-        else if d == 12 { nat_put_u32(&mut out, 0x1000 + iat_off); nat_put_u32(&mut out, iat_size); }
-        else { nat_put_u32(&mut out, 0); nat_put_u32(&mut out, 0); }
+        if d == 1 {
+            nat_put_u32(& mut out, 0x1000 + imp_off);
+            nat_put_u32(& mut out, imp_size);
+        } else if d == 12 {
+            nat_put_u32(& mut out, 0x1000 + iat_off);
+            nat_put_u32(& mut out, iat_size);
+        } else {
+            nat_put_u32(& mut out, 0);
+            nat_put_u32(& mut out, 0);
+        }
         d = d + 1;
     }
     // The sections (data_off is page-aligned, so file and memory agree)
     var tname: Vec<i64> = Vec::new();
-    tname.push(0x2E); tname.push(0x74); tname.push(0x65); tname.push(0x78); tname.push(0x74);
+    tname.push(0x2E);
+    tname.push(0x74);
+    tname.push(0x65);
+    tname.push(0x78);
+    tname.push(0x74);
     var dname: Vec<i64> = Vec::new();
-    dname.push(0x2E); dname.push(0x64); dname.push(0x61); dname.push(0x74); dname.push(0x61);
-    nat_pe_section(&mut out, tname, data_off, 0x1000, data_off, 0x200, 0x60000020);       // code, RX
-    nat_pe_section(&mut out, dname, dsize, 0x1000 + data_off, fsize - data_off, 0x200 + data_off, 0xC0000040);   // data, RW
-    while out.len() < 0x200 { out.push(0); }
+    dname.push(0x2E);
+    dname.push(0x64);
+    dname.push(0x61);
+    dname.push(0x74);
+    dname.push(0x61);
+    nat_pe_section(& mut out, tname, data_off, 0x1000, data_off, 0x200, 0x60000020);
+    // code, RX
+    nat_pe_section(& mut out, dname, dsize, 0x1000 + data_off, fsize - data_off, 0x200 + data_off, 0xC0000040);
+    // data, RW
+    while out.len() < 0x200 {
+        out.push(0);
+    }
     var i: i64 = 0;
     while i < image.len() {
         out.push(image.get(i));
         i = i + 1;
+    } while out.len() < 0x200 + fsize {
+        out.push(0);
     }
-    while out.len() < 0x200 + fsize { out.push(0); }
     return out;
 }
 
@@ -801,30 +1146,50 @@ pub fn nat_pe(image: Vec<i64>, entry: i64, data_off: i64, imp_off: i64, imp_size
 // Line tables wait for the lowering to record source lines.
 // ---------------------------------------------------------------------------
 
-fn nat_put_u16(out: &mut Vec<i64>, v: i64) { out.push(v & 255); out.push((v >> 8) & 255); }
-fn nat_put_u32(out: &mut Vec<i64>, v: i64) { nat_put_u16(out, v); nat_put_u16(out, v >> 16); }
-fn nat_put_u64(out: &mut Vec<i64>, v: i64) { nat_put_u32(out, v); nat_put_u32(out, v >> 32); }
-fn nat_put_str(out: &mut Vec<i64>, s: str) {
+fn nat_put_u16(out: & mut Vec<i64>, v: i64) {
+    out.push(v & 255);
+    out.push((v >> 8) & 255);
+}
+
+fn nat_put_u32(out: & mut Vec<i64>, v: i64) {
+    nat_put_u16(out, v);
+    nat_put_u16(out, v >> 16);
+}
+
+fn nat_put_u64(out: & mut Vec<i64>, v: i64) {
+    nat_put_u32(out, v);
+    nat_put_u32(out, v >> 32);
+}
+
+fn nat_put_str(out: & mut Vec<i64>, s: str) {
     var i: i64 = 0;
-    while i < str_len(s) { out.push(str_byte_at(s, i)); i = i + 1; }
+    while i < str_len(s) {
+        out.push(str_byte_at(s, i));
+        i = i + 1;
+    }
     out.push(0);
 }
-fn nat_set_u32(out: &mut Vec<i64>, at: i64, v: i64) {
+
+fn nat_set_u32(out: & mut Vec<i64>, at: i64, v: i64) {
     var i: i64 = 0;
-    while i < 4 { out.set(at + i, (v >> (i * 8)) & 255); i = i + 1; }
+    while i < 4 {
+        out.set(at + i, (v >> (i * 8)) & 255);
+        i = i + 1;
+    }
 }
-fn nat_set_u16(out: &mut Vec<i64>, at: i64, v: i64) {
+
+fn nat_set_u16(out: & mut Vec<i64>, at: i64, v: i64) {
     out.set(at, v & 255);
     out.set(at + 1, (v >> 8) & 255);
 }
-fn nat_set_u64(out: &mut Vec<i64>, at: i64, v: i64) {
+
+fn nat_set_u64(out: & mut Vec<i64>, at: i64, v: i64) {
     nat_set_u32(out, at, v);
     nat_set_u32(out, at + 4, v >> 32);
 }
 
 /// One section header (64 bytes).
-fn nat_shdr(out: &mut Vec<i64>, name: i64, typ: i64, flags: i64, addr: i64, off: i64, size: i64, link: i64,
-            info: i64, align: i64, entsize: i64) {
+fn nat_shdr(out: & mut Vec<i64>, name: i64, typ: i64, flags: i64, addr: i64, off: i64, size: i64, link: i64, info: i64, align: i64, entsize: i64) {
     nat_put_u32(out, name);
     nat_put_u32(out, typ);
     nat_put_u64(out, flags);
@@ -839,52 +1204,89 @@ fn nat_shdr(out: &mut Vec<i64>, name: i64, typ: i64, flags: i64, addr: i64, off:
 
 /// The CFI of one function: our prologue's frame record, then the frame
 /// pointer as the CFA for the rest of the body.
-fn nat_fde_body(arch: i64, out: &mut Vec<i64>) {
+fn nat_fde_body(arch: i64, out: & mut Vec<i64>) {
     if arch == NAT_X64 {
-        out.push(0x41);                          // advance 1: after push rbp
-        out.push(0x0E); out.push(16);            // def_cfa_offset 16
-        out.push(0x80 | 6); out.push(2);         // rbp at cfa - 16
-        out.push(0x43);                          // advance 3: after mov rbp, rsp
-        out.push(0x0D); out.push(6);             // def_cfa_register rbp
+        out.push(0x41);
+        // advance 1: after push rbp
+        out.push(0x0E);
+        out.push(16);
+        // def_cfa_offset 16
+        out.push(0x80 | 6);
+        out.push(2);
+        // rbp at cfa - 16
+        out.push(0x43);
+        // advance 3: after mov rbp, rsp
+        out.push(0x0D);
+        out.push(6);
+        // def_cfa_register rbp
         return;
     }
     if arch == NAT_A64 {
-        out.push(0x41);                          // advance 1: after stp x29, x30, [sp, #-16]!
-        out.push(0x0E); out.push(16);            // def_cfa_offset 16
-        out.push(0x80 | 29); out.push(2);        // x29 at cfa - 16
-        out.push(0x80 | 30); out.push(1);        // x30 at cfa - 8
-        out.push(0x41);                          // advance 1: after mov x29, sp
-        out.push(0x0D); out.push(29);            // def_cfa_register x29
+        out.push(0x41);
+        // advance 1: after stp x29, x30, [sp, #-16]!
+        out.push(0x0E);
+        out.push(16);
+        // def_cfa_offset 16
+        out.push(0x80 | 29);
+        out.push(2);
+        // x29 at cfa - 16
+        out.push(0x80 | 30);
+        out.push(1);
+        // x30 at cfa - 8
+        out.push(0x41);
+        // advance 1: after mov x29, sp
+        out.push(0x0D);
+        out.push(29);
+        // def_cfa_register x29
     } else {
-        out.push(0x41);                          // advance 1: after addi sp, sp, -16
-        out.push(0x0E); out.push(16);            // def_cfa_offset 16
-        out.push(0x41);                          // advance 1: after sd ra, 8(sp)
-        out.push(0x80 | 1); out.push(1);         // ra at cfa - 8
-        out.push(0x41);                          // advance 1: after sd s0, 0(sp)
-        out.push(0x80 | 8); out.push(2);         // s0 at cfa - 16
-        out.push(0x41);                          // advance 1: after addi s0, sp, 16
-        out.push(0x0C); out.push(8); out.push(0);   // def_cfa s0, 0
+        out.push(0x41);
+        // advance 1: after addi sp, sp, -16
+        out.push(0x0E);
+        out.push(16);
+        // def_cfa_offset 16
+        out.push(0x41);
+        // advance 1: after sd ra, 8(sp)
+        out.push(0x80 | 1);
+        out.push(1);
+        // ra at cfa - 8
+        out.push(0x41);
+        // advance 1: after sd s0, 0(sp)
+        out.push(0x80 | 8);
+        out.push(2);
+        // s0 at cfa - 16
+        out.push(0x41);
+        // advance 1: after addi s0, sp, 16
+        out.push(0x0C);
+        out.push(8);
+        out.push(0);
+        // def_cfa s0, 0
     }
 }
 
 /// nat_elf, with a symbol table and DWARF for the functions [name, start,
 /// end) (image offsets, in address order).
-fn nat_put_uleb(out: &mut Vec<i64>, v: i64) {
+fn nat_put_uleb(out: & mut Vec<i64>, v: i64) {
     var x: i64 = v;
     while true {
         var b: i64 = x & 127;
         x = x >> 7;
-        if x == 0 { out.push(b); return; }
+        if x == 0 {
+            out.push(b);
+            return;
+        }
         out.push(b | 128);
     }
 }
 
-fn nat_put_sleb(out: &mut Vec<i64>, v: i64) {
+fn nat_put_sleb(out: & mut Vec<i64>, v: i64) {
     var x: i64 = v;
     while true {
         var b: i64 = x & 127;
         x = x >> 7;
-        if (x == 0 && (b & 64) == 0) || (x == 0 - 1 && (b & 64) != 0) { out.push(b); return; }
+        if (x == 0 && (b & 64) == 0) || (x == 0 - 1 && (b & 64) != 0) {
+            out.push(b);
+            return;
+        }
         out.push(b | 128);
     }
 }
@@ -893,23 +1295,45 @@ fn nat_put_sleb(out: &mut Vec<i64>, v: i64) {
 /// a sequence per function of the input file (DB1).
 fn nat_debug_line(file: str, rows: Vec<i64>) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
-    nat_put_u32(&mut out, 0);                    // unit length, set below
-    nat_put_u16(&mut out, 4);
-    nat_put_u32(&mut out, 0);                    // header length, set below
+    nat_put_u32(& mut out, 0);
+    // unit length, set below
+    nat_put_u16(& mut out, 4);
+    nat_put_u32(& mut out, 0);
+    // header length, set below
     var hstart: i64 = out.len();
-    out.push(1);                                 // minimum instruction length
-    out.push(1);                                 // maximum operations per instruction
-    out.push(1);                                 // default is_stmt
-    out.push(0xFB);                              // line_base -5
-    out.push(14);                                // line_range
-    out.push(13);                                // opcode_base
-    out.push(0); out.push(1); out.push(1); out.push(1); out.push(1); out.push(0);
-    out.push(0); out.push(0); out.push(1); out.push(0); out.push(0); out.push(1);
-    out.push(0);                                 // no include directories
-    nat_put_str(&mut out, file);
-    out.push(0); out.push(0); out.push(0);       // directory, time, size
+    out.push(1);
+    // minimum instruction length
+    out.push(1);
+    // maximum operations per instruction
+    out.push(1);
+    // default is_stmt
+    out.push(0xFB);
+    // line_base -5
+    out.push(14);
+    // line_range
+    out.push(13);
+    // opcode_base
     out.push(0);
-    nat_set_u32(&mut out, 6, out.len() - hstart);
+    out.push(1);
+    out.push(1);
+    out.push(1);
+    out.push(1);
+    out.push(0);
+    out.push(0);
+    out.push(0);
+    out.push(1);
+    out.push(0);
+    out.push(0);
+    out.push(1);
+    out.push(0);
+    // no include directories
+    nat_put_str(& mut out, file);
+    out.push(0);
+    out.push(0);
+    out.push(0);
+    // directory, time, size
+    out.push(0);
+    nat_set_u32(& mut out, 6, out.len() - hstart);
     var open: bool = false;
     var addr: i64 = 0;
     var line: i64 = 1;
@@ -919,30 +1343,42 @@ fn nat_debug_line(file: str, rows: Vec<i64>) -> Vec<i64> {
         var l: i64 = rows.get(i + 1);
         if rows.get(i + 2) == 1 {
             if open {
-                out.push(0x02); nat_put_uleb(&mut out, at - addr);     // advance_pc
-                out.push(0); out.push(1); out.push(1);                 // end_sequence
+                out.push(0x02);
+                nat_put_uleb(& mut out, at - addr);
+                // advance_pc
+                out.push(0);
+                out.push(1);
+                out.push(1);
+                // end_sequence
                 open = false;
                 line = 1;
             }
         } else {
             if !open {
-                out.push(0); out.push(9); out.push(2);                 // set_address
-                nat_put_u64(&mut out, at);
+                out.push(0);
+                out.push(9);
+                out.push(2);
+                // set_address
+                nat_put_u64(& mut out, at);
                 addr = at;
                 open = true;
             } else if at != addr {
-                out.push(0x02); nat_put_uleb(&mut out, at - addr);
+                out.push(0x02);
+                nat_put_uleb(& mut out, at - addr);
                 addr = at;
             }
             if l != line {
-                out.push(0x03); nat_put_sleb(&mut out, l - line);      // advance_line
+                out.push(0x03);
+                nat_put_sleb(& mut out, l - line);
+                // advance_line
                 line = l;
             }
-            out.push(0x01);                                            // copy
+            out.push(0x01);
+            // copy
         }
         i = i + 3;
     }
-    nat_set_u32(&mut out, 0, out.len() - 4);
+    nat_set_u32(& mut out, 0, out.len() - 4);
     return out;
 }
 
@@ -954,133 +1390,227 @@ pub fn nat_elf_debug(arch: i64, image: Vec<i64>, entry: i64, names: Vec<str>, st
     strtab.push(0);
     var symtab: Vec<i64> = Vec::new();
     var k: i64 = 0;
-    while k < 24 { symtab.push(0); k = k + 1; }
+    while k < 24 {
+        symtab.push(0);
+        k = k + 1;
+    }
     var i: i64 = 0;
     while i < names.len() {
-        nat_put_u32(&mut symtab, strtab.len());
-        nat_put_str(&mut strtab, names.get(i));
-        symtab.push(0x12);                       // STB_GLOBAL, STT_FUNC
+        nat_put_u32(& mut symtab, strtab.len());
+        nat_put_str(& mut strtab, names.get(i));
+        symtab.push(0x12);
+        // STB_GLOBAL, STT_FUNC
         symtab.push(0);
-        nat_put_u16(&mut symtab, 1);             // .text
-        nat_put_u64(&mut symtab, base + starts.get(i));
-        nat_put_u64(&mut symtab, ends.get(i) - starts.get(i));
+        nat_put_u16(& mut symtab, 1);
+        // .text
+        nat_put_u64(& mut symtab, base + starts.get(i));
+        nat_put_u64(& mut symtab, ends.get(i) - starts.get(i));
         i = i + 1;
     }
     // .debug_abbrev: 1 the compile unit, 2 a function
     var abbrev: Vec<i64> = Vec::new();
-    abbrev.push(1); abbrev.push(0x11); abbrev.push(1);
-    abbrev.push(0x25); abbrev.push(0x08);        // producer, string
-    abbrev.push(0x13); abbrev.push(0x05);        // language, data2
-    abbrev.push(0x03); abbrev.push(0x08);        // name, string
-    abbrev.push(0x11); abbrev.push(0x01);        // low_pc, addr
-    abbrev.push(0x12); abbrev.push(0x07);        // high_pc, data8 (a length)
-    abbrev.push(0x10); abbrev.push(0x17);        // stmt_list, sec_offset
-    abbrev.push(0); abbrev.push(0);
-    abbrev.push(2); abbrev.push(0x2E); abbrev.push(0);
-    abbrev.push(0x03); abbrev.push(0x08);
-    abbrev.push(0x11); abbrev.push(0x01);
-    abbrev.push(0x12); abbrev.push(0x07);
-    abbrev.push(0x3F); abbrev.push(0x19);        // external, flag_present
-    abbrev.push(0); abbrev.push(0);
+    abbrev.push(1);
+    abbrev.push(0x11);
+    abbrev.push(1);
+    abbrev.push(0x25);
+    abbrev.push(0x08);
+    // producer, string
+    abbrev.push(0x13);
+    abbrev.push(0x05);
+    // language, data2
+    abbrev.push(0x03);
+    abbrev.push(0x08);
+    // name, string
+    abbrev.push(0x11);
+    abbrev.push(0x01);
+    // low_pc, addr
+    abbrev.push(0x12);
+    abbrev.push(0x07);
+    // high_pc, data8 (a length)
+    abbrev.push(0x10);
+    abbrev.push(0x17);
+    // stmt_list, sec_offset
+    abbrev.push(0);
+    abbrev.push(0);
+    abbrev.push(2);
+    abbrev.push(0x2E);
+    abbrev.push(0);
+    abbrev.push(0x03);
+    abbrev.push(0x08);
+    abbrev.push(0x11);
+    abbrev.push(0x01);
+    abbrev.push(0x12);
+    abbrev.push(0x07);
+    abbrev.push(0x3F);
+    abbrev.push(0x19);
+    // external, flag_present
+    abbrev.push(0);
+    abbrev.push(0);
     abbrev.push(0);
     // .debug_info (DWARF 4)
     var info: Vec<i64> = Vec::new();
-    nat_put_u32(&mut info, 0);                   // unit length, set below
-    nat_put_u16(&mut info, 4);
-    nat_put_u32(&mut info, 0);                   // abbrev offset
-    info.push(8);                                // address size
+    nat_put_u32(& mut info, 0);
+    // unit length, set below
+    nat_put_u16(& mut info, 4);
+    nat_put_u32(& mut info, 0);
+    // abbrev offset
+    info.push(8);
+    // address size
     info.push(1);
-    nat_put_str(&mut info, "fid (Fides)");
-    nat_put_u16(&mut info, 0x0C);                // DW_LANG_C99: what debuggers expect
-    if file == "" { nat_put_str(&mut info, "fides"); } else { nat_put_str(&mut info, file); }
+    nat_put_str(& mut info, "fid (Fides)");
+    nat_put_u16(& mut info, 0x0C);
+    // DW_LANG_C99: what debuggers expect
+    if file == "" {
+        nat_put_str(& mut info, "fides");
+    } else {
+        nat_put_str(& mut info, file);
+    }
     var lo: i64 = 0;
     var hi: i64 = image.len();
-    if starts.len() > 0 { lo = starts.get(0); hi = ends.get(ends.len() - 1); }
-    nat_put_u64(&mut info, base + lo);
-    nat_put_u64(&mut info, hi - lo);
-    nat_put_u32(&mut info, 0);                   // the line program at .debug_line + 0
+    if starts.len() > 0 {
+        lo = starts.get(0);
+        hi = ends.get(ends.len() - 1);
+    }
+    nat_put_u64(& mut info, base + lo);
+    nat_put_u64(& mut info, hi - lo);
+    nat_put_u32(& mut info, 0);
+    // the line program at .debug_line + 0
     i = 0;
     while i < names.len() {
         info.push(2);
-        nat_put_str(&mut info, names.get(i));
-        nat_put_u64(&mut info, base + starts.get(i));
-        nat_put_u64(&mut info, ends.get(i) - starts.get(i));
+        nat_put_str(& mut info, names.get(i));
+        nat_put_u64(& mut info, base + starts.get(i));
+        nat_put_u64(& mut info, ends.get(i) - starts.get(i));
         i = i + 1;
     }
     info.push(0);
-    nat_set_u32(&mut info, 0, info.len() - 4);
+    nat_set_u32(& mut info, 0, info.len() - 4);
     // .debug_frame: one CIE, an FDE per function
     var frame: Vec<i64> = Vec::new();
-    nat_put_u32(&mut frame, 0);                  // CIE length, set below
-    nat_put_u32(&mut frame, 4294967295);         // CIE id
-    frame.push(1);                               // version
-    frame.push(0);                               // augmentation ""
-    if arch == NAT_X64 { frame.push(1); } else { frame.push(4); }      // code alignment
-    frame.push(0x78);                            // data alignment -8
-    if arch == NAT_A64 { frame.push(30); } else if arch == NAT_X64 { frame.push(16); } else { frame.push(1); }
+    nat_put_u32(& mut frame, 0);
+    // CIE length, set below
+    nat_put_u32(& mut frame, 4294967295);
+    // CIE id
+    frame.push(1);
+    // version
+    frame.push(0);
+    // augmentation ""
     if arch == NAT_X64 {
-        frame.push(0x0C); frame.push(7); frame.push(8);     // def_cfa rsp, 8
-        frame.push(0x80 | 16); frame.push(1);               // rip at cfa - 8
+        frame.push(1);
     } else {
-        frame.push(0x0C);                        // def_cfa sp, 0
-        if arch == NAT_A64 { frame.push(31); } else { frame.push(2); }
+        frame.push(4);
+    }
+    // code alignment
+    frame.push(0x78);
+    // data alignment -8
+    if arch == NAT_A64 {
+        frame.push(30);
+    } else if arch == NAT_X64 {
+        frame.push(16);
+    } else {
+        frame.push(1);
+    }
+    if arch == NAT_X64 {
+        frame.push(0x0C);
+        frame.push(7);
+        frame.push(8);
+        // def_cfa rsp, 8
+        frame.push(0x80 | 16);
+        frame.push(1);
+        // rip at cfa - 8
+    } else {
+        frame.push(0x0C);
+        // def_cfa sp, 0
+        if arch == NAT_A64 {
+            frame.push(31);
+        } else {
+            frame.push(2);
+        }
+        frame.push(0);
+    } while frame.len() % 8 != 0 {
         frame.push(0);
     }
-    while frame.len() % 8 != 0 { frame.push(0); }
-    nat_set_u32(&mut frame, 0, frame.len() - 4);
+    nat_set_u32(& mut frame, 0, frame.len() - 4);
     i = 0;
     while i < names.len() {
         var at: i64 = frame.len();
-        nat_put_u32(&mut frame, 0);
-        nat_put_u32(&mut frame, 0);              // the CIE at offset 0
-        nat_put_u64(&mut frame, base + starts.get(i));
-        nat_put_u64(&mut frame, ends.get(i) - starts.get(i));
-        nat_fde_body(arch, &mut frame);
-        while (frame.len() - at) % 8 != 0 { frame.push(0); }
-        nat_set_u32(&mut frame, at, frame.len() - at - 4);
+        nat_put_u32(& mut frame, 0);
+        nat_put_u32(& mut frame, 0);
+        // the CIE at offset 0
+        nat_put_u64(& mut frame, base + starts.get(i));
+        nat_put_u64(& mut frame, ends.get(i) - starts.get(i));
+        nat_fde_body(arch, & mut frame);
+        while (frame.len() - at) % 8 != 0 {
+            frame.push(0);
+        }
+        nat_set_u32(& mut frame, at, frame.len() - at - 4);
         i = i + 1;
     }
     // .shstrtab
     var shstr: Vec<i64> = Vec::new();
     shstr.push(0);
-    var n_text: i64 = shstr.len(); nat_put_str(&mut shstr, ".text");
-    var n_sym: i64 = shstr.len(); nat_put_str(&mut shstr, ".symtab");
-    var n_str: i64 = shstr.len(); nat_put_str(&mut shstr, ".strtab");
-    var n_abbr: i64 = shstr.len(); nat_put_str(&mut shstr, ".debug_abbrev");
-    var n_info: i64 = shstr.len(); nat_put_str(&mut shstr, ".debug_info");
-    var n_frame: i64 = shstr.len(); nat_put_str(&mut shstr, ".debug_frame");
-    var n_shs: i64 = shstr.len(); nat_put_str(&mut shstr, ".shstrtab");
-    var n_line: i64 = shstr.len(); nat_put_str(&mut shstr, ".debug_line");
+    var n_text: i64 = shstr.len();
+    nat_put_str(& mut shstr, ".text");
+    var n_sym: i64 = shstr.len();
+    nat_put_str(& mut shstr, ".symtab");
+    var n_str: i64 = shstr.len();
+    nat_put_str(& mut shstr, ".strtab");
+    var n_abbr: i64 = shstr.len();
+    nat_put_str(& mut shstr, ".debug_abbrev");
+    var n_info: i64 = shstr.len();
+    nat_put_str(& mut shstr, ".debug_info");
+    var n_frame: i64 = shstr.len();
+    nat_put_str(& mut shstr, ".debug_frame");
+    var n_shs: i64 = shstr.len();
+    nat_put_str(& mut shstr, ".shstrtab");
+    var n_line: i64 = shstr.len();
+    nat_put_str(& mut shstr, ".debug_line");
     // The sections after the image, 8-aligned, then the headers
     var offs: Vec<i64> = Vec::new();
     var parts: Vec<Vec<i64>> = Vec::new();
     var fname: str = file;
-    if fname == "" { fname = "fides"; }
-    parts.push(symtab); parts.push(strtab); parts.push(abbrev); parts.push(info); parts.push(frame); parts.push(shstr);
+    if fname == "" {
+        fname = "fides";
+    }
+    parts.push(symtab);
+    parts.push(strtab);
+    parts.push(abbrev);
+    parts.push(info);
+    parts.push(frame);
+    parts.push(shstr);
     parts.push(nat_debug_line(fname, lrows));
     var p: i64 = 0;
     while p < parts.len() {
-        while out.len() % 8 != 0 { out.push(0); }
+        while out.len() % 8 != 0 {
+            out.push(0);
+        }
         offs.push(out.len());
         var part: Vec<i64> = parts.get(p);
         var j: i64 = 0;
-        while j < part.len() { out.push(part.get(j)); j = j + 1; }
+        while j < part.len() {
+            out.push(part.get(j));
+            j = j + 1;
+        }
         p = p + 1;
+    } while out.len() % 8 != 0 {
+        out.push(0);
     }
-    while out.len() % 8 != 0 { out.push(0); }
     var shoff: i64 = out.len();
-    nat_shdr(&mut out, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
-    nat_shdr(&mut out, n_text, 1, 7, base, 0x1000, image.len(), 0, 0, 16, 0);
-    nat_shdr(&mut out, n_sym, 2, 0, 0, offs.get(0), parts.get(0).len(), 3, 1, 8, 24);
-    nat_shdr(&mut out, n_str, 3, 0, 0, offs.get(1), parts.get(1).len(), 0, 0, 1, 0);
-    nat_shdr(&mut out, n_abbr, 1, 0, 0, offs.get(2), parts.get(2).len(), 0, 0, 1, 0);
-    nat_shdr(&mut out, n_info, 1, 0, 0, offs.get(3), parts.get(3).len(), 0, 0, 1, 0);
-    nat_shdr(&mut out, n_frame, 1, 0, 0, offs.get(4), parts.get(4).len(), 0, 0, 8, 0);
-    nat_shdr(&mut out, n_shs, 3, 0, 0, offs.get(5), parts.get(5).len(), 0, 0, 1, 0);
-    nat_shdr(&mut out, n_line, 1, 0, 0, offs.get(6), parts.get(6).len(), 0, 0, 1, 0);
-    nat_set_u64(&mut out, 0x28, shoff);          // e_shoff
-    nat_set_u16(&mut out, 0x3C, 9);              // e_shnum
-    nat_set_u16(&mut out, 0x3E, 7);              // e_shstrndx
+    nat_shdr(& mut out, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    nat_shdr(& mut out, n_text, 1, 7, base, 0x1000, image.len(), 0, 0, 16, 0);
+    nat_shdr(& mut out, n_sym, 2, 0, 0, offs.get(0), parts.get(0).len(), 3, 1, 8, 24);
+    nat_shdr(& mut out, n_str, 3, 0, 0, offs.get(1), parts.get(1).len(), 0, 0, 1, 0);
+    nat_shdr(& mut out, n_abbr, 1, 0, 0, offs.get(2), parts.get(2).len(), 0, 0, 1, 0);
+    nat_shdr(& mut out, n_info, 1, 0, 0, offs.get(3), parts.get(3).len(), 0, 0, 1, 0);
+    nat_shdr(& mut out, n_frame, 1, 0, 0, offs.get(4), parts.get(4).len(), 0, 0, 8, 0);
+    nat_shdr(& mut out, n_shs, 3, 0, 0, offs.get(5), parts.get(5).len(), 0, 0, 1, 0);
+    nat_shdr(& mut out, n_line, 1, 0, 0, offs.get(6), parts.get(6).len(), 0, 0, 1, 0);
+    nat_set_u64(& mut out, 0x28, shoff);
+    // e_shoff
+    nat_set_u16(& mut out, 0x3C, 9);
+    // e_shnum
+    nat_set_u16(& mut out, 0x3E, 7);
+    // e_shstrndx
     return out;
 }
 
@@ -1090,54 +1620,60 @@ pub fn nat_elf_debug(arch: i64, image: Vec<i64>, entry: i64, names: Vec<str>, st
 // rbx 3, rsp 4, rbp 5, rsi 6, rdi 7, r8..r15 8..15); xmm registers 0..15.
 // ---------------------------------------------------------------------------
 
-pub const NAT_X64: i64 = 3;
-pub const NATFIX_X64_REL32: i64 = 7;
-pub const NATFIX_RVA32: i64 = 8;        // 4 data bytes: the label's PE RVA
+pub const NAT_X64: i64 = 3; pub const NATFIX_X64_REL32: i64 = 7; pub const NATFIX_RVA32: i64 = 8;  // 4 data bytes: the label's PE RVA
 
 // Condition codes (the low nibble of Jcc / SETcc)
-pub const X64_O: i64 = 0;
-pub const X64_B: i64 = 2;
-pub const X64_AE: i64 = 3;
-pub const X64_E: i64 = 4;
-pub const X64_NE: i64 = 5;
-pub const X64_BE: i64 = 6;
-pub const X64_A: i64 = 7;
-pub const X64_S: i64 = 8;
-pub const X64_P: i64 = 10;
-pub const X64_NP: i64 = 11;
-pub const X64_L: i64 = 12;
-pub const X64_GE: i64 = 13;
-pub const X64_LE: i64 = 14;
-pub const X64_G: i64 = 15;
-
+pub const X64_O: i64 = 0; pub const X64_B: i64 = 2; pub const X64_AE: i64 = 3; pub const X64_E: i64 = 4; pub const X64_NE: i64 = 5; pub const X64_BE: i64 = 6; pub const X64_A: i64 = 7; pub const X64_S: i64 = 8; pub const X64_P: i64 = 10; pub const X64_NP: i64 = 11; pub const X64_L: i64 = 12; pub const X64_GE: i64 = 13; pub const X64_LE: i64 = 14; pub const X64_G: i64 = 15;
 /// A REX prefix when one is needed (or `force`: byte access to spl..dil).
-fn x64_rex(e: &mut NatEnc, w: bool, reg: i64, index: i64, base: i64, force: bool) {
+fn x64_rex(e: & mut NatEnc, w: bool, reg: i64, index: i64, base: i64, force: bool) {
     var r: i64 = 0x40;
-    if w { r = r | 8; }
-    if reg >= 8 { r = r | 4; }
-    if index >= 8 { r = r | 2; }
-    if base >= 8 { r = r | 1; }
-    if r != 0x40 || force { NatEnc_byte(e, r); }
+    if w {
+        r = r | 8;
+    }
+    if reg >= 8 {
+        r = r | 4;
+    }
+    if index >= 8 {
+        r = r | 2;
+    }
+    if base >= 8 {
+        r = r | 1;
+    }
+    if r != 0x40 || force {
+        NatEnc_byte(e, r);
+    }
 }
 
-fn x64_modrm_rr(e: &mut NatEnc, reg: i64, rm: i64) {
+fn x64_modrm_rr(e: & mut NatEnc, reg: i64, rm: i64) {
     NatEnc_byte(e, 0xC0 | ((reg & 7) << 3) | (rm & 7));
 }
 
-fn x64_fits8(v: i64) -> bool { return v >= 0 - 128 && v <= 127; }
-
-/// ModRM (+ SIB, displacement) for [base + disp].
-fn x64_modrm_mem(e: &mut NatEnc, reg: i64, base: i64, disp: i64) {
-    var b: i64 = base & 7;
-    var md: i64 = 2;
-    if disp == 0 && b != 5 { md = 0; } else if x64_fits8(disp) { md = 1; }
-    NatEnc_byte(e, (md << 6) | ((reg & 7) << 3) | b);
-    if b == 4 { NatEnc_byte(e, 0x24); }
-    if md == 1 { NatEnc_byte(e, disp & 255); }
-    if md == 2 { NatEnc_u32(e, disp); }
+fn x64_fits8(v: i64) -> bool {
+    return v >= 0 - 128 && v <= 127;
 }
 
-pub fn NatEnc_u32(e: &mut NatEnc, v: i64) {
+/// ModRM (+ SIB, displacement) for [base + disp].
+fn x64_modrm_mem(e: & mut NatEnc, reg: i64, base: i64, disp: i64) {
+    var b: i64 = base & 7;
+    var md: i64 = 2;
+    if disp == 0 && b != 5 {
+        md = 0;
+    } else if x64_fits8(disp) {
+        md = 1;
+    }
+    NatEnc_byte(e, (md << 6) | ((reg & 7) << 3) | b);
+    if b == 4 {
+        NatEnc_byte(e, 0x24);
+    }
+    if md == 1 {
+        NatEnc_byte(e, disp & 255);
+    }
+    if md == 2 {
+        NatEnc_u32(e, disp);
+    }
+}
+
+pub fn NatEnc_u32(e: & mut NatEnc, v: i64) {
     NatEnc_byte(e, v & 255);
     NatEnc_byte(e, (v >> 8) & 255);
     NatEnc_byte(e, (v >> 16) & 255);
@@ -1145,238 +1681,410 @@ pub fn NatEnc_u32(e: &mut NatEnc, v: i64) {
 }
 
 /// A 32-bit field relative to its own end, filled with label later.
-fn x64_rel32(e: &mut NatEnc, label: i64) {
+fn x64_rel32(e: & mut NatEnc, label: i64) {
     NatEnc_fix(e, label, NATFIX_X64_REL32);
     NatEnc_u32(e, 0);
 }
 
-pub fn x64_mov(e: &mut NatEnc, d: i64, s: i64) {
-    x64_rex(e, true, s, 0, d, false); NatEnc_byte(e, 0x89); x64_modrm_rr(e, s, d);
+pub fn x64_mov(e: & mut NatEnc, d: i64, s: i64) {
+    x64_rex(e, true, s, 0, d, false);
+    NatEnc_byte(e, 0x89);
+    x64_modrm_rr(e, s, d);
 }
 
 /// mov r32, r32: the low 32 bits, zero-extended
-pub fn x64_mov32(e: &mut NatEnc, d: i64, s: i64) {
-    x64_rex(e, false, s, 0, d, false); NatEnc_byte(e, 0x89); x64_modrm_rr(e, s, d);
+pub fn x64_mov32(e: & mut NatEnc, d: i64, s: i64) {
+    x64_rex(e, false, s, 0, d, false);
+    NatEnc_byte(e, 0x89);
+    x64_modrm_rr(e, s, d);
 }
 
-@wrapping
-pub fn x64_li(e: &mut NatEnc, d: i64, v: i64) {
+@wrapping pub fn x64_li(e: & mut NatEnc, d: i64, v: i64) {
     if v == 0 {
-        x64_rex(e, false, d, 0, d, false); NatEnc_byte(e, 0x31); x64_modrm_rr(e, d, d);
+        x64_rex(e, false, d, 0, d, false);
+        NatEnc_byte(e, 0x31);
+        x64_modrm_rr(e, d, d);
         return;
     }
     if v > 0 && v <= 4294967295 {
-        x64_rex(e, false, 0, 0, d, false); NatEnc_byte(e, 0xB8 + (d & 7)); NatEnc_u32(e, v);
+        x64_rex(e, false, 0, 0, d, false);
+        NatEnc_byte(e, 0xB8 + (d & 7));
+        NatEnc_u32(e, v);
         return;
     }
     if v >= 0 - 2147483648 && v <= 2147483647 {
-        x64_rex(e, true, 0, 0, d, false); NatEnc_byte(e, 0xC7); x64_modrm_rr(e, 0, d); NatEnc_u32(e, v);
+        x64_rex(e, true, 0, 0, d, false);
+        NatEnc_byte(e, 0xC7);
+        x64_modrm_rr(e, 0, d);
+        NatEnc_u32(e, v);
         return;
     }
-    x64_rex(e, true, 0, 0, d, false); NatEnc_byte(e, 0xB8 + (d & 7)); NatEnc_quad(e, v);
+    x64_rex(e, true, 0, 0, d, false);
+    NatEnc_byte(e, 0xB8 + (d & 7));
+    NatEnc_quad(e, v);
 }
 
 /// d = d op s for op 0x01 add, 0x09 or, 0x21 and, 0x29 sub, 0x31 xor,
 /// 0x39 cmp (flags only)
-pub fn x64_alu(e: &mut NatEnc, op: i64, d: i64, s: i64) {
-    x64_rex(e, true, s, 0, d, false); NatEnc_byte(e, op); x64_modrm_rr(e, s, d);
+pub fn x64_alu(e: & mut NatEnc, op: i64, d: i64, s: i64) {
+    x64_rex(e, true, s, 0, d, false);
+    NatEnc_byte(e, op);
+    x64_modrm_rr(e, s, d);
 }
 
-pub fn x64_imul(e: &mut NatEnc, d: i64, s: i64) {
-    x64_rex(e, true, d, 0, s, false); NatEnc_byte(e, 0x0F); NatEnc_byte(e, 0xAF); x64_modrm_rr(e, d, s);
+pub fn x64_imul(e: & mut NatEnc, d: i64, s: i64) {
+    x64_rex(e, true, d, 0, s, false);
+    NatEnc_byte(e, 0x0F);
+    NatEnc_byte(e, 0xAF);
+    x64_modrm_rr(e, d, s);
 }
 
 /// F7 /ext: 2 not, 3 neg, 4 mul, 5 imul, 6 div, 7 idiv
-pub fn x64_f7(e: &mut NatEnc, ext: i64, r: i64) {
-    x64_rex(e, true, 0, 0, r, false); NatEnc_byte(e, 0xF7); x64_modrm_rr(e, ext, r);
+pub fn x64_f7(e: & mut NatEnc, ext: i64, r: i64) {
+    x64_rex(e, true, 0, 0, r, false);
+    NatEnc_byte(e, 0xF7);
+    x64_modrm_rr(e, ext, r);
 }
 
 /// D3 /ext: shift by cl (4 shl, 5 shr, 7 sar)
-pub fn x64_shift_cl(e: &mut NatEnc, ext: i64, r: i64) {
-    x64_rex(e, true, 0, 0, r, false); NatEnc_byte(e, 0xD3); x64_modrm_rr(e, ext, r);
+pub fn x64_shift_cl(e: & mut NatEnc, ext: i64, r: i64) {
+    x64_rex(e, true, 0, 0, r, false);
+    NatEnc_byte(e, 0xD3);
+    x64_modrm_rr(e, ext, r);
 }
 
 /// C1 /ext ib: shift by an immediate
-pub fn x64_shift_imm(e: &mut NatEnc, ext: i64, r: i64, n: i64) {
-    x64_rex(e, true, 0, 0, r, false); NatEnc_byte(e, 0xC1); x64_modrm_rr(e, ext, r); NatEnc_byte(e, n & 255);
+pub fn x64_shift_imm(e: & mut NatEnc, ext: i64, r: i64, n: i64) {
+    x64_rex(e, true, 0, 0, r, false);
+    NatEnc_byte(e, 0xC1);
+    x64_modrm_rr(e, ext, r);
+    NatEnc_byte(e, n & 255);
 }
 
-pub fn x64_cqo(e: &mut NatEnc) { NatEnc_byte(e, 0x48); NatEnc_byte(e, 0x99); }
+pub fn x64_cqo(e: & mut NatEnc) {
+    NatEnc_byte(e, 0x48);
+    NatEnc_byte(e, 0x99);
+}
 
-pub fn x64_setcc(e: &mut NatEnc, cc: i64, r: i64) {
-    x64_rex(e, false, 0, 0, r, r >= 4 && r <= 7); NatEnc_byte(e, 0x0F); NatEnc_byte(e, 0x90 + cc); x64_modrm_rr(e, 0, r);
+pub fn x64_setcc(e: & mut NatEnc, cc: i64, r: i64) {
+    x64_rex(e, false, 0, 0, r, r >= 4 && r <= 7);
+    NatEnc_byte(e, 0x0F);
+    NatEnc_byte(e, 0x90 + cc);
+    x64_modrm_rr(e, 0, r);
 }
 
 /// Extensions to 64 bits: 0F B6 movzx8, 0F B7 movzx16, 0F BE movsx8,
 /// 0F BF movsx16 (REX.W), 63 movsxd
-pub fn x64_movx(e: &mut NatEnc, op: i64, d: i64, s: i64) {
+pub fn x64_movx(e: & mut NatEnc, op: i64, d: i64, s: i64) {
     x64_rex(e, true, d, 0, s, false);
-    if op != 0x63 { NatEnc_byte(e, 0x0F); }
+    if op != 0x63 {
+        NatEnc_byte(e, 0x0F);
+    }
     NatEnc_byte(e, op);
     x64_modrm_rr(e, d, s);
 }
 
-pub fn x64_test(e: &mut NatEnc, a: i64, b: i64) {
-    x64_rex(e, true, b, 0, a, false); NatEnc_byte(e, 0x85); x64_modrm_rr(e, b, a);
+pub fn x64_test(e: & mut NatEnc, a: i64, b: i64) {
+    x64_rex(e, true, b, 0, a, false);
+    NatEnc_byte(e, 0x85);
+    x64_modrm_rr(e, b, a);
 }
 
 /// d = *(base + disp), `size` bytes, extended to 64 bits
-pub fn x64_load(e: &mut NatEnc, d: i64, base: i64, disp: i64, size: i64, signed: bool) {
+pub fn x64_load(e: & mut NatEnc, d: i64, base: i64, disp: i64, size: i64, signed: bool) {
     if size == 8 {
-        x64_rex(e, true, d, 0, base, false); NatEnc_byte(e, 0x8B);
+        x64_rex(e, true, d, 0, base, false);
+        NatEnc_byte(e, 0x8B);
     } else if size == 4 && signed {
-        x64_rex(e, true, d, 0, base, false); NatEnc_byte(e, 0x63);
+        x64_rex(e, true, d, 0, base, false);
+        NatEnc_byte(e, 0x63);
     } else if size == 4 {
-        x64_rex(e, false, d, 0, base, false); NatEnc_byte(e, 0x8B);
+        x64_rex(e, false, d, 0, base, false);
+        NatEnc_byte(e, 0x8B);
     } else {
         x64_rex(e, true, d, 0, base, false);
         NatEnc_byte(e, 0x0F);
-        if size == 2 { if signed { NatEnc_byte(e, 0xBF); } else { NatEnc_byte(e, 0xB7); } }
-        else { if signed { NatEnc_byte(e, 0xBE); } else { NatEnc_byte(e, 0xB6); } }
+        if size == 2 {
+            if signed {
+                NatEnc_byte(e, 0xBF);
+            } else {
+                NatEnc_byte(e, 0xB7);
+            }
+        } else {
+            if signed {
+                NatEnc_byte(e, 0xBE);
+            } else {
+                NatEnc_byte(e, 0xB6);
+            }
+        }
     }
     x64_modrm_mem(e, d, base, disp);
 }
 
 /// *(base + disp) = v, `size` bytes
-pub fn x64_store(e: &mut NatEnc, v: i64, base: i64, disp: i64, size: i64) {
-    if size == 2 { NatEnc_byte(e, 0x66); }
+pub fn x64_store(e: & mut NatEnc, v: i64, base: i64, disp: i64, size: i64) {
+    if size == 2 {
+        NatEnc_byte(e, 0x66);
+    }
     x64_rex(e, size == 8, v, 0, base, size == 1 && v >= 4 && v <= 7);
-    if size == 1 { NatEnc_byte(e, 0x88); } else { NatEnc_byte(e, 0x89); }
+    if size == 1 {
+        NatEnc_byte(e, 0x88);
+    } else {
+        NatEnc_byte(e, 0x89);
+    }
     x64_modrm_mem(e, v, base, disp);
 }
 
-pub fn x64_lea(e: &mut NatEnc, d: i64, base: i64, disp: i64) {
-    x64_rex(e, true, d, 0, base, false); NatEnc_byte(e, 0x8D); x64_modrm_mem(e, d, base, disp);
+pub fn x64_lea(e: & mut NatEnc, d: i64, base: i64, disp: i64) {
+    x64_rex(e, true, d, 0, base, false);
+    NatEnc_byte(e, 0x8D);
+    x64_modrm_mem(e, d, base, disp);
 }
 
 /// d = the address of `label` (rip-relative)
-pub fn x64_lea_label(e: &mut NatEnc, d: i64, label: i64) {
-    x64_rex(e, true, d, 0, 0, false); NatEnc_byte(e, 0x8D); NatEnc_byte(e, ((d & 7) << 3) | 5); x64_rel32(e, label);
+pub fn x64_lea_label(e: & mut NatEnc, d: i64, label: i64) {
+    x64_rex(e, true, d, 0, 0, false);
+    NatEnc_byte(e, 0x8D);
+    NatEnc_byte(e, ((d & 7) << 3) | 5);
+    x64_rel32(e, label);
 }
 
 /// [rip + label] = r (8 bytes)
-pub fn x64_store_label(e: &mut NatEnc, r: i64, label: i64) {
-    x64_rex(e, true, r, 0, 0, false); NatEnc_byte(e, 0x89); NatEnc_byte(e, ((r & 7) << 3) | 5); x64_rel32(e, label);
+pub fn x64_store_label(e: & mut NatEnc, r: i64, label: i64) {
+    x64_rex(e, true, r, 0, 0, false);
+    NatEnc_byte(e, 0x89);
+    NatEnc_byte(e, ((r & 7) << 3) | 5);
+    x64_rel32(e, label);
 }
 
 /// r = [rip + label] (8 bytes)
-pub fn x64_load_label(e: &mut NatEnc, r: i64, label: i64) {
-    x64_rex(e, true, r, 0, 0, false); NatEnc_byte(e, 0x8B); NatEnc_byte(e, ((r & 7) << 3) | 5); x64_rel32(e, label);
+pub fn x64_load_label(e: & mut NatEnc, r: i64, label: i64) {
+    x64_rex(e, true, r, 0, 0, false);
+    NatEnc_byte(e, 0x8B);
+    NatEnc_byte(e, ((r & 7) << 3) | 5);
+    x64_rel32(e, label);
 }
 
 /// r = fs:[disp]
-pub fn x64_load_fs(e: &mut NatEnc, r: i64, disp: i64) {
-    NatEnc_byte(e, 0x64); x64_rex(e, true, r, 0, 0, false); NatEnc_byte(e, 0x8B);
-    NatEnc_byte(e, ((r & 7) << 3) | 4); NatEnc_byte(e, 0x25); NatEnc_u32(e, disp);
+pub fn x64_load_fs(e: & mut NatEnc, r: i64, disp: i64) {
+    NatEnc_byte(e, 0x64);
+    x64_rex(e, true, r, 0, 0, false);
+    NatEnc_byte(e, 0x8B);
+    NatEnc_byte(e, ((r & 7) << 3) | 4);
+    NatEnc_byte(e, 0x25);
+    NatEnc_u32(e, disp);
 }
 
 /// r = gs:[disp] (Windows: the thread environment block)
-pub fn x64_load_gs(e: &mut NatEnc, r: i64, disp: i64) {
-    NatEnc_byte(e, 0x65); x64_rex(e, true, r, 0, 0, false); NatEnc_byte(e, 0x8B);
-    NatEnc_byte(e, ((r & 7) << 3) | 4); NatEnc_byte(e, 0x25); NatEnc_u32(e, disp);
+pub fn x64_load_gs(e: & mut NatEnc, r: i64, disp: i64) {
+    NatEnc_byte(e, 0x65);
+    x64_rex(e, true, r, 0, 0, false);
+    NatEnc_byte(e, 0x8B);
+    NatEnc_byte(e, ((r & 7) << 3) | 4);
+    NatEnc_byte(e, 0x25);
+    NatEnc_u32(e, disp);
 }
 
 /// gs:[disp] = r
-pub fn x64_store_gs(e: &mut NatEnc, r: i64, disp: i64) {
-    NatEnc_byte(e, 0x65); x64_rex(e, true, r, 0, 0, false); NatEnc_byte(e, 0x89);
-    NatEnc_byte(e, ((r & 7) << 3) | 4); NatEnc_byte(e, 0x25); NatEnc_u32(e, disp);
+pub fn x64_store_gs(e: & mut NatEnc, r: i64, disp: i64) {
+    NatEnc_byte(e, 0x65);
+    x64_rex(e, true, r, 0, 0, false);
+    NatEnc_byte(e, 0x89);
+    NatEnc_byte(e, ((r & 7) << 3) | 4);
+    NatEnc_byte(e, 0x25);
+    NatEnc_u32(e, disp);
 }
 
 /// and rsp, -16
-pub fn x64_align_sp16(e: &mut NatEnc) {
-    NatEnc_byte(e, 0x48); NatEnc_byte(e, 0x83); NatEnc_byte(e, 0xE4); NatEnc_byte(e, 0xF0);
+pub fn x64_align_sp16(e: & mut NatEnc) {
+    NatEnc_byte(e, 0x48);
+    NatEnc_byte(e, 0x83);
+    NatEnc_byte(e, 0xE4);
+    NatEnc_byte(e, 0xF0);
 }
 
 /// 4 data bytes: the PE RVA of `label`
-pub fn NatEnc_rva32(e: &mut NatEnc, label: i64) {
+pub fn NatEnc_rva32(e: & mut NatEnc, label: i64) {
     NatEnc_fix(e, label, NATFIX_RVA32);
     NatEnc_u32(e, 0);
 }
 
-pub fn x64_call(e: &mut NatEnc, label: i64) { NatEnc_byte(e, 0xE8); x64_rel32(e, label); }
-pub fn x64_jmp(e: &mut NatEnc, label: i64) { NatEnc_byte(e, 0xE9); x64_rel32(e, label); }
-pub fn x64_jcc(e: &mut NatEnc, cc: i64, label: i64) { NatEnc_byte(e, 0x0F); NatEnc_byte(e, 0x80 + cc); x64_rel32(e, label); }
+pub fn x64_call(e: & mut NatEnc, label: i64) {
+    NatEnc_byte(e, 0xE8);
+    x64_rel32(e, label);
+}
+pub fn x64_jmp(e: & mut NatEnc, label: i64) {
+    NatEnc_byte(e, 0xE9);
+    x64_rel32(e, label);
+}
+pub fn x64_jcc(e: & mut NatEnc, cc: i64, label: i64) {
+    NatEnc_byte(e, 0x0F);
+    NatEnc_byte(e, 0x80 + cc);
+    x64_rel32(e, label);
+}
 
 /// Jcc by a fixed count of bytes after this 2-byte instruction
-pub fn x64_jcc8(e: &mut NatEnc, cc: i64, rel: i64) { NatEnc_byte(e, 0x70 + cc); NatEnc_byte(e, rel & 255); }
-
-pub fn x64_call_r(e: &mut NatEnc, r: i64) {
-    x64_rex(e, false, 0, 0, r, false); NatEnc_byte(e, 0xFF); x64_modrm_rr(e, 2, r);
+pub fn x64_jcc8(e: & mut NatEnc, cc: i64, rel: i64) {
+    NatEnc_byte(e, 0x70 + cc);
+    NatEnc_byte(e, rel & 255);
 }
 
-pub fn x64_ret(e: &mut NatEnc) { NatEnc_byte(e, 0xC3); }
-pub fn x64_push(e: &mut NatEnc, r: i64) { x64_rex(e, false, 0, 0, r, false); NatEnc_byte(e, 0x50 + (r & 7)); }
-pub fn x64_pop(e: &mut NatEnc, r: i64) { x64_rex(e, false, 0, 0, r, false); NatEnc_byte(e, 0x58 + (r & 7)); }
-pub fn x64_ud2(e: &mut NatEnc) { NatEnc_byte(e, 0x0F); NatEnc_byte(e, 0x0B); }
-pub fn x64_syscall(e: &mut NatEnc) { NatEnc_byte(e, 0x0F); NatEnc_byte(e, 0x05); }
-pub fn x64_mfence(e: &mut NatEnc) { NatEnc_byte(e, 0x0F); NatEnc_byte(e, 0xAE); NatEnc_byte(e, 0xF0); }
+pub fn x64_call_r(e: & mut NatEnc, r: i64) {
+    x64_rex(e, false, 0, 0, r, false);
+    NatEnc_byte(e, 0xFF);
+    x64_modrm_rr(e, 2, r);
+}
+
+pub fn x64_ret(e: & mut NatEnc) {
+    NatEnc_byte(e, 0xC3);
+}
+pub fn x64_push(e: & mut NatEnc, r: i64) {
+    x64_rex(e, false, 0, 0, r, false);
+    NatEnc_byte(e, 0x50 + (r & 7));
+}
+pub fn x64_pop(e: & mut NatEnc, r: i64) {
+    x64_rex(e, false, 0, 0, r, false);
+    NatEnc_byte(e, 0x58 + (r & 7));
+}
+pub fn x64_ud2(e: & mut NatEnc) {
+    NatEnc_byte(e, 0x0F);
+    NatEnc_byte(e, 0x0B);
+}
+pub fn x64_syscall(e: & mut NatEnc) {
+    NatEnc_byte(e, 0x0F);
+    NatEnc_byte(e, 0x05);
+}
+pub fn x64_mfence(e: & mut NatEnc) {
+    NatEnc_byte(e, 0x0F);
+    NatEnc_byte(e, 0xAE);
+    NatEnc_byte(e, 0xF0);
+}
 
 /// add / sub r, imm32 (81 /0, /5)
-pub fn x64_add_imm(e: &mut NatEnc, r: i64, v: i64) {
+pub fn x64_add_imm(e: & mut NatEnc, r: i64, v: i64) {
     x64_rex(e, true, 0, 0, r, false);
-    if x64_fits8(v) { NatEnc_byte(e, 0x83); x64_modrm_rr(e, 0, r); NatEnc_byte(e, v & 255); }
-    else if r == 0 { NatEnc_byte(e, 0x05); NatEnc_u32(e, v); }    // the rax form
-    else { NatEnc_byte(e, 0x81); x64_modrm_rr(e, 0, r); NatEnc_u32(e, v); }
+    if x64_fits8(v) {
+        NatEnc_byte(e, 0x83);
+        x64_modrm_rr(e, 0, r);
+        NatEnc_byte(e, v & 255);
+    } else if r == 0 {
+        NatEnc_byte(e, 0x05);
+        NatEnc_u32(e, v);
+    }  // the rax form
+    else {
+        NatEnc_byte(e, 0x81);
+        x64_modrm_rr(e, 0, r);
+        NatEnc_u32(e, v);
+    }
 }
 
-pub fn x64_sub_imm(e: &mut NatEnc, r: i64, v: i64) {
+pub fn x64_sub_imm(e: & mut NatEnc, r: i64, v: i64) {
     x64_rex(e, true, 0, 0, r, false);
-    if x64_fits8(v) { NatEnc_byte(e, 0x83); x64_modrm_rr(e, 5, r); NatEnc_byte(e, v & 255); }
-    else if r == 0 { NatEnc_byte(e, 0x2D); NatEnc_u32(e, v); }    // the rax form
-    else { NatEnc_byte(e, 0x81); x64_modrm_rr(e, 5, r); NatEnc_u32(e, v); }
+    if x64_fits8(v) {
+        NatEnc_byte(e, 0x83);
+        x64_modrm_rr(e, 5, r);
+        NatEnc_byte(e, v & 255);
+    } else if r == 0 {
+        NatEnc_byte(e, 0x2D);
+        NatEnc_u32(e, v);
+    }  // the rax form
+    else {
+        NatEnc_byte(e, 0x81);
+        x64_modrm_rr(e, 5, r);
+        NatEnc_u32(e, v);
+    }
 }
 
 // SSE2 (and SSE4.1 roundsd, FMA3 vfmadd213sd)
 
 /// xmm x = the 64 bits of r (movq), or the low 32 (movd)
-pub fn x64_movq_xr(e: &mut NatEnc, x: i64, r: i64, w: bool) {
-    NatEnc_byte(e, 0x66); x64_rex(e, w, x, 0, r, false); NatEnc_byte(e, 0x0F); NatEnc_byte(e, 0x6E); x64_modrm_rr(e, x, r);
+pub fn x64_movq_xr(e: & mut NatEnc, x: i64, r: i64, w: bool) {
+    NatEnc_byte(e, 0x66);
+    x64_rex(e, w, x, 0, r, false);
+    NatEnc_byte(e, 0x0F);
+    NatEnc_byte(e, 0x6E);
+    x64_modrm_rr(e, x, r);
 }
 
-pub fn x64_movq_rx(e: &mut NatEnc, r: i64, x: i64, w: bool) {
-    NatEnc_byte(e, 0x66); x64_rex(e, w, x, 0, r, false); NatEnc_byte(e, 0x0F); NatEnc_byte(e, 0x7E); x64_modrm_rr(e, x, r);
+pub fn x64_movq_rx(e: & mut NatEnc, r: i64, x: i64, w: bool) {
+    NatEnc_byte(e, 0x66);
+    x64_rex(e, w, x, 0, r, false);
+    NatEnc_byte(e, 0x0F);
+    NatEnc_byte(e, 0x7E);
+    x64_modrm_rr(e, x, r);
 }
 
 /// prefix 0F op /r between xmm registers (F2 58 addsd, 5C subsd, 59 mulsd,
 /// 5E divsd, 51 sqrtsd, F3 5A cvtss2sd, F2 5A cvtsd2ss, 66 2E ucomisd)
-pub fn x64_sse(e: &mut NatEnc, prefix: i64, op: i64, x1: i64, x2: i64) {
-    NatEnc_byte(e, prefix); x64_rex(e, false, x1, 0, x2, false); NatEnc_byte(e, 0x0F); NatEnc_byte(e, op); x64_modrm_rr(e, x1, x2);
+pub fn x64_sse(e: & mut NatEnc, prefix: i64, op: i64, x1: i64, x2: i64) {
+    NatEnc_byte(e, prefix);
+    x64_rex(e, false, x1, 0, x2, false);
+    NatEnc_byte(e, 0x0F);
+    NatEnc_byte(e, op);
+    x64_modrm_rr(e, x1, x2);
 }
 
-pub fn x64_cvtsi2sd(e: &mut NatEnc, x: i64, r: i64) {
-    NatEnc_byte(e, 0xF2); x64_rex(e, true, x, 0, r, false); NatEnc_byte(e, 0x0F); NatEnc_byte(e, 0x2A); x64_modrm_rr(e, x, r);
+pub fn x64_cvtsi2sd(e: & mut NatEnc, x: i64, r: i64) {
+    NatEnc_byte(e, 0xF2);
+    x64_rex(e, true, x, 0, r, false);
+    NatEnc_byte(e, 0x0F);
+    NatEnc_byte(e, 0x2A);
+    x64_modrm_rr(e, x, r);
 }
 
-pub fn x64_cvttsd2si(e: &mut NatEnc, r: i64, x: i64) {
-    NatEnc_byte(e, 0xF2); x64_rex(e, true, r, 0, x, false); NatEnc_byte(e, 0x0F); NatEnc_byte(e, 0x2C); x64_modrm_rr(e, r, x);
+pub fn x64_cvttsd2si(e: & mut NatEnc, r: i64, x: i64) {
+    NatEnc_byte(e, 0xF2);
+    x64_rex(e, true, r, 0, x, false);
+    NatEnc_byte(e, 0x0F);
+    NatEnc_byte(e, 0x2C);
+    x64_modrm_rr(e, r, x);
 }
 
 /// roundsd x1, x2, mode (1 floor, 2 ceil, 3 trunc)
-pub fn x64_roundsd(e: &mut NatEnc, x1: i64, x2: i64, mode: i64) {
-    NatEnc_byte(e, 0x66); x64_rex(e, false, x1, 0, x2, false); NatEnc_byte(e, 0x0F); NatEnc_byte(e, 0x3A);
-    NatEnc_byte(e, 0x0B); x64_modrm_rr(e, x1, x2); NatEnc_byte(e, mode);
+pub fn x64_roundsd(e: & mut NatEnc, x1: i64, x2: i64, mode: i64) {
+    NatEnc_byte(e, 0x66);
+    x64_rex(e, false, x1, 0, x2, false);
+    NatEnc_byte(e, 0x0F);
+    NatEnc_byte(e, 0x3A);
+    NatEnc_byte(e, 0x0B);
+    x64_modrm_rr(e, x1, x2);
+    NatEnc_byte(e, mode);
 }
 
 /// xmm0 = xmm1 * xmm0 + xmm2, rounded once
-pub fn x64_vfmadd213sd_012(e: &mut NatEnc) {
-    NatEnc_byte(e, 0xC4); NatEnc_byte(e, 0xE2); NatEnc_byte(e, 0xF1); NatEnc_byte(e, 0xA9); NatEnc_byte(e, 0xC2);
+pub fn x64_vfmadd213sd_012(e: & mut NatEnc) {
+    NatEnc_byte(e, 0xC4);
+    NatEnc_byte(e, 0xE2);
+    NatEnc_byte(e, 0xF1);
+    NatEnc_byte(e, 0xA9);
+    NatEnc_byte(e, 0xC2);
 }
 
 // Atomics
 
 /// xchg [base], r (an implicit lock)
-pub fn x64_xchg_mem(e: &mut NatEnc, base: i64, r: i64) {
-    x64_rex(e, true, r, 0, base, false); NatEnc_byte(e, 0x87); x64_modrm_mem(e, r, base, 0);
+pub fn x64_xchg_mem(e: & mut NatEnc, base: i64, r: i64) {
+    x64_rex(e, true, r, 0, base, false);
+    NatEnc_byte(e, 0x87);
+    x64_modrm_mem(e, r, base, 0);
 }
 
 /// lock xadd [base], r
-pub fn x64_lock_xadd(e: &mut NatEnc, base: i64, r: i64) {
-    NatEnc_byte(e, 0xF0); x64_rex(e, true, r, 0, base, false); NatEnc_byte(e, 0x0F); NatEnc_byte(e, 0xC1); x64_modrm_mem(e, r, base, 0);
+pub fn x64_lock_xadd(e: & mut NatEnc, base: i64, r: i64) {
+    NatEnc_byte(e, 0xF0);
+    x64_rex(e, true, r, 0, base, false);
+    NatEnc_byte(e, 0x0F);
+    NatEnc_byte(e, 0xC1);
+    x64_modrm_mem(e, r, base, 0);
 }
 
 /// lock cmpxchg [base], r (compares with rax)
-pub fn x64_lock_cmpxchg(e: &mut NatEnc, base: i64, r: i64) {
-    NatEnc_byte(e, 0xF0); x64_rex(e, true, r, 0, base, false); NatEnc_byte(e, 0x0F); NatEnc_byte(e, 0xB1); x64_modrm_mem(e, r, base, 0);
+pub fn x64_lock_cmpxchg(e: & mut NatEnc, base: i64, r: i64) {
+    NatEnc_byte(e, 0xF0);
+    x64_rex(e, true, r, 0, base, false);
+    NatEnc_byte(e, 0x0F);
+    NatEnc_byte(e, 0xB1);
+    x64_modrm_mem(e, r, base, 0);
 }
 
 // ===========================================================================
@@ -1396,10 +2104,8 @@ pub fn x64_lock_cmpxchg(e: &mut NatEnc, base: i64, r: i64) {
 // written (ad-hoc, no certificate).
 // ===========================================================================
 
-pub const NAT_MACHO_BASE: i64 = 0x100000000;
-/// The header + load commands take one page; the code follows.
+pub const NAT_MACHO_BASE: i64 = 0x100000000;  /// The header + load commands take one page; the code follows.
 pub const NAT_MACHO_HDR: i64 = 0x4000;
-
 // ── SHA-256 (for the ad-hoc code signature's page hashes) ───────────────
 
 fn sha_rotr(x: i64, n: i64) -> i64 {
@@ -1408,43 +2114,108 @@ fn sha_rotr(x: i64, n: i64) -> i64 {
 
 fn sha_k(i: i64) -> i64 {
     var k: Vec<i64> = Vec::new();
-    k.push(0x428a2f98); k.push(0x71374491); k.push(0xb5c0fbcf); k.push(0xe9b5dba5);
-    k.push(0x3956c25b); k.push(0x59f111f1); k.push(0x923f82a4); k.push(0xab1c5ed5);
-    k.push(0xd807aa98); k.push(0x12835b01); k.push(0x243185be); k.push(0x550c7dc3);
-    k.push(0x72be5d74); k.push(0x80deb1fe); k.push(0x9bdc06a7); k.push(0xc19bf174);
-    k.push(0xe49b69c1); k.push(0xefbe4786); k.push(0x0fc19dc6); k.push(0x240ca1cc);
-    k.push(0x2de92c6f); k.push(0x4a7484aa); k.push(0x5cb0a9dc); k.push(0x76f988da);
-    k.push(0x983e5152); k.push(0xa831c66d); k.push(0xb00327c8); k.push(0xbf597fc7);
-    k.push(0xc6e00bf3); k.push(0xd5a79147); k.push(0x06ca6351); k.push(0x14292967);
-    k.push(0x27b70a85); k.push(0x2e1b2138); k.push(0x4d2c6dfc); k.push(0x53380d13);
-    k.push(0x650a7354); k.push(0x766a0abb); k.push(0x81c2c92e); k.push(0x92722c85);
-    k.push(0xa2bfe8a1); k.push(0xa81a664b); k.push(0xc24b8b70); k.push(0xc76c51a3);
-    k.push(0xd192e819); k.push(0xd6990624); k.push(0xf40e3585); k.push(0x106aa070);
-    k.push(0x19a4c116); k.push(0x1e376c08); k.push(0x2748774c); k.push(0x34b0bcb5);
-    k.push(0x391c0cb3); k.push(0x4ed8aa4a); k.push(0x5b9cca4f); k.push(0x682e6ff3);
-    k.push(0x748f82ee); k.push(0x78a5636f); k.push(0x84c87814); k.push(0x8cc70208);
-    k.push(0x90befffa); k.push(0xa4506ceb); k.push(0xbef9a3f7); k.push(0xc67178f2);
+    k.push(0x428a2f98);
+    k.push(0x71374491);
+    k.push(0xb5c0fbcf);
+    k.push(0xe9b5dba5);
+    k.push(0x3956c25b);
+    k.push(0x59f111f1);
+    k.push(0x923f82a4);
+    k.push(0xab1c5ed5);
+    k.push(0xd807aa98);
+    k.push(0x12835b01);
+    k.push(0x243185be);
+    k.push(0x550c7dc3);
+    k.push(0x72be5d74);
+    k.push(0x80deb1fe);
+    k.push(0x9bdc06a7);
+    k.push(0xc19bf174);
+    k.push(0xe49b69c1);
+    k.push(0xefbe4786);
+    k.push(0x0fc19dc6);
+    k.push(0x240ca1cc);
+    k.push(0x2de92c6f);
+    k.push(0x4a7484aa);
+    k.push(0x5cb0a9dc);
+    k.push(0x76f988da);
+    k.push(0x983e5152);
+    k.push(0xa831c66d);
+    k.push(0xb00327c8);
+    k.push(0xbf597fc7);
+    k.push(0xc6e00bf3);
+    k.push(0xd5a79147);
+    k.push(0x06ca6351);
+    k.push(0x14292967);
+    k.push(0x27b70a85);
+    k.push(0x2e1b2138);
+    k.push(0x4d2c6dfc);
+    k.push(0x53380d13);
+    k.push(0x650a7354);
+    k.push(0x766a0abb);
+    k.push(0x81c2c92e);
+    k.push(0x92722c85);
+    k.push(0xa2bfe8a1);
+    k.push(0xa81a664b);
+    k.push(0xc24b8b70);
+    k.push(0xc76c51a3);
+    k.push(0xd192e819);
+    k.push(0xd6990624);
+    k.push(0xf40e3585);
+    k.push(0x106aa070);
+    k.push(0x19a4c116);
+    k.push(0x1e376c08);
+    k.push(0x2748774c);
+    k.push(0x34b0bcb5);
+    k.push(0x391c0cb3);
+    k.push(0x4ed8aa4a);
+    k.push(0x5b9cca4f);
+    k.push(0x682e6ff3);
+    k.push(0x748f82ee);
+    k.push(0x78a5636f);
+    k.push(0x84c87814);
+    k.push(0x8cc70208);
+    k.push(0x90befffa);
+    k.push(0xa4506ceb);
+    k.push(0xbef9a3f7);
+    k.push(0xc67178f2);
     return k.get(i);
 }
 
 /// SHA-256 of bytes `data[from, to)`, as 32 big-endian bytes appended to
 /// `out`. 32-bit modular arithmetic throughout.
-@wrapping fn sha256_into(out: &mut Vec<i64>, data: &Vec<i64>, from: i64, to: i64) {
-    var h0: i64 = 0x6a09e667; var h1: i64 = 0xbb67ae85; var h2: i64 = 0x3c6ef372; var h3: i64 = 0xa54ff53a;
-    var h4: i64 = 0x510e527f; var h5: i64 = 0x9b05688c; var h6: i64 = 0x1f83d9ab; var h7: i64 = 0x5be0cd19;
+@wrapping fn sha256_into(out: & mut Vec<i64>, data: & Vec<i64>, from: i64, to: i64) {
+    var h0: i64 = 0x6a09e667;
+    var h1: i64 = 0xbb67ae85;
+    var h2: i64 = 0x3c6ef372;
+    var h3: i64 = 0xa54ff53a;
+    var h4: i64 = 0x510e527f;
+    var h5: i64 = 0x9b05688c;
+    var h6: i64 = 0x1f83d9ab;
+    var h7: i64 = 0x5be0cd19;
     var len: i64 = to - from;
     var bits: i64 = len * 8;
     // padded message as a byte Vec
     var msg: Vec<i64> = Vec::new();
     var i: i64 = from;
-    while i < to { msg.push(data.get(i) & 0xFF); i = i + 1; }
+    while i < to {
+        msg.push(data.get(i) & 0xFF);
+        i = i + 1;
+    }
     msg.push(0x80);
-    while (msg.len() % 64) != 56 { msg.push(0); }
+    while (msg.len() % 64) != 56 {
+        msg.push(0);
+    }
     var b: i64 = 7;
-    while b >= 0 { msg.push((bits >> (b * 8)) & 0xFF); b = b - 1; }
+    while b >= 0 {
+        msg.push((bits >> (b * 8)) & 0xFF);
+        b = b - 1;
+    }
     var w: Vec<i64> = Vec::new();
     var wi: i64 = 0;
-    while wi < 64 { w.push(0); wi = wi + 1; }
+    while wi < 64 {
+        w.push(0);
+        wi = wi + 1;
+    }
     var blk: i64 = 0;
     while blk < msg.len() {
         var t: i64 = 0;
@@ -1462,8 +2233,14 @@ fn sha_k(i: i64) -> i64 {
             w.set(t, (w.get(t - 16) + s0 + w.get(t - 7) + s1) & 0xFFFFFFFF);
             t = t + 1;
         }
-        var a: i64 = h0; var bb: i64 = h1; var c: i64 = h2; var d: i64 = h3;
-        var e: i64 = h4; var f: i64 = h5; var gg: i64 = h6; var hh: i64 = h7;
+        var a: i64 = h0;
+        var bb: i64 = h1;
+        var c: i64 = h2;
+        var d: i64 = h3;
+        var e: i64 = h4;
+        var f: i64 = h5;
+        var gg: i64 = h6;
+        var hh: i64 = h7;
         t = 0;
         while t < 64 {
             var S1: i64 = sha_rotr(e, 6) ^ sha_rotr(e, 11) ^ sha_rotr(e, 25);
@@ -1472,26 +2249,51 @@ fn sha_k(i: i64) -> i64 {
             var S0: i64 = sha_rotr(a, 2) ^ sha_rotr(a, 13) ^ sha_rotr(a, 22);
             var maj: i64 = (a & bb) ^ (a & c) ^ (bb & c);
             var t2: i64 = (S0 + maj) & 0xFFFFFFFF;
-            hh = gg; gg = f; f = e; e = (d + t1) & 0xFFFFFFFF;
-            d = c; c = bb; bb = a; a = (t1 + t2) & 0xFFFFFFFF;
+            hh = gg;
+            gg = f;
+            f = e;
+            e = (d + t1) & 0xFFFFFFFF;
+            d = c;
+            c = bb;
+            bb = a;
+            a = (t1 + t2) & 0xFFFFFFFF;
             t = t + 1;
         }
-        h0 = (h0 + a) & 0xFFFFFFFF; h1 = (h1 + bb) & 0xFFFFFFFF; h2 = (h2 + c) & 0xFFFFFFFF; h3 = (h3 + d) & 0xFFFFFFFF;
-        h4 = (h4 + e) & 0xFFFFFFFF; h5 = (h5 + f) & 0xFFFFFFFF; h6 = (h6 + gg) & 0xFFFFFFFF; h7 = (h7 + hh) & 0xFFFFFFFF;
+        h0 = (h0 + a) & 0xFFFFFFFF;
+        h1 = (h1 + bb) & 0xFFFFFFFF;
+        h2 = (h2 + c) & 0xFFFFFFFF;
+        h3 = (h3 + d) & 0xFFFFFFFF;
+        h4 = (h4 + e) & 0xFFFFFFFF;
+        h5 = (h5 + f) & 0xFFFFFFFF;
+        h6 = (h6 + gg) & 0xFFFFFFFF;
+        h7 = (h7 + hh) & 0xFFFFFFFF;
         blk = blk + 64;
     }
     var hs: Vec<i64> = Vec::new();
-    hs.push(h0); hs.push(h1); hs.push(h2); hs.push(h3); hs.push(h4); hs.push(h5); hs.push(h6); hs.push(h7);
+    hs.push(h0);
+    hs.push(h1);
+    hs.push(h2);
+    hs.push(h3);
+    hs.push(h4);
+    hs.push(h5);
+    hs.push(h6);
+    hs.push(h7);
     var j: i64 = 0;
     while j < 8 {
         var v: i64 = hs.get(j);
-        out.push((v >> 24) & 0xFF); out.push((v >> 16) & 0xFF); out.push((v >> 8) & 0xFF); out.push(v & 0xFF);
+        out.push((v >> 24) & 0xFF);
+        out.push((v >> 16) & 0xFF);
+        out.push((v >> 8) & 0xFF);
+        out.push(v & 0xFF);
         j = j + 1;
     }
 }
 
-fn nat_be_u32(out: &mut Vec<i64>, v: i64) {
-    out.push((v >> 24) & 0xFF); out.push((v >> 16) & 0xFF); out.push((v >> 8) & 0xFF); out.push(v & 0xFF);
+fn nat_be_u32(out: & mut Vec<i64>, v: i64) {
+    out.push((v >> 24) & 0xFF);
+    out.push((v >> 16) & 0xFF);
+    out.push((v >> 8) & 0xFF);
+    out.push(v & 0xFF);
 }
 
 /// Round `v` up to a multiple of `n`.
@@ -1499,23 +2301,30 @@ fn nat_round(v: i64, n: i64) -> i64 {
     return (v + n - 1) / n * n;
 }
 
-fn nat_put_u64_be(out: &mut Vec<i64>, v: i64) {
+fn nat_put_u64_be(out: & mut Vec<i64>, v: i64) {
     var b: i64 = 7;
-    while b >= 0 { out.push((v >> (b * 8)) & 0xFF); b = b - 1; }
+    while b >= 0 {
+        out.push((v >> (b * 8)) & 0xFF);
+        b = b - 1;
+    }
 }
 
-fn nat_macho_name16(out: &mut Vec<i64>, name: str) {
+fn nat_macho_name16(out: & mut Vec<i64>, name: str) {
     var i: i64 = 0;
     while i < 16 {
-        if i < str_len(name) { out.push(str_byte_at(name, i)); } else { out.push(0); }
+        if i < str_len(name) {
+            out.push(str_byte_at(name, i));
+        } else {
+            out.push(0);
+        }
         i = i + 1;
     }
 }
 
 /// One LC_SEGMENT_64 header (nsects section headers follow).
-fn nat_macho_seg(out: &mut Vec<i64>, name: str, vmaddr: i64, vmsize: i64, fileoff: i64,
-                 filesize: i64, maxprot: i64, initprot: i64, nsects: i64) {
-    nat_put_u32(out, 0x19);                                    // LC_SEGMENT_64
+fn nat_macho_seg(out: & mut Vec<i64>, name: str, vmaddr: i64, vmsize: i64, fileoff: i64, filesize: i64, maxprot: i64, initprot: i64, nsects: i64) {
+    nat_put_u32(out, 0x19);
+    // LC_SEGMENT_64
     nat_put_u32(out, 72 + 80 * nsects);
     nat_macho_name16(out, name);
     nat_put_u64(out, vmaddr);
@@ -1525,50 +2334,74 @@ fn nat_macho_seg(out: &mut Vec<i64>, name: str, vmaddr: i64, vmsize: i64, fileof
     nat_put_u32(out, maxprot);
     nat_put_u32(out, initprot);
     nat_put_u32(out, nsects);
-    nat_put_u32(out, 0);                                       // flags
+    nat_put_u32(out, 0);
+    // flags
 }
 
-fn nat_macho_sect(out: &mut Vec<i64>, sect: str, seg: str, addr: i64, size: i64, offset: i64,
-                  align: i64, flags: i64) {
+fn nat_macho_sect(out: & mut Vec<i64>, sect: str, seg: str, addr: i64, size: i64, offset: i64, align: i64, flags: i64) {
     nat_macho_name16(out, sect);
     nat_macho_name16(out, seg);
     nat_put_u64(out, addr);
     nat_put_u64(out, size);
     nat_put_u32(out, offset);
     nat_put_u32(out, align);
-    nat_put_u32(out, 0);                                       // reloff
-    nat_put_u32(out, 0);                                       // nreloc
+    nat_put_u32(out, 0);
+    // reloff
+    nat_put_u32(out, 0);
+    // nreloc
     nat_put_u32(out, flags);
-    nat_put_u32(out, 0);                                       // reserved1
-    nat_put_u32(out, 0);                                       // reserved2
-    nat_put_u32(out, 0);                                       // reserved3
+    nat_put_u32(out, 0);
+    // reserved1
+    nat_put_u32(out, 0);
+    // reserved2
+    nat_put_u32(out, 0);
+    // reserved3
 }
 
-fn nat_macho_dylinker(out: &mut Vec<i64>) {
+fn nat_macho_dylinker(out: & mut Vec<i64>) {
     var path: str = "/usr/lib/dyld";
     var cmdsize: i64 = nat_round(12 + str_len(path) + 1, 8);
-    nat_put_u32(out, 0xE);                                     // LC_LOAD_DYLINKER
+    nat_put_u32(out, 0xE);
+    // LC_LOAD_DYLINKER
     nat_put_u32(out, cmdsize);
-    nat_put_u32(out, 12);                                      // name offset
+    nat_put_u32(out, 12);
+    // name offset
     var i: i64 = 0;
-    while i < str_len(path) { out.push(str_byte_at(path, i)); i = i + 1; }
+    while i < str_len(path) {
+        out.push(str_byte_at(path, i));
+        i = i + 1;
+    }
     i = 12 + str_len(path);
-    while i < cmdsize { out.push(0); i = i + 1; }
+    while i < cmdsize {
+        out.push(0);
+        i = i + 1;
+    }
 }
 
-fn nat_macho_dylib(out: &mut Vec<i64>) {
+fn nat_macho_dylib(out: & mut Vec<i64>) {
     var path: str = "/usr/lib/libSystem.B.dylib";
     var cmdsize: i64 = nat_round(24 + str_len(path) + 1, 8);
-    nat_put_u32(out, 0xC);                                     // LC_LOAD_DYLIB
+    nat_put_u32(out, 0xC);
+    // LC_LOAD_DYLIB
     nat_put_u32(out, cmdsize);
-    nat_put_u32(out, 24);                                      // name offset
-    nat_put_u32(out, 2);                                       // timestamp
-    nat_put_u32(out, 0x10000);                                 // current version
-    nat_put_u32(out, 0x10000);                                 // compat version
+    nat_put_u32(out, 24);
+    // name offset
+    nat_put_u32(out, 2);
+    // timestamp
+    nat_put_u32(out, 0x10000);
+    // current version
+    nat_put_u32(out, 0x10000);
+    // compat version
     var i: i64 = 0;
-    while i < str_len(path) { out.push(str_byte_at(path, i)); i = i + 1; }
+    while i < str_len(path) {
+        out.push(str_byte_at(path, i));
+        i = i + 1;
+    }
     i = 24 + str_len(path);
-    while i < cmdsize { out.push(0); i = i + 1; }
+    while i < cmdsize {
+        out.push(0);
+        i = i + 1;
+    }
 }
 
 /// A 64-bit Mach-O executable. `image` is the contiguous code+data blob
@@ -1577,10 +2410,11 @@ fn nat_macho_dylib(out: &mut Vec<i64>) {
 /// words (each >= data_off); `imp_names` the libSystem symbols and
 /// `imp_offs` their GOT slot offsets in the image (each >= data_off).
 /// g_nat_abs_base must already be NAT_MACHO_BASE + NAT_MACHO_HDR.
-pub fn nat_macho(arch: i64, image: Vec<i64>, entry: i64, data_off: i64,
-                 rebase_offs: Vec<i64>, imp_names: Vec<str>, imp_offs: Vec<i64>) -> Vec<i64> {
+pub fn nat_macho(arch: i64, image: Vec<i64>, entry: i64, data_off: i64, rebase_offs: Vec<i64>, imp_names: Vec<str>, imp_offs: Vec<i64>) -> Vec<i64> {
     var page: i64 = 0x1000;
-    if arch == NAT_A64 { page = 0x4000; }
+    if arch == NAT_A64 {
+        page = 0x4000;
+    }
     var H: i64 = NAT_MACHO_HDR;
     var base: i64 = NAT_MACHO_BASE;
     var imglen: i64 = image.len();
@@ -1593,37 +2427,52 @@ pub fn nat_macho(arch: i64, image: Vec<i64>, entry: i64, data_off: i64,
     // ── dyld info: rebase then bind opcodes ──
     var rebase: Vec<i64> = Vec::new();
     if rebase_offs.len() > 0 {
-        rebase.push(0x10 | 1);                                 // SET_TYPE_IMM pointer
+        rebase.push(0x10 | 1);
+        // SET_TYPE_IMM pointer
         var ri: i64 = 0;
         while ri < rebase_offs.len() {
-            rebase.push(0x20 | 2);                             // SET_SEG_AND_OFFSET __DATA(2)
-            nat_put_uleb(&mut rebase, rebase_offs.get(ri) - data_off);
-            rebase.push(0x60);                                 // DO_REBASE_ULEB_TIMES
-            nat_put_uleb(&mut rebase, 1);
+            rebase.push(0x20 | 2);
+            // SET_SEG_AND_OFFSET __DATA(2)
+            nat_put_uleb(& mut rebase, rebase_offs.get(ri) - data_off);
+            rebase.push(0x60);
+            // DO_REBASE_ULEB_TIMES
+            nat_put_uleb(& mut rebase, 1);
             ri = ri + 1;
         }
-        rebase.push(0x00);                                     // DONE
+        rebase.push(0x00);
+        // DONE
     }
     var bind: Vec<i64> = Vec::new();
     if imp_names.len() > 0 {
-        bind.push(0x10 | 1);                                   // SET_DYLIB_ORDINAL_IMM 1
-        bind.push(0x50 | 1);                                   // SET_TYPE_IMM pointer
+        bind.push(0x10 | 1);
+        // SET_DYLIB_ORDINAL_IMM 1
+        bind.push(0x50 | 1);
+        // SET_TYPE_IMM pointer
         var bi: i64 = 0;
         while bi < imp_names.len() {
-            bind.push(0x40 | 0);                               // SET_SYMBOL_TRAILING_FLAGS_IMM
+            bind.push(0x40 | 0);
+            // SET_SYMBOL_TRAILING_FLAGS_IMM
             var nm: str = imp_names.get(bi);
             var ci: i64 = 0;
-            while ci < str_len(nm) { bind.push(str_byte_at(nm, ci)); ci = ci + 1; }
+            while ci < str_len(nm) {
+                bind.push(str_byte_at(nm, ci));
+                ci = ci + 1;
+            }
             bind.push(0);
-            bind.push(0x70 | 2);                               // SET_SEG_AND_OFFSET __DATA(2)
-            nat_put_uleb(&mut bind, imp_offs.get(bi) - data_off);
-            bind.push(0x90);                                   // DO_BIND
+            bind.push(0x70 | 2);
+            // SET_SEG_AND_OFFSET __DATA(2)
+            nat_put_uleb(& mut bind, imp_offs.get(bi) - data_off);
+            bind.push(0x90);
+            // DO_BIND
             bi = bi + 1;
         }
-        bind.push(0x00);                                       // DONE
+        bind.push(0x00);
+        // DONE
+    } while (rebase.len() % 8) != 0 {
+        rebase.push(0);
+    } while (bind.len() % 8) != 0 {
+        bind.push(0);
     }
-    while (rebase.len() % 8) != 0 { rebase.push(0); }
-    while (bind.len() % 8) != 0 { bind.push(0); }
 
     var rebase_off: i64 = le_fileoff;
     var bind_off: i64 = rebase_off + rebase.len();
@@ -1632,7 +2481,9 @@ pub fn nat_macho(arch: i64, image: Vec<i64>, entry: i64, data_off: i64,
     var stroff: i64 = symoff;
     var strtab: Vec<i64> = Vec::new();
     strtab.push(0);
-    while (strtab.len() % 8) != 0 { strtab.push(0); }
+    while (strtab.len() % 8) != 0 {
+        strtab.push(0);
+    }
     var strsize: i64 = strtab.len();
     var sig_off: i64 = nat_round(stroff + strsize, 16);
 
@@ -1641,114 +2492,190 @@ pub fn nat_macho(arch: i64, image: Vec<i64>, entry: i64, data_off: i64,
     var ident_len: i64 = str_len(ident) + 1;
     var ncode: i64 = (sig_off + 4095) / 4096;
     var cd_len: i64 = 88 + ident_len + ncode * 32;
-    var sig_len: i64 = 20 + cd_len;              // SuperBlob header 12 + one index 8
+    var sig_len: i64 = 20 + cd_len;
+    // SuperBlob header 12 + one index 8
     var file_end: i64 = sig_off + sig_len;
     var le_filelen: i64 = file_end - le_fileoff;
 
     // ── load commands ──
     var lc: Vec<i64> = Vec::new();
-    nat_macho_seg(&mut lc, "__PAGEZERO", 0, base, 0, 0, 0, 0, 0);
+    nat_macho_seg(& mut lc, "__PAGEZERO", 0, base, 0, 0, 0, 0, 0);
     var tsz: i64 = nat_round(text_fileend, page);
-    nat_macho_seg(&mut lc, "__TEXT", base, tsz, 0, text_fileend, 5, 5, 1);
-    nat_macho_sect(&mut lc, "__text", "__TEXT", base + H, data_off, H, 2, 0x80000400);
+    nat_macho_seg(& mut lc, "__TEXT", base, tsz, 0, text_fileend, 5, 5, 1);
+    nat_macho_sect(& mut lc, "__text", "__TEXT", base + H, data_off, H, 2, 0x80000400);
     var dvm: i64 = base + data_fileoff;
-    nat_macho_seg(&mut lc, "__DATA", dvm, nat_round(datalen, page), data_fileoff, data_filelen, 3, 3, 1);
-    nat_macho_sect(&mut lc, "__data", "__DATA", dvm, datalen, data_fileoff, 3, 0);
+    nat_macho_seg(& mut lc, "__DATA", dvm, nat_round(datalen, page), data_fileoff, data_filelen, 3, 3, 1);
+    nat_macho_sect(& mut lc, "__data", "__DATA", dvm, datalen, data_fileoff, 3, 0);
     var levm: i64 = base + le_fileoff;
-    nat_macho_seg(&mut lc, "__LINKEDIT", levm, nat_round(le_filelen, page), le_fileoff, le_filelen, 1, 1, 0);
+    nat_macho_seg(& mut lc, "__LINKEDIT", levm, nat_round(le_filelen, page), le_fileoff, le_filelen, 1, 1, 0);
     // LC_DYLD_INFO_ONLY
-    nat_put_u32(&mut lc, 0x80000022); nat_put_u32(&mut lc, 48);
-    nat_put_u32(&mut lc, rebase_off); nat_put_u32(&mut lc, rebase.len());
-    nat_put_u32(&mut lc, bind_off); nat_put_u32(&mut lc, bind.len());
-    nat_put_u32(&mut lc, 0); nat_put_u32(&mut lc, 0);
-    nat_put_u32(&mut lc, 0); nat_put_u32(&mut lc, 0);
-    nat_put_u32(&mut lc, 0); nat_put_u32(&mut lc, 0);
+    nat_put_u32(& mut lc, 0x80000022);
+    nat_put_u32(& mut lc, 48);
+    nat_put_u32(& mut lc, rebase_off);
+    nat_put_u32(& mut lc, rebase.len());
+    nat_put_u32(& mut lc, bind_off);
+    nat_put_u32(& mut lc, bind.len());
+    nat_put_u32(& mut lc, 0);
+    nat_put_u32(& mut lc, 0);
+    nat_put_u32(& mut lc, 0);
+    nat_put_u32(& mut lc, 0);
+    nat_put_u32(& mut lc, 0);
+    nat_put_u32(& mut lc, 0);
     // LC_SYMTAB
-    nat_put_u32(&mut lc, 0x2); nat_put_u32(&mut lc, 24);
-    nat_put_u32(&mut lc, symoff); nat_put_u32(&mut lc, nsyms);
-    nat_put_u32(&mut lc, stroff); nat_put_u32(&mut lc, strsize);
+    nat_put_u32(& mut lc, 0x2);
+    nat_put_u32(& mut lc, 24);
+    nat_put_u32(& mut lc, symoff);
+    nat_put_u32(& mut lc, nsyms);
+    nat_put_u32(& mut lc, stroff);
+    nat_put_u32(& mut lc, strsize);
     // LC_DYSYMTAB
-    nat_put_u32(&mut lc, 0xB); nat_put_u32(&mut lc, 80);
+    nat_put_u32(& mut lc, 0xB);
+    nat_put_u32(& mut lc, 80);
     var dz: i64 = 0;
-    while dz < 18 { nat_put_u32(&mut lc, 0); dz = dz + 1; }
-    nat_macho_dylinker(&mut lc);
+    while dz < 18 {
+        nat_put_u32(& mut lc, 0);
+        dz = dz + 1;
+    }
+    nat_macho_dylinker(& mut lc);
     // LC_BUILD_VERSION: macOS, minos 11.0, sdk 13.0, 0 tools
-    nat_put_u32(&mut lc, 0x32); nat_put_u32(&mut lc, 24);
-    nat_put_u32(&mut lc, 1); nat_put_u32(&mut lc, 0x000B0000); nat_put_u32(&mut lc, 0x000D0000); nat_put_u32(&mut lc, 0);
+    nat_put_u32(& mut lc, 0x32);
+    nat_put_u32(& mut lc, 24);
+    nat_put_u32(& mut lc, 1);
+    nat_put_u32(& mut lc, 0x000B0000);
+    nat_put_u32(& mut lc, 0x000D0000);
+    nat_put_u32(& mut lc, 0);
     // LC_MAIN
-    nat_put_u32(&mut lc, 0x80000028); nat_put_u32(&mut lc, 24);
-    nat_put_u64(&mut lc, H + entry); nat_put_u64(&mut lc, 0);
-    nat_macho_dylib(&mut lc);
+    nat_put_u32(& mut lc, 0x80000028);
+    nat_put_u32(& mut lc, 24);
+    nat_put_u64(& mut lc, H + entry);
+    nat_put_u64(& mut lc, 0);
+    nat_macho_dylib(& mut lc);
     // LC_CODE_SIGNATURE
-    nat_put_u32(&mut lc, 0x1D); nat_put_u32(&mut lc, 16);
-    nat_put_u32(&mut lc, sig_off); nat_put_u32(&mut lc, sig_len);
+    nat_put_u32(& mut lc, 0x1D);
+    nat_put_u32(& mut lc, 16);
+    nat_put_u32(& mut lc, sig_off);
+    nat_put_u32(& mut lc, sig_len);
 
     var ncmds: i64 = 12;
     var sizeofcmds: i64 = lc.len();
-    if 32 + sizeofcmds > H { return Vec::new(); }
+    if 32 + sizeofcmds > H {
+        return Vec::new();
+    }
 
     // ── assemble ──
     var out: Vec<i64> = Vec::new();
-    nat_put_u32(&mut out, 0xFEEDFACF);
-    if arch == NAT_A64 { nat_put_u32(&mut out, 0x0100000C); nat_put_u32(&mut out, 0); }
-    else { nat_put_u32(&mut out, 0x01000007); nat_put_u32(&mut out, 3); }
-    nat_put_u32(&mut out, 2);                                   // MH_EXECUTE
-    nat_put_u32(&mut out, ncmds);
-    nat_put_u32(&mut out, sizeofcmds);
-    nat_put_u32(&mut out, 0x00200085);                         // NOUNDEFS|DYLDLINK|TWOLEVEL|PIE
-    nat_put_u32(&mut out, 0);
+    nat_put_u32(& mut out, 0xFEEDFACF);
+    if arch == NAT_A64 {
+        nat_put_u32(& mut out, 0x0100000C);
+        nat_put_u32(& mut out, 0);
+    } else {
+        nat_put_u32(& mut out, 0x01000007);
+        nat_put_u32(& mut out, 3);
+    }
+    nat_put_u32(& mut out, 2);
+    // MH_EXECUTE
+    nat_put_u32(& mut out, ncmds);
+    nat_put_u32(& mut out, sizeofcmds);
+    nat_put_u32(& mut out, 0x00200085);
+    // NOUNDEFS|DYLDLINK|TWOLEVEL|PIE
+    nat_put_u32(& mut out, 0);
     var li: i64 = 0;
-    while li < lc.len() { out.push(lc.get(li)); li = li + 1; }
-    while out.len() < H { out.push(0); }
+    while li < lc.len() {
+        out.push(lc.get(li));
+        li = li + 1;
+    } while out.len() < H {
+        out.push(0);
+    }
     var ii: i64 = 0;
-    while ii < imglen { out.push(image.get(ii)); ii = ii + 1; }
-    while out.len() < le_fileoff { out.push(0); }
+    while ii < imglen {
+        out.push(image.get(ii));
+        ii = ii + 1;
+    } while out.len() < le_fileoff {
+        out.push(0);
+    }
     var k: i64 = 0;
-    while k < rebase.len() { out.push(rebase.get(k)); k = k + 1; }
+    while k < rebase.len() {
+        out.push(rebase.get(k));
+        k = k + 1;
+    }
     k = 0;
-    while k < bind.len() { out.push(bind.get(k)); k = k + 1; }
+    while k < bind.len() {
+        out.push(bind.get(k));
+        k = k + 1;
+    }
     k = 0;
-    while k < strtab.len() { out.push(strtab.get(k)); k = k + 1; }
-    while out.len() < sig_off { out.push(0); }
+    while k < strtab.len() {
+        out.push(strtab.get(k));
+        k = k + 1;
+    } while out.len() < sig_off {
+        out.push(0);
+    }
 
     // ── ad-hoc code signature (big-endian) over file [0, sig_off) ──
-    nat_be_u32(&mut out, 0xFADE0CC0);
-    nat_be_u32(&mut out, sig_len);
-    nat_be_u32(&mut out, 1);
-    nat_be_u32(&mut out, 0);
-    nat_be_u32(&mut out, 20);                                  // the CodeDirectory at offset 20
-    nat_be_u32(&mut out, 0xFADE0C02);
-    nat_be_u32(&mut out, cd_len);
-    nat_be_u32(&mut out, 0x00020400);
-    nat_be_u32(&mut out, 2);                                   // flags adhoc
-    nat_be_u32(&mut out, 88 + ident_len);                      // hashOffset
-    nat_be_u32(&mut out, 88);                                  // identOffset
-    nat_be_u32(&mut out, 0);                                   // nSpecialSlots
-    nat_be_u32(&mut out, ncode);                               // nCodeSlots
-    nat_be_u32(&mut out, sig_off);                             // codeLimit
-    out.push(32); out.push(2); out.push(0); out.push(12);      // hashSize, SHA256, platform, pageShift
-    nat_be_u32(&mut out, 0);                                   // spare2
-    nat_be_u32(&mut out, 0);                                   // scatterOffset
-    nat_be_u32(&mut out, 0);                                   // teamOffset
-    nat_be_u32(&mut out, 0);                                   // spare3
-    nat_put_u64_be(&mut out, 0);                               // codeLimit64
-    nat_put_u64_be(&mut out, 0);                               // execSegBase
-    nat_put_u64_be(&mut out, text_fileend);                    // execSegLimit
-    nat_put_u64_be(&mut out, 1);                               // execSegFlags MAIN_BINARY
+    nat_be_u32(& mut out, 0xFADE0CC0);
+    nat_be_u32(& mut out, sig_len);
+    nat_be_u32(& mut out, 1);
+    nat_be_u32(& mut out, 0);
+    nat_be_u32(& mut out, 20);
+    // the CodeDirectory at offset 20
+    nat_be_u32(& mut out, 0xFADE0C02);
+    nat_be_u32(& mut out, cd_len);
+    nat_be_u32(& mut out, 0x00020400);
+    nat_be_u32(& mut out, 2);
+    // flags adhoc
+    nat_be_u32(& mut out, 88 + ident_len);
+    // hashOffset
+    nat_be_u32(& mut out, 88);
+    // identOffset
+    nat_be_u32(& mut out, 0);
+    // nSpecialSlots
+    nat_be_u32(& mut out, ncode);
+    // nCodeSlots
+    nat_be_u32(& mut out, sig_off);
+    // codeLimit
+    out.push(32);
+    out.push(2);
+    out.push(0);
+    out.push(12);
+    // hashSize, SHA256, platform, pageShift
+    nat_be_u32(& mut out, 0);
+    // spare2
+    nat_be_u32(& mut out, 0);
+    // scatterOffset
+    nat_be_u32(& mut out, 0);
+    // teamOffset
+    nat_be_u32(& mut out, 0);
+    // spare3
+    nat_put_u64_be(& mut out, 0);
+    // codeLimit64
+    nat_put_u64_be(& mut out, 0);
+    // execSegBase
+    nat_put_u64_be(& mut out, text_fileend);
+    // execSegLimit
+    nat_put_u64_be(& mut out, 1);
+    // execSegFlags MAIN_BINARY
     var idc: i64 = 0;
-    while idc < str_len(ident) { out.push(str_byte_at(ident, idc)); idc = idc + 1; }
+    while idc < str_len(ident) {
+        out.push(str_byte_at(ident, idc));
+        idc = idc + 1;
+    }
     out.push(0);
     // Hash from a copy of the signed prefix (the signature cannot borrow
     // `out` mutably and immutably at once).
     var body: Vec<i64> = Vec::new();
     var bj: i64 = 0;
-    while bj < sig_off { body.push(out.get(bj)); bj = bj + 1; }
+    while bj < sig_off {
+        body.push(out.get(bj));
+        bj = bj + 1;
+    }
     var pg: i64 = 0;
     while pg < ncode {
         var lo: i64 = pg * 4096;
         var hi: i64 = lo + 4096;
-        if hi > sig_off { hi = sig_off; }
-        sha256_into(&mut out, &body, lo, hi);
+        if hi > sig_off {
+            hi = sig_off;
+        }
+        sha256_into(& mut out, & body, lo, hi);
         pg = pg + 1;
     }
     return out;

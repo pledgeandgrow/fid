@@ -24,19 +24,10 @@
 //   a struct by value, va_list, `...`  not expressible yet: skipped
 
 module compiler::cparser;
-
-use core;
-use vec;
-use string;
-
+ use core; use vec; use string;
 // --- Token kinds ----------------------------------------------------------
 
-const CTK_IDENT: i64 = 1;
-const CTK_NUM: i64 = 2;
-const CTK_PUNCT: i64 = 3;
-const CTK_STR: i64 = 4;
-const CTK_CHAR: i64 = 5;
-
+const CTK_IDENT: i64 = 1; const CTK_NUM: i64 = 2; const CTK_PUNCT: i64 = 3; const CTK_STR: i64 = 4; const CTK_CHAR: i64 = 5;
 /// The state of one parse: macros, headers read, the code, the types seen.
 pub struct CHeaderState {
     // Macros: name -> 1 + index
@@ -70,25 +61,7 @@ pub struct CHeaderState {
 
 pub fn CHeaderState_new() -> CHeaderState {
     return CHeaderState {
-        macro_index: HashMap_new(),
-        macro_names: Vec::new(),
-        macro_bodies: Vec::new(),
-        macro_params: Vec::new(),
-        macro_noise: Vec::new(),
-        included: Vec::new(),
-        code: StringBuilder::new(),
-        toks: Vec::new(),
-        kinds: Vec::new(),
-        td_index: HashMap_new(),
-        td_names: Vec::new(),
-        td_base: Vec::new(),
-        td_ptr: Vec::new(),
-        const_index: HashMap_new(),
-        const_names: Vec::new(),
-        const_values: Vec::new(),
-        fn_index: HashMap_new(),
-        fn_lines: Vec::new(),
-        skipped: Vec::new(),
+        macro_index: HashMap_new(), macro_names: Vec::new(), macro_bodies: Vec::new(), macro_params: Vec::new(), macro_noise: Vec::new(), included: Vec::new(), code: StringBuilder::new(), toks: Vec::new(), kinds: Vec::new(), td_index: HashMap_new(), td_names: Vec::new(), td_base: Vec::new(), td_ptr: Vec::new(), const_index: HashMap_new(), const_names: Vec::new(), const_values: Vec::new(), fn_index: HashMap_new(), fn_lines: Vec::new(), skipped: Vec::new(),
     };
 }
 
@@ -99,12 +72,12 @@ pub fn CHeaderState_new() -> CHeaderState {
 /// becomes the `module` line ("" for none).
 pub fn cparse_header_file(path: str, link: str, module_name: str) -> str {
     var st: CHeaderState = CHeaderState_new();
-    cp_load_file(&mut st, path);
+    cp_load_file(& mut st, path);
     var code: str = st.code.to_str();
-    cp_tokenize(&mut st, code);
-    cp_parse_decls(&mut st);
-    cp_collect_define_consts(&mut st);
-    return cp_render(&mut st, path, link, module_name);
+    cp_tokenize(& mut st, code);
+    cp_parse_decls(& mut st);
+    cp_collect_define_consts(& mut st);
+    return cp_render(& mut st, path, link, module_name);
 }
 
 // --- Small string helpers -------------------------------------------------
@@ -129,7 +102,9 @@ fn cp_dir_of(path: str) -> str {
     var i: i64 = str_len(path) - 1;
     while i >= 0 {
         var c: i64 = str_byte_at(path, i);
-        if c == 47 || c == 92 { return str_slice(path, 0, i + 1); }
+        if c == 47 || c == 92 {
+            return str_slice(path, 0, i + 1);
+        }
         i = i - 1;
     }
     return "";
@@ -143,7 +118,9 @@ fn cp_base_name(path: str) -> str {
 fn cp_strs_has(v: Vec<str>, s: str) -> bool {
     var i: i64 = 0;
     while i < v.len() {
-        if v.get(i) == s { return true; }
+        if v.get(i) == s {
+            return true;
+        }
         i = i + 1;
     }
     return false;
@@ -156,19 +133,24 @@ fn cp_strip(src: str) -> str {
     var out: StringBuilder = StringBuilder::new();
     var n: i64 = str_len(src);
     var i: i64 = 0;
-    var run: i64 = 0; // start of the text not yet copied
+    var run: i64 = 0;
+    // start of the text not yet copied
     while i < n {
         var c: i64 = str_byte_at(src, i);
         if c == 47 && i + 1 < n && str_byte_at(src, i + 1) == 47 {
             out.append_str(str_slice_len(src, n, run, i));
-            while i < n && str_byte_at(src, i) != 10 { i = i + 1; }
+            while i < n && str_byte_at(src, i) != 10 {
+                i = i + 1;
+            }
             run = i;
         } else if c == 47 && i + 1 < n && str_byte_at(src, i + 1) == 42 {
             out.append_str(str_slice_len(src, n, run, i));
             i = i + 2;
             while i + 1 < n && !(str_byte_at(src, i) == 42 && str_byte_at(src, i + 1) == 47) {
                 // keep line breaks, so directives stay on their own lines
-                if str_byte_at(src, i) == 10 { out.append_str("\n"); }
+                if str_byte_at(src, i) == 10 {
+                    out.append_str("\n");
+                }
                 i = i + 1;
             }
             i = i + 2;
@@ -178,28 +160,39 @@ fn cp_strip(src: str) -> str {
             // a string or character literal: copied as it is
             i = i + 1;
             while i < n && str_byte_at(src, i) != c && str_byte_at(src, i) != 10 {
-                if str_byte_at(src, i) == 92 { i = i + 1; }
+                if str_byte_at(src, i) == 92 {
+                    i = i + 1;
+                }
                 i = i + 1;
             }
             i = i + 1;
-        } else if c == 92 && i + 1 < n && (str_byte_at(src, i + 1) == 10
-            || (str_byte_at(src, i + 1) == 13 && i + 2 < n && str_byte_at(src, i + 2) == 10)) {
+        } else if c == 92 && i + 1 < n && (str_byte_at(src, i + 1) == 10 || (str_byte_at(src, i + 1) == 13 && i + 2 < n && str_byte_at(src, i + 2) == 10)) {
             out.append_str(str_slice_len(src, n, run, i));
-            if str_byte_at(src, i + 1) == 13 { i = i + 3; } else { i = i + 2; }
+            if str_byte_at(src, i + 1) == 13 {
+                i = i + 3;
+            } else {
+                i = i + 2;
+            }
             run = i;
         } else {
             i = i + 1;
         }
     }
-    if run < n { out.append_str(str_slice_len(src, n, run, n)); }
+    if run < n {
+        out.append_str(str_slice_len(src, n, run, n));
+    }
     return out.to_str();
 }
 
-fn cp_load_file(st: &mut CHeaderState, path: str) {
-    if cp_strs_has(st.included, path) { return; }
+fn cp_load_file(st: & mut CHeaderState, path: str) {
+    if cp_strs_has(st.included, path) {
+        return;
+    }
     st.included.push(path);
     var src: str = p_file_read(path);
-    if (src as i64) == 0 { return; }
+    if (src as i64) == 0 {
+        return;
+    }
     var text: str = cp_strip(src);
     var dir: str = cp_dir_of(path);
     var lines: Vec<str> = str_lines(text);
@@ -228,33 +221,43 @@ fn cp_load_file(st: &mut CHeaderState, path: str) {
 }
 
 /// `#define NAME body` or `#define NAME(a, b) body`: the first definition wins.
-fn cp_add_define(st: &mut CHeaderState, d: str) {
+fn cp_add_define(st: & mut CHeaderState, d: str) {
     var n: i64 = str_len(d);
     var i: i64 = 0;
-    while i < n && cp_is_ident_char(str_byte_at(d, i)) { i = i + 1; }
-    if i == 0 { return; }
+    while i < n && cp_is_ident_char(str_byte_at(d, i)) {
+        i = i + 1;
+    }
+    if i == 0 {
+        return;
+    }
     var name: str = str_slice_len(d, n, 0, i);
     var params: str = "";
     if i < n && str_byte_at(d, i) == 40 {
         var close: i64 = i;
-        while close < n && str_byte_at(d, close) != 41 { close = close + 1; }
+        while close < n && str_byte_at(d, close) != 41 {
+            close = close + 1;
+        }
         var plist: str = str_trim(str_slice_len(d, n, i + 1, close));
         params = "()";
-        if str_len(plist) > 0 { params = str_replace(str_replace(plist, " ", ""), "\t", ""); }
+        if str_len(plist) > 0 {
+            params = str_replace(str_replace(plist, " ", ""), "\t", "");
+        }
         i = close + 1;
     }
     var body: str = str_trim(str_slice_len(d, n, i, n));
-    if HashMap_contains(st.macro_index, name) { return; }
+    if HashMap_contains(st.macro_index, name) {
+        return;
+    }
     st.macro_names.push(name);
     st.macro_bodies.push(body);
     st.macro_params.push(params);
-    st.macro_noise.push(-1);
+    st.macro_noise.push(- 1);
     HashMap_insert(st.macro_index, name, st.macro_names.len());
 }
 
 // --- Tokenizer ------------------------------------------------------------
 
-fn cp_tokens_of(text: str, toks: &mut Vec<str>, kinds: &mut Vec<i64>) {
+fn cp_tokens_of(text: str, toks: & mut Vec<str>, kinds: & mut Vec<i64>) {
     var n: i64 = str_len(text);
     var i: i64 = 0;
     while i < n {
@@ -263,33 +266,45 @@ fn cp_tokens_of(text: str, toks: &mut Vec<str>, kinds: &mut Vec<i64>) {
             i = i + 1;
         } else if cp_is_ident_start(c) {
             var s: i64 = i;
-            while i < n && cp_is_ident_char(str_byte_at(text, i)) { i = i + 1; }
+            while i < n && cp_is_ident_char(str_byte_at(text, i)) {
+                i = i + 1;
+            }
             toks.push(str_slice_len(text, n, s, i));
             kinds.push(CTK_IDENT);
         } else if cp_is_digit(c) || (c == 46 && i + 1 < n && cp_is_digit(str_byte_at(text, i + 1))) {
             var s2: i64 = i;
-            while i < n && (cp_is_ident_char(str_byte_at(text, i)) || str_byte_at(text, i) == 46) { i = i + 1; }
+            while i < n && (cp_is_ident_char(str_byte_at(text, i)) || str_byte_at(text, i) == 46) {
+                i = i + 1;
+            }
             toks.push(str_slice_len(text, n, s2, i));
             kinds.push(CTK_NUM);
         } else if c == 34 || c == 39 {
             var s3: i64 = i;
             i = i + 1;
             while i < n && str_byte_at(text, i) != c {
-                if str_byte_at(text, i) == 92 { i = i + 1; }
+                if str_byte_at(text, i) == 92 {
+                    i = i + 1;
+                }
                 i = i + 1;
             }
             i = i + 1;
             toks.push(str_slice_len(text, n, s3, i));
-            if c == 34 { kinds.push(CTK_STR); } else { kinds.push(CTK_CHAR); }
+            if c == 34 {
+                kinds.push(CTK_STR);
+            } else {
+                kinds.push(CTK_CHAR);
+            }
         } else {
             var two: str = str_slice_len(text, n, i, i + 2);
             if str_slice_len(text, n, i, i + 3) == "..." {
-                toks.push("..."); i = i + 3;
-            } else if two == "<<" || two == ">>" || two == "==" || two == "!=" || two == "<="
-                || two == ">=" || two == "&&" || two == "||" || two == "->" || two == "##" {
-                toks.push(two); i = i + 2;
+                toks.push("...");
+                i = i + 3;
+            } else if two == "<<" || two == ">>" || two == "==" || two == "!=" || two == "<=" || two == ">=" || two == "&&" || two == "||" || two == "->" || two == "##" {
+                toks.push(two);
+                i = i + 2;
             } else {
-                toks.push(str_slice_len(text, n, i, i + 1)); i = i + 1;
+                toks.push(str_slice_len(text, n, i, i + 1));
+                i = i + 1;
             }
             kinds.push(CTK_PUNCT);
         }
@@ -298,10 +313,10 @@ fn cp_tokens_of(text: str, toks: &mut Vec<str>, kinds: &mut Vec<i64>) {
 
 /// Tokens of the code, with noise macros (and the groups after them)
 /// dropped, and `extern "C" {` wrappers removed.
-fn cp_tokenize(st: &mut CHeaderState, code: str) {
+fn cp_tokenize(st: & mut CHeaderState, code: str) {
     var raw: Vec<str> = Vec::new();
     var rk: Vec<i64> = Vec::new();
-    cp_tokens_of(code, &mut raw, &mut rk);
+    cp_tokens_of(code, & mut raw, & mut rk);
     var depth: i64 = 0;
     var i: i64 = 0;
     while i < raw.len() {
@@ -314,21 +329,33 @@ fn cp_tokenize(st: &mut CHeaderState, code: str) {
         if k == CTK_IDENT && (cp_is_noise_word(t) || cp_macro_is_noise(st, t)) {
             // An attribute group after it goes too: __declspec(x), NAME(args)
             i = i + 1;
-            if i < raw.len() && raw.get(i) == "(" && (t == "__declspec" || t == "__attribute__"
-                || t == "__attribute" || cp_macro_is_fn(st, t) || t == "_Pragma" || t == "__pragma"
-                || t == "__asm__" || t == "__asm" || t == "_Alignas" || t == "__declspec") {
+            if i < raw.len() && raw.get(i) == "(" && (t == "__declspec" || t == "__attribute__" || t == "__attribute" || cp_macro_is_fn(st, t) || t == "_Pragma" || t == "__pragma" || t == "__asm__" || t == "__asm" || t == "_Alignas" || t == "__declspec") {
                 var pd: i64 = 0;
                 while i < raw.len() {
-                    if raw.get(i) == "(" { pd = pd + 1; }
-                    if raw.get(i) == ")" { pd = pd - 1; if pd == 0 { i = i + 1; break; } }
+                    if raw.get(i) == "(" {
+                        pd = pd + 1;
+                    }
+                    if raw.get(i) == ")" {
+                        pd = pd - 1;
+                        if pd == 0 {
+                            i = i + 1;
+                            break;
+                        }
+                    }
                     i = i + 1;
                 }
             }
             continue;
         }
-        if t == "{" { depth = depth + 1; }
+        if t == "{" {
+            depth = depth + 1;
+        }
         if t == "}" {
-            if depth == 0 { i = i + 1; continue; } // the end of `extern "C" {`
+            if depth == 0 {
+                i = i + 1;
+                continue;
+            }
+            // the end of `extern "C" {`
             depth = depth - 1;
         }
         st.toks.push(t);
@@ -339,54 +366,58 @@ fn cp_tokenize(st: &mut CHeaderState, code: str) {
 
 /// Words that never matter to a binding.
 fn cp_is_noise_word(t: str) -> bool {
-    return t == "extern" || t == "__declspec" || t == "__attribute__" || t == "__attribute"
-        || t == "__cdecl" || t == "__stdcall" || t == "__fastcall" || t == "__vectorcall"
-        || t == "__inline" || t == "__inline__" || t == "inline" || t == "__forceinline"
-        || t == "__extension__" || t == "restrict" || t == "__restrict" || t == "__restrict__"
-        || t == "const" || t == "volatile" || t == "register" || t == "_Printf_format_string_"
-        || t == "__unaligned" || t == "__ptr64" || t == "__ptr32" || t == "_Noreturn"
-        || t == "__cdecl__" || t == "_Pragma" || t == "__pragma" || t == "__asm__" || t == "__asm"
-        || t == "_Alignas" || t == "WINAPI" || t == "APIENTRY" || t == "CALLBACK";
+    return t == "extern" || t == "__declspec" || t == "__attribute__" || t == "__attribute" || t == "__cdecl" || t == "__stdcall" || t == "__fastcall" || t == "__vectorcall" || t == "__inline" || t == "__inline__" || t == "inline" || t == "__forceinline" || t == "__extension__" || t == "restrict" || t == "__restrict" || t == "__restrict__" || t == "const" || t == "volatile" || t == "register" || t == "_Printf_format_string_" || t == "__unaligned" || t == "__ptr64" || t == "__ptr32" || t == "_Noreturn" || t == "__cdecl__" || t == "_Pragma" || t == "__pragma" || t == "__asm__" || t == "__asm" || t == "_Alignas" || t == "WINAPI" || t == "APIENTRY" || t == "CALLBACK";
 }
 
-fn cp_macro_at(st: &CHeaderState, name: str) -> i64 {
+fn cp_macro_at(st: & CHeaderState, name: str) -> i64 {
     return HashMap_get(st.macro_index, name) - 1;
 }
 
-fn cp_macro_is_fn(st: &CHeaderState, name: str) -> bool {
+fn cp_macro_is_fn(st: & CHeaderState, name: str) -> bool {
     var m: i64 = cp_macro_at(st, name);
     return m >= 0 && st.macro_params.get(m) != "";
 }
 
 /// A macro is noise when its body, macros expanded, holds only noise words,
 /// attribute groups and other noise macros (or nothing).
-fn cp_macro_is_noise(st: &mut CHeaderState, name: str) -> bool {
+fn cp_macro_is_noise(st: & mut CHeaderState, name: str) -> bool {
     var m: i64 = cp_macro_at(st, name);
-    if m < 0 { return false; }
+    if m < 0 {
+        return false;
+    }
     var known: i64 = st.macro_noise.get(m);
-    if known >= 0 { return known == 1; }
-    st.macro_noise.set(m, 0); // a cycle is not noise
+    if known >= 0 {
+        return known == 1;
+    }
+    st.macro_noise.set(m, 0);
+    // a cycle is not noise
     var toks: Vec<str> = Vec::new();
     var kinds: Vec<i64> = Vec::new();
-    cp_tokens_of(st.macro_bodies.get(m), &mut toks, &mut kinds);
+    cp_tokens_of(st.macro_bodies.get(m), & mut toks, & mut kinds);
     var noise: bool = true;
     var depth: i64 = 0;
     var i: i64 = 0;
     while i < toks.len() && noise {
         var t: str = toks.get(i);
         if depth > 0 {
-            if t == "(" { depth = depth + 1; }
-            if t == ")" { depth = depth - 1; }
+            if t == "(" {
+                depth = depth + 1;
+            }
+            if t == ")" {
+                depth = depth - 1;
+            }
         } else if t == "(" && i > 0 {
-            depth = 1; // the argument group of an attribute
-        } else if kinds.get(i) == CTK_IDENT && (cp_is_noise_word(t) || cp_macro_is_noise(st, t)) {
-            // fine
+            depth = 1;
+            // the argument group of an attribute
+        } else if kinds.get(i) == CTK_IDENT && (cp_is_noise_word(t) || cp_macro_is_noise(st, t)) {  // fine
         } else {
             noise = false;
         }
         i = i + 1;
     }
-    if noise { st.macro_noise.set(m, 1); }
+    if noise {
+        st.macro_noise.set(m, 1);
+    }
     return noise;
 }
 
@@ -394,21 +425,32 @@ fn cp_macro_is_noise(st: &mut CHeaderState, name: str) -> bool {
 
 /// Split the tokens into declarations at `;` (outside brackets); function
 /// bodies end a declaration and are skipped.
-fn cp_parse_decls(st: &mut CHeaderState) {
+fn cp_parse_decls(st: & mut CHeaderState) {
     var start: i64 = 0;
     var depth: i64 = 0;
     var i: i64 = 0;
     while i < st.toks.len() {
         var t: str = st.toks.get(i);
-        if t == "(" || t == "[" { depth = depth + 1; }
-        if t == ")" || t == "]" { depth = depth - 1; }
+        if t == "(" || t == "[" {
+            depth = depth + 1;
+        }
+        if t == ")" || t == "]" {
+            depth = depth - 1;
+        }
         if t == "{" && depth == 0 {
             // a function definition: `) {` -- skip its body
             if i > start && st.toks.get(i - 1) == ")" {
                 var bd: i64 = 0;
                 while i < st.toks.len() {
-                    if st.toks.get(i) == "{" { bd = bd + 1; }
-                    if st.toks.get(i) == "}" { bd = bd - 1; if bd == 0 { break; } }
+                    if st.toks.get(i) == "{" {
+                        bd = bd + 1;
+                    }
+                    if st.toks.get(i) == "}" {
+                        bd = bd - 1;
+                        if bd == 0 {
+                            break;
+                        }
+                    }
                     i = i + 1;
                 }
                 start = i + 1;
@@ -418,66 +460,93 @@ fn cp_parse_decls(st: &mut CHeaderState) {
             // a struct, union or enum body: up to its `}`
             var bd2: i64 = 0;
             while i < st.toks.len() {
-                if st.toks.get(i) == "{" { bd2 = bd2 + 1; }
-                if st.toks.get(i) == "}" { bd2 = bd2 - 1; if bd2 == 0 { break; } }
+                if st.toks.get(i) == "{" {
+                    bd2 = bd2 + 1;
+                }
+                if st.toks.get(i) == "}" {
+                    bd2 = bd2 - 1;
+                    if bd2 == 0 {
+                        break;
+                    }
+                }
                 i = i + 1;
             }
             i = i + 1;
             continue;
         }
         if t == ";" && depth == 0 {
-            if i > start { cp_decl(st, start, i); }
+            if i > start {
+                cp_decl(st, start, i);
+            }
             start = i + 1;
         }
         i = i + 1;
     }
 }
 
-fn cp_decl(st: &mut CHeaderState, a: i64, b: i64) {
+fn cp_decl(st: & mut CHeaderState, a: i64, b: i64) {
     var first: str = st.toks.get(a);
     if first == "typedef" {
         cp_typedef(st, a + 1, b);
         return;
     }
-    if first == "static" { return; }
+    if first == "static" {
+        return;
+    }
     if first == "struct" || first == "union" || first == "enum" {
         var brace: i64 = cp_find(st, a, b, "{");
         if brace >= 0 {
-            if first == "enum" { cp_enum_body(st, brace); }
-            return; // `struct X { .. };` -- a variable after it is not kept
+            if first == "enum" {
+                cp_enum_body(st, brace);
+            }
+            return;
+            // `struct X { .. };` -- a variable after it is not kept
         }
     }
     cp_function(st, a, b);
 }
 
 /// Index of token `t` in [a, b), or -1.
-fn cp_find(st: &CHeaderState, a: i64, b: i64, t: str) -> i64 {
+fn cp_find(st: & CHeaderState, a: i64, b: i64, t: str) -> i64 {
     var i: i64 = a;
     while i < b {
-        if st.toks.get(i) == t { return i; }
+        if st.toks.get(i) == t {
+            return i;
+        }
         i = i + 1;
     }
-    return -1;
+    return - 1;
 }
 
 /// The index of the bracket closing the one at `open`.
-fn cp_close_of(st: &CHeaderState, open: i64) -> i64 {
+fn cp_close_of(st: & CHeaderState, open: i64) -> i64 {
     var o: str = st.toks.get(open);
     var c: str = ")";
-    if o == "{" { c = "}"; }
-    if o == "[" { c = "]"; }
+    if o == "{" {
+        c = "}";
+    }
+    if o == "[" {
+        c = "]";
+    }
     var depth: i64 = 0;
     var i: i64 = open;
     while i < st.toks.len() {
         var t: str = st.toks.get(i);
-        if t == o { depth = depth + 1; }
-        if t == c { depth = depth - 1; if depth == 0 { return i; } }
+        if t == o {
+            depth = depth + 1;
+        }
+        if t == c {
+            depth = depth - 1;
+            if depth == 0 {
+                return i;
+            }
+        }
         i = i + 1;
     }
     return st.toks.len() - 1;
 }
 
-fn cp_enum_body(st: &mut CHeaderState, brace: i64) {
+fn cp_enum_body(st: & mut CHeaderState, brace: i64) {
     var close: i64 = cp_close_of(st, brace);
     var next: i64 = 0;
     var next_ok: bool = true;
@@ -487,8 +556,12 @@ fn cp_enum_body(st: &mut CHeaderState, brace: i64) {
         var e: i64 = i;
         var depth: i64 = 0;
         while e < close && !(depth == 0 && st.toks.get(e) == ",") {
-            if st.toks.get(e) == "(" { depth = depth + 1; }
-            if st.toks.get(e) == ")" { depth = depth - 1; }
+            if st.toks.get(e) == "(" {
+                depth = depth + 1;
+            }
+            if st.toks.get(e) == ")" {
+                depth = depth - 1;
+            }
             e = e + 1;
         }
         if e > i && st.kinds.get(i) == CTK_IDENT {
@@ -497,30 +570,40 @@ fn cp_enum_body(st: &mut CHeaderState, brace: i64) {
                 var vt: Vec<str> = Vec::new();
                 var vk: Vec<i64> = Vec::new();
                 var j: i64 = i + 2;
-                while j < e { vt.push(st.toks.get(j)); vk.push(st.kinds.get(j)); j = j + 1; }
+                while j < e {
+                    vt.push(st.toks.get(j));
+                    vk.push(st.kinds.get(j));
+                    j = j + 1;
+                }
                 var r: CpEval = cp_eval_tokens(st, vt, vk, 0);
                 next_ok = r.ok;
                 next = r.value;
             }
-            if next_ok { cp_add_const(st, name, next); }
+            if next_ok {
+                cp_add_const(st, name, next);
+            }
             next = next + 1;
         }
         i = e + 1;
     }
 }
 
-fn cp_add_const(st: &mut CHeaderState, name: str, value: i64) {
-    if HashMap_contains(st.const_index, name) { return; }
+fn cp_add_const(st: & mut CHeaderState, name: str, value: i64) {
+    if HashMap_contains(st.const_index, name) {
+        return;
+    }
     st.const_names.push(name);
     st.const_values.push(value);
     HashMap_insert(st.const_index, name, st.const_names.len());
 }
 
-fn cp_add_typedef(st: &mut CHeaderState, name: str, base: str, ptr: i64) {
+fn cp_add_typedef(st: & mut CHeaderState, name: str, base: str, ptr: i64) {
     var at: i64 = HashMap_get(st.td_index, name) - 1;
     if at >= 0 {
         // the first one that resolves wins
-        if cp_resolve(st, st.td_base.get(at), st.td_ptr.get(at), 0) != "?" { return; }
+        if cp_resolve(st, st.td_base.get(at), st.td_ptr.get(at), 0) != "?" {
+            return;
+        }
         st.td_base.set(at, base);
         st.td_ptr.set(at, ptr);
         return;
@@ -532,20 +615,29 @@ fn cp_add_typedef(st: &mut CHeaderState, name: str, base: str, ptr: i64) {
 }
 
 /// `typedef ...` in [a, b).
-fn cp_typedef(st: &mut CHeaderState, a: i64, b: i64) {
-    if a >= b { return; }
+fn cp_typedef(st: & mut CHeaderState, a: i64, b: i64) {
+    if a >= b {
+        return;
+    }
     var first: str = st.toks.get(a);
     // typedef struct|union|enum TAG? { ... } NAMES  /  typedef struct TAG NAMES
     if first == "struct" || first == "union" || first == "enum" {
         var tag: str = "";
         var p: i64 = a + 1;
-        if p < b && st.kinds.get(p) == CTK_IDENT { tag = st.toks.get(p); p = p + 1; }
+        if p < b && st.kinds.get(p) == CTK_IDENT {
+            tag = st.toks.get(p);
+            p = p + 1;
+        }
         if p < b && st.toks.get(p) == "{" {
-            if first == "enum" { cp_enum_body(st, p); }
+            if first == "enum" {
+                cp_enum_body(st, p);
+            }
             p = cp_close_of(st, p) + 1;
         }
         var base: str = first + " " + tag;
-        if first == "enum" { base = "enum"; }
+        if first == "enum" {
+            base = "enum";
+        }
         cp_typedef_declarators(st, p, b, base, 0);
         return;
     }
@@ -564,49 +656,71 @@ fn cp_typedef(st: &mut CHeaderState, a: i64, b: i64) {
     // identifier of the first declarator
     var comma: i64 = cp_find(st, a, b, ",");
     var end1: i64 = b;
-    if comma >= 0 { end1 = comma; }
+    if comma >= 0 {
+        end1 = comma;
+    }
     var nm: i64 = end1 - 1;
     while nm > a && st.toks.get(nm) == "]" {
         nm = cp_open_of(st, nm, a) - 1;
     }
-    if nm <= a || st.kinds.get(nm) != CTK_IDENT { return; }
+    if nm <= a || st.kinds.get(nm) != CTK_IDENT {
+        return;
+    }
     var ptr: i64 = 0;
     var be: i64 = nm;
-    while be > a && st.toks.get(be - 1) == "*" { ptr = ptr + 1; be = be - 1; }
+    while be > a && st.toks.get(be - 1) == "*" {
+        ptr = ptr + 1;
+        be = be - 1;
+    }
     var base2: str = cp_base_of(st, a, be);
-    if end1 < b && nm + 1 < end1 && st.toks.get(nm + 1) == "[" { ptr = ptr + 1; }
+    if end1 < b && nm + 1 < end1 && st.toks.get(nm + 1) == "[" {
+        ptr = ptr + 1;
+    }
     cp_add_typedef(st, st.toks.get(nm), base2, ptr);
-    if comma >= 0 { cp_typedef_declarators(st, comma + 1, b, base2, 0); }
+    if comma >= 0 {
+        cp_typedef_declarators(st, comma + 1, b, base2, 0);
+    }
 }
 
 /// The `[` opening the `]` at `close` (not before `limit`).
-fn cp_open_of(st: &CHeaderState, close: i64, limit: i64) -> i64 {
+fn cp_open_of(st: & CHeaderState, close: i64, limit: i64) -> i64 {
     var depth: i64 = 0;
     var i: i64 = close;
     while i >= limit {
-        if st.toks.get(i) == "]" { depth = depth + 1; }
-        if st.toks.get(i) == "[" { depth = depth - 1; if depth == 0 { return i; } }
+        if st.toks.get(i) == "]" {
+            depth = depth + 1;
+        }
+        if st.toks.get(i) == "[" {
+            depth = depth - 1;
+            if depth == 0 {
+                return i;
+            }
+        }
         i = i - 1;
     }
     return limit;
 }
 
 /// Declarators `*A, B, **C` in [a, b) for type `base`.
-fn cp_typedef_declarators(st: &mut CHeaderState, a: i64, b: i64, base: str, ptr0: i64) {
+fn cp_typedef_declarators(st: & mut CHeaderState, a: i64, b: i64, base: str, ptr0: i64) {
     var i: i64 = a;
     var ptr: i64 = ptr0;
     while i < b {
         var t: str = st.toks.get(i);
-        if t == "*" { ptr = ptr + 1; }
-        else if t == "," { ptr = ptr0; }
-        else if st.kinds.get(i) == CTK_IDENT { cp_add_typedef(st, t, base, ptr); }
+        if t == "*" {
+            ptr = ptr + 1;
+        } else if t == "," {
+            ptr = ptr0;
+        } else if st.kinds.get(i) == CTK_IDENT {
+            cp_add_typedef(st, t, base, ptr);
+        }
         i = i + 1;
     }
 }
 
 /// The base type of the tokens [a, b) (no `*`): "int", "uint", "struct X",
 /// "td NAME", ...; "?" when it is not a type.
-fn cp_base_of(st: &CHeaderState, a: i64, b: i64) -> str {
+fn cp_base_of(st: & CHeaderState, a: i64, b: i64) -> str {
     var unsigned: bool = false;
     var signed: bool = false;
     var longs: i64 = 0;
@@ -615,100 +729,211 @@ fn cp_base_of(st: &CHeaderState, a: i64, b: i64) -> str {
     var i: i64 = a;
     while i < b {
         var t: str = st.toks.get(i);
-        if t == "unsigned" { unsigned = true; }
-        else if t == "signed" { signed = true; }
-        else if t == "long" { longs = longs + 1; }
-        else if t == "short" { short = true; }
-        else if t == "int" { if word == "" { word = "int"; } }
-        else if t == "struct" || t == "union" || t == "enum" {
-            if i + 1 < b { return t + " " + st.toks.get(i + 1); }
+        if t == "unsigned" {
+            unsigned = true;
+        } else if t == "signed" {
+            signed = true;
+        } else if t == "long" {
+            longs = longs + 1;
+        } else if t == "short" {
+            short = true;
+        } else if t == "int" {
+            if word == "" {
+                word = "int";
+            }
+        } else if t == "struct" || t == "union" || t == "enum" {
+            if i + 1 < b {
+                return t + " " + st.toks.get(i + 1);
+            }
+            return "?";
+        } else if st.kinds.get(i) == CTK_IDENT {
+            word = t;
+        } else {
             return "?";
         }
-        else if st.kinds.get(i) == CTK_IDENT { word = t; }
-        else { return "?"; }
         i = i + 1;
     }
-    if longs >= 2 { if unsigned { return "ullong"; } return "llong"; }
-    if longs == 1 && word == "double" { return "double"; }
-    if longs == 1 { if unsigned { return "ulong"; } return "long"; }
-    if short { if unsigned { return "ushort"; } return "short"; }
+    if longs >= 2 {
+        if unsigned {
+            return "ullong";
+        }
+        return "llong";
+    }
+    if longs == 1 && word == "double" {
+        return "double";
+    }
+    if longs == 1 {
+        if unsigned {
+            return "ulong";
+        }
+        return "long";
+    }
+    if short {
+        if unsigned {
+            return "ushort";
+        }
+        return "short";
+    }
     if word == "char" {
-        if unsigned { return "uchar"; }
+        if unsigned {
+            return "uchar";
+        }
         return "char";
     }
     if word == "" || word == "int" {
-        if unsigned { return "uint"; }
-        if signed || word == "int" { return "int"; }
+        if unsigned {
+            return "uint";
+        }
+        if signed || word == "int" {
+            return "int";
+        }
         return "?";
     }
-    if word == "float" || word == "double" || word == "void" { return word; }
-    if word == "_Bool" || word == "bool" { return "bool"; }
+    if word == "float" || word == "double" || word == "void" {
+        return word;
+    }
+    if word == "_Bool" || word == "bool" {
+        return "bool";
+    }
     // MSVC's sized integers: `unsigned __int8` and the like
     if word == "__int8" || word == "__int16" || word == "__int32" || word == "__int64" {
         var bits: str = str_slice(word, 5, str_len(word));
-        if unsigned { return "u" + bits; }
+        if unsigned {
+            return "u" + bits;
+        }
         return "i" + bits;
     }
-    if unsigned { return "uint"; } // `unsigned NAME`: not C
+    if unsigned {
+        return "uint";
+    }
+    // `unsigned NAME`: not C
     return "td " + word;
 }
 
 /// A known type name of the system headers, as a base ("" when unknown).
 fn cp_builtin(name: str) -> str {
-    if name == "int8_t" || name == "__int8" { return "i8"; }
-    if name == "int16_t" || name == "__int16" { return "i16"; }
-    if name == "int32_t" || name == "__int32" { return "i32"; }
-    if name == "int64_t" || name == "__int64" || name == "intptr_t" || name == "ptrdiff_t"
-        || name == "ssize_t" || name == "off_t" || name == "time_t" || name == "intmax_t" { return "i64"; }
-    if name == "uint8_t" { return "u8"; }
-    if name == "uint16_t" || name == "wchar_t" { return "u16"; }
-    if name == "uint32_t" { return "u32"; }
-    if name == "uint64_t" || name == "size_t" || name == "uintptr_t" || name == "uintmax_t" { return "u64"; }
-    if name == "FILE" { return "struct FILE"; }
-    if name == "va_list" || name == "__builtin_va_list" { return "valist"; }
+    if name == "int8_t" || name == "__int8" {
+        return "i8";
+    }
+    if name == "int16_t" || name == "__int16" {
+        return "i16";
+    }
+    if name == "int32_t" || name == "__int32" {
+        return "i32";
+    }
+    if name == "int64_t" || name == "__int64" || name == "intptr_t" || name == "ptrdiff_t" || name == "ssize_t" || name == "off_t" || name == "time_t" || name == "intmax_t" {
+        return "i64";
+    }
+    if name == "uint8_t" {
+        return "u8";
+    }
+    if name == "uint16_t" || name == "wchar_t" {
+        return "u16";
+    }
+    if name == "uint32_t" {
+        return "u32";
+    }
+    if name == "uint64_t" || name == "size_t" || name == "uintptr_t" || name == "uintmax_t" {
+        return "u64";
+    }
+    if name == "FILE" {
+        return "struct FILE";
+    }
+    if name == "va_list" || name == "__builtin_va_list" {
+        return "valist";
+    }
     return "";
 }
 
 /// The Fides type of base `base` with `ptr` stars: "i32", "*u8", "str",
 /// "i64" (an address), "struct:X" (by value), "valist", or "?" (unknown).
-fn cp_resolve(st: &CHeaderState, base: str, ptr: i64, depth: i64) -> str {
-    if depth > 32 { return "?"; }
+fn cp_resolve(st: & CHeaderState, base: str, ptr: i64, depth: i64) -> str {
+    if depth > 32 {
+        return "?";
+    }
     var prim: str = "";
-    if base == "int" { prim = "i32"; }
-    if base == "uint" { prim = "u32"; }
-    if base == "char" { prim = "i8"; }
-    if base == "uchar" { prim = "u8"; }
-    if base == "short" { prim = "i16"; }
-    if base == "ushort" { prim = "u16"; }
-    if base == "long" { prim = "i32"; }
-    if base == "ulong" { prim = "u32"; }
-    if base == "llong" { prim = "i64"; }
-    if base == "ullong" { prim = "u64"; }
-    if base == "float" { prim = "f32"; }
-    if base == "double" { prim = "f64"; }
-    if base == "bool" { prim = "bool"; }
-    if base == "enum" || str_starts_with(base, "enum ") { prim = "i32"; }
-    if base == "i8" || base == "i16" || base == "i32" || base == "i64" || base == "u8"
-        || base == "u16" || base == "u32" || base == "u64" { prim = base; }
+    if base == "int" {
+        prim = "i32";
+    }
+    if base == "uint" {
+        prim = "u32";
+    }
+    if base == "char" {
+        prim = "i8";
+    }
+    if base == "uchar" {
+        prim = "u8";
+    }
+    if base == "short" {
+        prim = "i16";
+    }
+    if base == "ushort" {
+        prim = "u16";
+    }
+    if base == "long" {
+        prim = "i32";
+    }
+    if base == "ulong" {
+        prim = "u32";
+    }
+    if base == "llong" {
+        prim = "i64";
+    }
+    if base == "ullong" {
+        prim = "u64";
+    }
+    if base == "float" {
+        prim = "f32";
+    }
+    if base == "double" {
+        prim = "f64";
+    }
+    if base == "bool" {
+        prim = "bool";
+    }
+    if base == "enum" || str_starts_with(base, "enum ") {
+        prim = "i32";
+    }
+    if base == "i8" || base == "i16" || base == "i32" || base == "i64" || base == "u8" || base == "u16" || base == "u32" || base == "u64" {
+        prim = base;
+    }
     if prim != "" {
-        if ptr == 0 { return prim; }
-        if ptr == 1 && (base == "char" || base == "uchar") { return "str"; }
-        if ptr == 1 { return "*" + prim; }
+        if ptr == 0 {
+            return prim;
+        }
+        if ptr == 1 && (base == "char" || base == "uchar") {
+            return "str";
+        }
+        if ptr == 1 {
+            return "*" + prim;
+        }
         return "*i64";
     }
     if base == "void" {
-        if ptr == 0 { return "void"; }
-        if ptr == 1 { return "i64"; }
+        if ptr == 0 {
+            return "void";
+        }
+        if ptr == 1 {
+            return "i64";
+        }
         return "*i64";
     }
     if base == "fnptr" {
-        if ptr == 0 { return "i64"; }
+        if ptr == 0 {
+            return "i64";
+        }
         return "*i64";
     }
-    if base == "valist" { return "valist"; }
+    if base == "valist" {
+        return "valist";
+    }
     if str_starts_with(base, "struct ") || str_starts_with(base, "union ") {
-        if ptr == 0 { return "struct:" + str_slice(base, 7, str_len(base)); }
-        if ptr == 1 { return "i64"; }
+        if ptr == 0 {
+            return "struct:" + str_slice(base, 7, str_len(base));
+        }
+        if ptr == 1 {
+            return "i64";
+        }
         return "*i64";
     }
     if str_starts_with(base, "td ") {
@@ -718,10 +943,16 @@ fn cp_resolve(st: &CHeaderState, base: str, ptr: i64, depth: i64) -> str {
             return cp_resolve(st, st.td_base.get(at), st.td_ptr.get(at) + ptr, depth + 1);
         }
         var b: str = cp_builtin(name);
-        if b != "" { return cp_resolve(st, b, ptr, depth + 1); }
+        if b != "" {
+            return cp_resolve(st, b, ptr, depth + 1);
+        }
         // An unknown name behind a pointer is still an address
-        if ptr == 1 { return "i64"; }
-        if ptr > 1 { return "*i64"; }
+        if ptr == 1 {
+            return "i64";
+        }
+        if ptr > 1 {
+            return "*i64";
+        }
         return "?";
     }
     return "?";
@@ -730,23 +961,38 @@ fn cp_resolve(st: &CHeaderState, base: str, ptr: i64, depth: i64) -> str {
 /// Fides keywords and type names cannot be parameter names.
 fn cp_safe_name(name: str) -> str {
     var kw: str = " as async await backward bool break cap component comptime const continue defer do dyn else ensure enum extern false fn for given grad guard handle if impl in interrupt is kernel layer loop match model module move mut on persist pub query region resume return sandbox select spawn state static str struct system true try txn type unsafe use val var void where while with yield self Self i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 isize usize char ";
-    if str_find(kw, " " + name + " ") >= 0 { return name + "_"; }
+    if str_find(kw, " " + name + " ") >= 0 {
+        return name + "_";
+    }
     return name;
 }
 
 /// A function prototype in [a, b), or nothing.
-fn cp_function(st: &mut CHeaderState, a: i64, b: i64) {
+fn cp_function(st: & mut CHeaderState, a: i64, b: i64) {
     // NAME ( params ) with the return type before NAME
     var lp: i64 = cp_find(st, a, b, "(");
-    if lp <= a || st.kinds.get(lp - 1) != CTK_IDENT { return; }
+    if lp <= a || st.kinds.get(lp - 1) != CTK_IDENT {
+        return;
+    }
     var rp: i64 = cp_close_of(st, lp);
-    if rp + 1 != b { return; } // anything after the parameters: not a plain prototype
+    if rp + 1 != b {
+        return;
+    }
+    // anything after the parameters: not a plain prototype
     var name: str = st.toks.get(lp - 1);
-    if HashMap_contains(st.fn_index, name) { return; }
+    if HashMap_contains(st.fn_index, name) {
+        return;
+    }
     var ptr: i64 = 0;
     var be: i64 = lp - 1;
-    while be > a && st.toks.get(be - 1) == "*" { ptr = ptr + 1; be = be - 1; }
-    if be <= a { return; } // no return type: a macro call
+    while be > a && st.toks.get(be - 1) == "*" {
+        ptr = ptr + 1;
+        be = be - 1;
+    }
+    if be <= a {
+        return;
+    }
+    // no return type: a macro call
     var rbase: str = cp_base_of(st, a, be);
     var ret: str = cp_resolve(st, rbase, ptr, 0);
     var why: str = cp_unsupported(ret, "the result");
@@ -761,7 +1007,9 @@ fn cp_function(st: &mut CHeaderState, a: i64, b: i64) {
             if (t == "," && depth == 0) || i == rp {
                 var one: str = cp_param(st, s, i, params.len());
                 if str_starts_with(one, "!") {
-                    if why == "" { why = str_slice(one, 1, str_len(one)); }
+                    if why == "" {
+                        why = str_slice(one, 1, str_len(one));
+                    }
                 } else {
                     params.push(one);
                 }
@@ -780,14 +1028,20 @@ fn cp_function(st: &mut CHeaderState, a: i64, b: i64) {
         return;
     }
     var line: str = "    fn " + name + "(" + str_join(params, ", ") + ")";
-    if ret != "void" { line = line + " -> " + ret; }
+    if ret != "void" {
+        line = line + " -> " + ret;
+    }
     st.fn_lines.push(line + ";");
 }
 
 /// Why a type cannot be a parameter or result yet ("" when it can).
 fn cp_unsupported(ty: str, what: str) -> str {
-    if ty == "?" { return what + " has a type this parser does not know"; }
-    if ty == "valist" { return what + " is a va_list"; }
+    if ty == "?" {
+        return what + " has a type this parser does not know";
+    }
+    if ty == "valist" {
+        return what + " is a va_list";
+    }
     if str_starts_with(ty, "struct:") {
         return what + " is a struct by value (" + str_slice(ty, 7, str_len(ty)) + ")";
     }
@@ -795,20 +1049,31 @@ fn cp_unsupported(ty: str, what: str) -> str {
 }
 
 /// One parameter in [a, b) as `name: type`, or "!reason".
-fn cp_param(st: &CHeaderState, a: i64, b: i64, index: i64) -> str {
-    if a >= b { return "!an empty parameter"; }
-    if st.toks.get(a) == "..." { return "!it takes a variable number of arguments"; }
+fn cp_param(st: & CHeaderState, a: i64, b: i64, index: i64) -> str {
+    if a >= b {
+        return "!an empty parameter";
+    }
+    if st.toks.get(a) == "..." {
+        return "!it takes a variable number of arguments";
+    }
     // A function pointer: RET (*name)(args)
     var lp: i64 = cp_find(st, a, b, "(");
     if lp >= 0 {
         var pname: str = "";
         var j: i64 = lp;
         while j < b {
-            if st.kinds.get(j) == CTK_IDENT { pname = st.toks.get(j); break; }
-            if st.toks.get(j) == ")" { break; }
+            if st.kinds.get(j) == CTK_IDENT {
+                pname = st.toks.get(j);
+                break;
+            }
+            if st.toks.get(j) == ")" {
+                break;
+            }
             j = j + 1;
         }
-        if pname == "" { pname = "arg" + int_to_str(index); }
+        if pname == "" {
+            pname = "arg" + int_to_str(index);
+        }
         return cp_safe_name(pname) + ": i64";
     }
     var e: i64 = b;
@@ -822,13 +1087,21 @@ fn cp_param(st: &CHeaderState, a: i64, b: i64, index: i64) -> str {
     if e - 1 > a && st.kinds.get(e - 1) == CTK_IDENT && cp_names_param(st, a, e - 1) {
         pname2 = st.toks.get(e - 1);
         e = e - 1;
+    } while e > a && st.toks.get(e - 1) == "*" {
+        ptr = ptr + 1;
+        e = e - 1;
     }
-    while e > a && st.toks.get(e - 1) == "*" { ptr = ptr + 1; e = e - 1; }
     var ty: str = cp_resolve(st, cp_base_of(st, a, e), ptr, 0);
-    if pname2 == "" { pname2 = "arg" + int_to_str(index); }
+    if pname2 == "" {
+        pname2 = "arg" + int_to_str(index);
+    }
     var why: str = cp_unsupported(ty, "parameter " + pname2);
-    if why != "" { return "!" + why; }
-    if ty == "void" { return "!parameter " + pname2 + " is void"; }
+    if why != "" {
+        return "!" + why;
+    }
+    if ty == "void" {
+        return "!parameter " + pname2 + " is void";
+    }
     // An integer argument is passed as i64: C reads only its low bits, and
     // the i64 constants above pass without a cast (results keep their type)
     if ty == "i8" || ty == "i16" || ty == "i32" || ty == "u8" || ty == "u16" || ty == "u32" || ty == "u64" {
@@ -839,12 +1112,15 @@ fn cp_param(st: &CHeaderState, a: i64, b: i64, index: i64) -> str {
 
 /// Is the identifier at the end of [a, last] a parameter name (not the end
 /// of its type, as in `unsigned int` or `struct X`)?
-fn cp_names_param(st: &CHeaderState, a: i64, last: i64) -> bool {
+fn cp_names_param(st: & CHeaderState, a: i64, last: i64) -> bool {
     var t: str = st.toks.get(last);
-    if t == "int" || t == "char" || t == "short" || t == "long" || t == "unsigned"
-        || t == "signed" || t == "float" || t == "double" || t == "void" || t == "_Bool" { return false; }
+    if t == "int" || t == "char" || t == "short" || t == "long" || t == "unsigned" || t == "signed" || t == "float" || t == "double" || t == "void" || t == "_Bool" {
+        return false;
+    }
     var prev: str = st.toks.get(last - 1);
-    if prev == "struct" || prev == "union" || prev == "enum" { return false; }
+    if prev == "struct" || prev == "union" || prev == "enum" {
+        return false;
+    }
     return true;
 }
 
@@ -864,113 +1140,182 @@ pub struct CpExpr {
     pub depth: i64,
 }
 
-fn cp_eval_tokens(st: &mut CHeaderState, toks: Vec<str>, kinds: Vec<i64>, depth: i64) -> CpEval {
-    if toks.len() == 0 || depth > 16 { return CpEval { ok: false, value: 0 }; }
-    var e: CpExpr = CpExpr { toks: toks, kinds: kinds, pos: 0, ok: true, depth: depth };
-    var v: i64 = cp_ex_or(st, &mut e);
-    if e.pos != e.toks.len() { e.ok = false; }
-    return CpEval { ok: e.ok, value: v };
+fn cp_eval_tokens(st: & mut CHeaderState, toks: Vec<str>, kinds: Vec<i64>, depth: i64) -> CpEval {
+    if toks.len() == 0 || depth > 16 {
+        return CpEval {
+            ok: false, value: 0
+        };
+    }
+    var e: CpExpr = CpExpr {
+        toks: toks, kinds: kinds, pos: 0, ok: true, depth: depth
+    };
+    var v: i64 = cp_ex_or(st, & mut e);
+    if e.pos != e.toks.len() {
+        e.ok = false;
+    }
+    return CpEval {
+        ok: e.ok, value: v
+    };
 }
 
-fn cp_ex_peek(e: &CpExpr) -> str {
-    if e.pos < e.toks.len() { return e.toks.get(e.pos); }
+fn cp_ex_peek(e: & CpExpr) -> str {
+    if e.pos < e.toks.len() {
+        return e.toks.get(e.pos);
+    }
     return "";
 }
 
-fn cp_ex_or(st: &mut CHeaderState, e: &mut CpExpr) -> i64 {
+fn cp_ex_or(st: & mut CHeaderState, e: & mut CpExpr) -> i64 {
     var v: i64 = cp_ex_xor(st, e);
-    while e.ok && cp_ex_peek(e) == "|" { e.pos = e.pos + 1; v = v | cp_ex_xor(st, e); }
+    while e.ok && cp_ex_peek(e) == "|" {
+        e.pos = e.pos + 1;
+        v = v | cp_ex_xor(st, e);
+    }
     return v;
 }
 
-fn cp_ex_xor(st: &mut CHeaderState, e: &mut CpExpr) -> i64 {
+fn cp_ex_xor(st: & mut CHeaderState, e: & mut CpExpr) -> i64 {
     var v: i64 = cp_ex_and(st, e);
-    while e.ok && cp_ex_peek(e) == "^" { e.pos = e.pos + 1; v = v ^ cp_ex_and(st, e); }
+    while e.ok && cp_ex_peek(e) == "^" {
+        e.pos = e.pos + 1;
+        v = v ^ cp_ex_and(st, e);
+    }
     return v;
 }
 
-fn cp_ex_and(st: &mut CHeaderState, e: &mut CpExpr) -> i64 {
+fn cp_ex_and(st: & mut CHeaderState, e: & mut CpExpr) -> i64 {
     var v: i64 = cp_ex_shift(st, e);
-    while e.ok && cp_ex_peek(e) == "&" { e.pos = e.pos + 1; v = v & cp_ex_shift(st, e); }
+    while e.ok && cp_ex_peek(e) == "&" {
+        e.pos = e.pos + 1;
+        v = v & cp_ex_shift(st, e);
+    }
     return v;
 }
 
-fn cp_ex_shift(st: &mut CHeaderState, e: &mut CpExpr) -> i64 {
+fn cp_ex_shift(st: & mut CHeaderState, e: & mut CpExpr) -> i64 {
     var v: i64 = cp_ex_add(st, e);
     while e.ok && (cp_ex_peek(e) == "<<" || cp_ex_peek(e) == ">>") {
         var op: str = cp_ex_peek(e);
         e.pos = e.pos + 1;
         var r: i64 = cp_ex_add(st, e);
-        if r < 0 || r > 63 { e.ok = false; return 0; }
-        if op == "<<" { v = v << r; } else { v = v >> r; }
+        if r < 0 || r > 63 {
+            e.ok = false;
+            return 0;
+        }
+        if op == "<<" {
+            v = v << r;
+        } else {
+            v = v >> r;
+        }
     }
     return v;
 }
 
-@wrapping fn cp_ex_add(st: &mut CHeaderState, e: &mut CpExpr) -> i64 {
+@wrapping fn cp_ex_add(st: & mut CHeaderState, e: & mut CpExpr) -> i64 {
     var v: i64 = cp_ex_mul(st, e);
     while e.ok && (cp_ex_peek(e) == "+" || cp_ex_peek(e) == "-") {
         var op: str = cp_ex_peek(e);
         e.pos = e.pos + 1;
         var r: i64 = cp_ex_mul(st, e);
-        if op == "+" { v = v + r; } else { v = v - r; }
+        if op == "+" {
+            v = v + r;
+        } else {
+            v = v - r;
+        }
     }
     return v;
 }
 
-@wrapping fn cp_ex_mul(st: &mut CHeaderState, e: &mut CpExpr) -> i64 {
+@wrapping fn cp_ex_mul(st: & mut CHeaderState, e: & mut CpExpr) -> i64 {
     var v: i64 = cp_ex_unary(st, e);
     while e.ok && (cp_ex_peek(e) == "*" || cp_ex_peek(e) == "/" || cp_ex_peek(e) == "%") {
         var op: str = cp_ex_peek(e);
         e.pos = e.pos + 1;
         var r: i64 = cp_ex_unary(st, e);
-        if op == "*" { v = v * r; }
-        else if r == 0 { e.ok = false; return 0; }
-        else if op == "/" { v = v / r; }
-        else { v = v % r; }
+        if op == "*" {
+            v = v * r;
+        } else if r == 0 {
+            e.ok = false;
+            return 0;
+        } else if op == "/" {
+            v = v / r;
+        } else {
+            v = v % r;
+        }
     }
     return v;
 }
 
-@wrapping fn cp_ex_unary(st: &mut CHeaderState, e: &mut CpExpr) -> i64 {
+@wrapping fn cp_ex_unary(st: & mut CHeaderState, e: & mut CpExpr) -> i64 {
     var t: str = cp_ex_peek(e);
-    if t == "-" { e.pos = e.pos + 1; return 0 - cp_ex_unary(st, e); }
-    if t == "+" { e.pos = e.pos + 1; return cp_ex_unary(st, e); }
-    if t == "~" { e.pos = e.pos + 1; return ~cp_ex_unary(st, e); }
-    if t == "!" { e.pos = e.pos + 1; if cp_ex_unary(st, e) == 0 { return 1; } return 0; }
+    if t == "-" {
+        e.pos = e.pos + 1;
+        return 0 - cp_ex_unary(st, e);
+    }
+    if t == "+" {
+        e.pos = e.pos + 1;
+        return cp_ex_unary(st, e);
+    }
+    if t == "~" {
+        e.pos = e.pos + 1;
+        return ~cp_ex_unary(st, e);
+    }
+    if t == "!" {
+        e.pos = e.pos + 1;
+        if cp_ex_unary(st, e) == 0 {
+            return 1;
+        }
+        return 0;
+    }
     return cp_ex_primary(st, e);
 }
 
 /// Is the token at `pos` the start of a cast `(type)`?
-fn cp_ex_is_cast(st: &CHeaderState, e: &CpExpr) -> bool {
+fn cp_ex_is_cast(st: & CHeaderState, e: & CpExpr) -> bool {
     var i: i64 = e.pos + 1;
     var saw: bool = false;
     while i < e.toks.len() {
         var t: str = e.toks.get(i);
-        if t == ")" { return saw && i + 1 < e.toks.len(); }
-        if t == "*" { i = i + 1; continue; }
-        if e.kinds.get(i) != CTK_IDENT { return false; }
-        if !(t == "unsigned" || t == "signed" || t == "int" || t == "long" || t == "short"
-            || t == "char" || cp_builtin(t) != "" || HashMap_contains(st.td_index, t)) { return false; }
+        if t == ")" {
+            return saw && i + 1 < e.toks.len();
+        }
+        if t == "*" {
+            i = i + 1;
+            continue;
+        }
+        if e.kinds.get(i) != CTK_IDENT {
+            return false;
+        }
+        if !(t == "unsigned" || t == "signed" || t == "int" || t == "long" || t == "short" || t == "char" || cp_builtin(t) != "" || HashMap_contains(st.td_index, t)) {
+            return false;
+        }
         saw = true;
         i = i + 1;
     }
     return false;
 }
 
-fn cp_ex_primary(st: &mut CHeaderState, e: &mut CpExpr) -> i64 {
-    if e.pos >= e.toks.len() { e.ok = false; return 0; }
+fn cp_ex_primary(st: & mut CHeaderState, e: & mut CpExpr) -> i64 {
+    if e.pos >= e.toks.len() {
+        e.ok = false;
+        return 0;
+    }
     var t: str = e.toks.get(e.pos);
     var k: i64 = e.kinds.get(e.pos);
     if t == "(" {
         if cp_ex_is_cast(st, e) {
-            while cp_ex_peek(e) != ")" { e.pos = e.pos + 1; }
+            while cp_ex_peek(e) != ")" {
+                e.pos = e.pos + 1;
+            }
             e.pos = e.pos + 1;
             return cp_ex_unary(st, e);
         }
         e.pos = e.pos + 1;
         var v: i64 = cp_ex_or(st, e);
-        if cp_ex_peek(e) != ")" { e.ok = false; return 0; }
+        if cp_ex_peek(e) != ")" {
+            e.ok = false;
+            return 0;
+        }
         e.pos = e.pos + 1;
         return v;
     }
@@ -980,16 +1325,30 @@ fn cp_ex_primary(st: &mut CHeaderState, e: &mut CpExpr) -> i64 {
     }
     if k == CTK_CHAR {
         e.pos = e.pos + 1;
-        if str_len(t) == 3 { return str_byte_at(t, 1); }
+        if str_len(t) == 3 {
+            return str_byte_at(t, 1);
+        }
         if str_len(t) >= 4 && str_byte_at(t, 1) == 92 {
             var c: i64 = str_byte_at(t, 2);
             if str_len(t) == 4 {
-                if c == 110 { return 10; }
-                if c == 116 { return 9; }
-                if c == 114 { return 13; }
-                if c == 48 { return 0; }
-                if c == 97 { return 7; }
-                if c == 98 { return 8; }
+                if c == 110 {
+                    return 10;
+                }
+                if c == 116 {
+                    return 9;
+                }
+                if c == 114 {
+                    return 13;
+                }
+                if c == 48 {
+                    return 0;
+                }
+                if c == 97 {
+                    return 7;
+                }
+                if c == 98 {
+                    return 8;
+                }
                 return c;
             }
             // '\033' (octal) and '\x1B' (hex)
@@ -997,15 +1356,29 @@ fn cp_ex_primary(st: &mut CHeaderState, e: &mut CpExpr) -> i64 {
             var v: i64 = 0;
             var base: i64 = 8;
             var di: i64 = 0;
-            if c == 120 { base = 16; di = 1; }
-            if di >= str_len(digits) { e.ok = false; return 0; }
-            while di < str_len(digits) {
+            if c == 120 {
+                base = 16;
+                di = 1;
+            }
+            if di >= str_len(digits) {
+                e.ok = false;
+                return 0;
+            } while di < str_len(digits) {
                 var dc: i64 = str_byte_at(digits, di);
-                var d: i64 = -1;
-                if dc >= 48 && dc <= 57 { d = dc - 48; }
-                if dc >= 97 && dc <= 102 { d = dc - 87; }
-                if dc >= 65 && dc <= 70 { d = dc - 55; }
-                if d < 0 || d >= base { e.ok = false; return 0; }
+                var d: i64 = - 1;
+                if dc >= 48 && dc <= 57 {
+                    d = dc - 48;
+                }
+                if dc >= 97 && dc <= 102 {
+                    d = dc - 87;
+                }
+                if dc >= 65 && dc <= 70 {
+                    d = dc - 55;
+                }
+                if d < 0 || d >= base {
+                    e.ok = false;
+                    return 0;
+                }
                 v = v * base + d;
                 di = di + 1;
             }
@@ -1017,48 +1390,68 @@ fn cp_ex_primary(st: &mut CHeaderState, e: &mut CpExpr) -> i64 {
     if k == CTK_IDENT {
         e.pos = e.pos + 1;
         var ci: i64 = HashMap_get(st.const_index, t) - 1;
-        if ci >= 0 { return st.const_values.get(ci); }
+        if ci >= 0 {
+            return st.const_values.get(ci);
+        }
         var m: i64 = cp_macro_at(st, t);
-        if m < 0 { e.ok = false; return 0; }
+        if m < 0 {
+            e.ok = false;
+            return 0;
+        }
         var body: str = st.macro_bodies.get(m);
         var params: str = st.macro_params.get(m);
         if params != "" {
             // NAME(args): the body with each parameter replaced
-            if cp_ex_peek(e) != "(" { e.ok = false; return 0; }
+            if cp_ex_peek(e) != "(" {
+                e.ok = false;
+                return 0;
+            }
             var args: Vec<str> = Vec::new();
             var cur: str = "";
             var depth: i64 = 0;
             e.pos = e.pos + 1;
             while e.pos < e.toks.len() {
                 var a: str = e.toks.get(e.pos);
-                if a == "(" { depth = depth + 1; }
+                if a == "(" {
+                    depth = depth + 1;
+                }
                 if a == ")" {
-                    if depth == 0 { break; }
+                    if depth == 0 {
+                        break;
+                    }
                     depth = depth - 1;
                 }
-                if a == "," && depth == 0 { args.push(cur); cur = ""; }
-                else { cur = cur + " " + a; }
+                if a == "," && depth == 0 {
+                    args.push(cur);
+                    cur = "";
+                } else {
+                    cur = cur + " " + a;
+                }
                 e.pos = e.pos + 1;
             }
             e.pos = e.pos + 1;
             args.push(cur);
             var names: Vec<str> = Vec::new();
-            if params != "()" { names = str_split(params, ","); }
+            if params != "()" {
+                names = str_split(params, ",");
+            }
             var bt: Vec<str> = Vec::new();
             var bk: Vec<i64> = Vec::new();
-            cp_tokens_of(body, &mut bt, &mut bk);
+            cp_tokens_of(body, & mut bt, & mut bk);
             var xt: Vec<str> = Vec::new();
             var xk: Vec<i64> = Vec::new();
             var bi: i64 = 0;
             while bi < bt.len() {
                 var pi: i64 = 0;
-                var hit: i64 = -1;
+                var hit: i64 = - 1;
                 while pi < names.len() {
-                    if names.get(pi) == bt.get(bi) { hit = pi; }
+                    if names.get(pi) == bt.get(bi) {
+                        hit = pi;
+                    }
                     pi = pi + 1;
                 }
                 if hit >= 0 && hit < args.len() {
-                    cp_tokens_of(args.get(hit), &mut xt, &mut xk);
+                    cp_tokens_of(args.get(hit), & mut xt, & mut xk);
                 } else {
                     xt.push(bt.get(bi));
                     xk.push(bk.get(bi));
@@ -1066,14 +1459,18 @@ fn cp_ex_primary(st: &mut CHeaderState, e: &mut CpExpr) -> i64 {
                 bi = bi + 1;
             }
             var r: CpEval = cp_eval_tokens(st, xt, xk, e.depth + 1);
-            if !r.ok { e.ok = false; }
+            if !r.ok {
+                e.ok = false;
+            }
             return r.value;
         }
         var ot: Vec<str> = Vec::new();
         var ok: Vec<i64> = Vec::new();
-        cp_tokens_of(body, &mut ot, &mut ok);
+        cp_tokens_of(body, & mut ot, & mut ok);
         var r2: CpEval = cp_eval_tokens(st, ot, ok, e.depth + 1);
-        if !r2.ok { e.ok = false; }
+        if !r2.ok {
+            e.ok = false;
+        }
         return r2.value;
     }
     e.ok = false;
@@ -1081,26 +1478,46 @@ fn cp_ex_primary(st: &mut CHeaderState, e: &mut CpExpr) -> i64 {
 }
 
 /// A C integer literal (decimal, 0x hex, 0 octal, with u/l suffixes).
-@wrapping fn cp_number(t: str, e: &mut CpExpr) -> i64 {
+@wrapping fn cp_number(t: str, e: & mut CpExpr) -> i64 {
     var s: str = t;
     while str_len(s) > 0 {
         var last: i64 = str_byte_at(s, str_len(s) - 1);
-        if last == 117 || last == 85 || last == 108 || last == 76 { s = str_slice(s, 0, str_len(s) - 1); }
-        else { break; }
+        if last == 117 || last == 85 || last == 108 || last == 76 {
+            s = str_slice(s, 0, str_len(s) - 1);
+        } else {
+            break;
+        }
     }
     var base: i64 = 10;
     var i: i64 = 0;
-    if str_starts_with(s, "0x") || str_starts_with(s, "0X") { base = 16; i = 2; }
-    else if str_len(s) > 1 && str_starts_with(s, "0") { base = 8; i = 1; }
-    if i >= str_len(s) && base == 16 { e.ok = false; return 0; }
+    if str_starts_with(s, "0x") || str_starts_with(s, "0X") {
+        base = 16;
+        i = 2;
+    } else if str_len(s) > 1 && str_starts_with(s, "0") {
+        base = 8;
+        i = 1;
+    }
+    if i >= str_len(s) && base == 16 {
+        e.ok = false;
+        return 0;
+    }
     var v: i64 = 0;
     while i < str_len(s) {
         var c: i64 = str_byte_at(s, i);
-        var d: i64 = -1;
-        if c >= 48 && c <= 57 { d = c - 48; }
-        if c >= 97 && c <= 102 { d = c - 87; }
-        if c >= 65 && c <= 70 { d = c - 55; }
-        if d < 0 || d >= base { e.ok = false; return 0; }
+        var d: i64 = - 1;
+        if c >= 48 && c <= 57 {
+            d = c - 48;
+        }
+        if c >= 97 && c <= 102 {
+            d = c - 87;
+        }
+        if c >= 65 && c <= 70 {
+            d = c - 55;
+        }
+        if d < 0 || d >= base {
+            e.ok = false;
+            return 0;
+        }
         v = v * base + d;
         i = i + 1;
     }
@@ -1108,17 +1525,18 @@ fn cp_ex_primary(st: &mut CHeaderState, e: &mut CpExpr) -> i64 {
 }
 
 /// Every object-like `#define` whose body is an integer constant.
-fn cp_collect_define_consts(st: &mut CHeaderState) {
+fn cp_collect_define_consts(st: & mut CHeaderState) {
     var i: i64 = 0;
     while i < st.macro_names.len() {
         var name: str = st.macro_names.get(i);
-        if st.macro_params.get(i) == "" && str_len(st.macro_bodies.get(i)) > 0
-            && !str_starts_with(name, "_") && !HashMap_contains(st.fn_index, name) {
+        if st.macro_params.get(i) == "" && str_len(st.macro_bodies.get(i)) > 0 && !str_starts_with(name, "_") && !HashMap_contains(st.fn_index, name) {
             var t: Vec<str> = Vec::new();
             var k: Vec<i64> = Vec::new();
-            cp_tokens_of(st.macro_bodies.get(i), &mut t, &mut k);
+            cp_tokens_of(st.macro_bodies.get(i), & mut t, & mut k);
             var r: CpEval = cp_eval_tokens(st, t, k, 0);
-            if r.ok { cp_add_const(st, name, r.value); }
+            if r.ok {
+                cp_add_const(st, name, r.value);
+            }
         }
         i = i + 1;
     }
@@ -1126,7 +1544,7 @@ fn cp_collect_define_consts(st: &mut CHeaderState) {
 
 // --- Output ---------------------------------------------------------------
 
-fn cp_render(st: &mut CHeaderState, path: str, link: str, module_name: str) -> str {
+fn cp_render(st: & mut CHeaderState, path: str, link: str, module_name: str) -> str {
     var out: StringBuilder = StringBuilder::new();
     out.append_str("// Generated by `fid parse-header` from " + cp_base_name(path));
     if st.included.len() > 1 {
@@ -1134,7 +1552,9 @@ fn cp_render(st: &mut CHeaderState, path: str, link: str, module_name: str) -> s
     }
     out.append_str(".\n// Regenerate rather than edit. Pointers other than char* are addresses\n");
     out.append_str("// (i64), char* is str, C `long` is 32 bits (Windows x64).\n");
-    if module_name != "" { out.append_str("\nmodule " + module_name + ";\n"); }
+    if module_name != "" {
+        out.append_str("\nmodule " + module_name + ";\n");
+    }
     out.append_str("\n");
     var i: i64 = 0;
     while i < st.const_names.len() {

@@ -14,16 +14,13 @@
 // Dependencies: compiler::token (TokenKind, Token, token_new)
 
 module compiler::lexer;
-
-use vec;
-use core;
-use compiler::token;
-
+ use vec; use core; use compiler::token;
 // --- Lexer ----------------------------------------------------------------
 
 pub struct Lexer {
     pub source: str,
-    pub src_len: i64,  // Cached length -- avoids O(n) str_len on every peek()
+    pub src_len: i64,
+    // Cached length -- avoids O(n) str_len on every peek()
     pub pos: i64,
     pub line: i64,
     pub col: i64,
@@ -34,17 +31,12 @@ pub struct Lexer {
 impl Lexer {
     pub fn new(source: str) -> Lexer {
         return Lexer {
-            source: source,
-            src_len: str_len(source),
-            pos: 0,
-            line: 1,
-            col: 1,
-            errors: Vec::new(),
+            source: source, src_len: str_len(source), pos: 0, line: 1, col: 1, errors: Vec::new(),
         };
     }
 
     /// Tokenize the entire source. Returns Vec<Token> ending with an Eof token.
-    pub fn tokenize(self: &mut Lexer) -> Vec<Token> {
+    pub fn tokenize(self: & mut Lexer) -> Vec<Token> {
         var tokens: Vec<Token> = Vec::new();
 
         while self.pos < self.src_len {
@@ -85,7 +77,7 @@ impl Lexer {
     }
 
     /// Peek the current byte, or 0 (NUL) at EOF.
-    fn peek(self: &Lexer) -> i64 {
+    fn peek(self: & Lexer) -> i64 {
         if self.pos >= self.src_len {
             return 0;
         }
@@ -96,17 +88,17 @@ impl Lexer {
     /// bounds. (Rust returns Option<char>; we use -1 as the "None" sentinel.
     /// Callers compare against specific byte values, never against 0, since 0
     /// is a valid NUL byte -- using -1 avoids a false match at EOF.)
-    fn peek_at(self: &Lexer, offset: i64) -> i64 {
+    fn peek_at(self: & Lexer, offset: i64) -> i64 {
         var idx: i64 = self.pos + offset;
         if idx >= self.src_len {
-            return -1;
+            return - 1;
         }
         return str_byte_at(self.source, idx);
     }
 
     /// Consume and return the current byte, advancing position and updating
     /// line/col. Multi-byte UTF-8 sequences count as a single column.
-    fn advance(self: &mut Lexer) -> i64 {
+    fn advance(self: & mut Lexer) -> i64 {
         var c: i64 = self.peek();
         self.pos = self.pos + 1;
         if c == 10 {
@@ -136,7 +128,7 @@ impl Lexer {
     /// Read the UTF-8 character at the current position as a string,
     /// advancing past all its bytes. Unlike `byte_to_str(advance())`,
     /// this captures multi-byte sequences (e.g. em-dash -- is 3 bytes).
-    fn read_utf8(self: &mut Lexer) -> str {
+    fn read_utf8(self: & mut Lexer) -> str {
         var c: i64 = self.peek();
         if c < 128 {
             // ASCII -- single byte
@@ -147,8 +139,11 @@ impl Lexer {
         //   0xE0..0xEF -> 3 bytes
         //   0xF0..0xF7 -> 4 bytes
         var seqlen: i64 = 2;
-        if c >= 240 { seqlen = 4; }
-        else if c >= 224 { seqlen = 3; }
+        if c >= 240 {
+            seqlen = 4;
+        } else if c >= 224 {
+            seqlen = 3;
+        }
         // Capture all bytes of the sequence
         var s: str = "";
         var i: i64 = 0;
@@ -168,42 +163,59 @@ impl Lexer {
     }
 
     /// Decode one UTF-8 scalar at the cursor and advance past it.
-    fn read_codepoint(self: &mut Lexer) -> i64 {
+    fn read_codepoint(self: & mut Lexer) -> i64 {
         var c: i64 = self.peek();
-        if c < 128 { return self.advance(); }
+        if c < 128 {
+            return self.advance();
+        }
         var extra: i64 = 1;
         var cp: i64 = c & 31;
-        if c >= 240 { extra = 3; cp = c & 7; }
-        else if c >= 224 { extra = 2; cp = c & 15; }
+        if c >= 240 {
+            extra = 3;
+            cp = c & 7;
+        } else if c >= 224 {
+            extra = 2;
+            cp = c & 15;
+        }
         var i: i64 = 1;
         while i <= extra && self.pos + i < self.src_len {
             cp = cp * 64 + (str_byte_at(self.source, self.pos + i) & 63);
             i = i + 1;
         }
-        self.advance(); // consumes the lead byte and its continuation bytes
+        self.advance();
+        // consumes the lead byte and its continuation bytes
         return cp;
     }
 
     /// Read N hex digits (N = 2 for \xHH) or up to '}' (for \u{...}).
-    fn read_hex_value(self: &mut Lexer, line: i64, col: i64, max_digits: i64, until_brace: bool) -> i64 {
+    fn read_hex_value(self: & mut Lexer, line: i64, col: i64, max_digits: i64, until_brace: bool) -> i64 {
         var v: i64 = 0;
         var n: i64 = 0;
         while self.pos < self.src_len && n < max_digits {
             var d: i64 = self.peek();
-            if until_brace && d == 125 { break; }
+            if until_brace && d == 125 {
+                break;
+            }
             if !lex_is_hexdigit(d) {
                 self.errors.push(lex_error(line, col, "invalid hex digit in escape"));
                 return 0;
             }
-            if d <= 57 { v = v * 16 + (d - 48); }
-            else if d <= 70 { v = v * 16 + (d - 55); }
-            else { v = v * 16 + (d - 87); }
+            if d <= 57 {
+                v = v * 16 + (d - 48);
+            } else if d <= 70 {
+                v = v * 16 + (d - 55);
+            } else {
+                v = v * 16 + (d - 87);
+            }
             self.advance();
             n = n + 1;
         }
         if until_brace {
-            if self.peek() == 125 { self.advance(); }
-            else { self.errors.push(lex_error(line, col, "expected '}' to close \\u{...}")); }
+            if self.peek() == 125 {
+                self.advance();
+            } else {
+                self.errors.push(lex_error(line, col, "expected '}' to close \\u{...}"));
+            }
         } else if n != max_digits {
             self.errors.push(lex_error(line, col, "\\x expects 2 hex digits"));
         }
@@ -213,10 +225,11 @@ impl Lexer {
     /// R1.7: char literal 'c' -> IntLit holding the Unicode scalar value, so it
     /// compares directly against str_byte_at results. Same escapes as strings
     /// plus \' (and \x / \u{...}).
-    fn read_char_lit(self: &mut Lexer) -> Token {
+    fn read_char_lit(self: & mut Lexer) -> Token {
         var line: i64 = self.line;
         var col: i64 = self.col;
-        self.advance(); // consume opening '\''
+        self.advance();
+        // consume opening '\''
 
         var v: i64 = 0;
         var c: i64 = self.peek();
@@ -225,15 +238,32 @@ impl Lexer {
         } else if c == 92 {
             self.advance();
             var esc: i64 = self.advance();
-            if esc == 110 { v = 10; }                // n
-            else if esc == 116 { v = 9; }            // t
-            else if esc == 114 { v = 13; }           // r
-            else if esc == 92 { v = 92; }            // backslash
-            else if esc == 39 { v = 39; }            // '\''
-            else if esc == 34 { v = 34; }            // '"'
-            else if esc == 48 { v = 0; }             // NUL
-            else if esc == 120 { v = self.read_hex_value(line, col, 2, false); }   // \xHH
-            else if esc == 117 && self.peek() == 123 {                              // \u{...}
+            if esc == 110 {
+                v = 10;
+            }  // n
+            else if esc == 116 {
+                v = 9;
+            }  // t
+            else if esc == 114 {
+                v = 13;
+            }  // r
+            else if esc == 92 {
+                v = 92;
+            }  // backslash
+            else if esc == 39 {
+                v = 39;
+            }  // '\''
+            else if esc == 34 {
+                v = 34;
+            }  // '"'
+            else if esc == 48 {
+                v = 0;
+            }  // NUL
+            else if esc == 120 {
+                v = self.read_hex_value(line, col, 2, false);
+            }  // \xHH
+            else if esc == 117 && self.peek() == 123 {
+                // \u{...}
                 self.advance();
                 v = self.read_hex_value(line, col, 6, true);
             } else {
@@ -245,7 +275,8 @@ impl Lexer {
         }
 
         if self.peek() == 39 {
-            self.advance(); // consume closing '\''
+            self.advance();
+            // consume closing '\''
         } else {
             self.errors.push(lex_error(line, col, "unterminated char literal"));
         }
@@ -253,15 +284,17 @@ impl Lexer {
         return token_new(TokenKind::IntLit(v), line, col);
     }
 
-    fn skip_line_comment(self: &mut Lexer) {
+    fn skip_line_comment(self: & mut Lexer) {
         while self.pos < self.src_len && self.peek() != 10 {
             self.advance();
         }
     }
 
-    fn skip_block_comment(self: &mut Lexer) {
-        self.advance(); // consume '/'
-        self.advance(); // consume '*'
+    fn skip_block_comment(self: & mut Lexer) {
+        self.advance();
+        // consume '/'
+        self.advance();
+        // consume '*'
         while self.pos < self.src_len {
             if self.peek() == 42 && self.peek_at(1) == 47 {
                 // "*/"
@@ -273,7 +306,7 @@ impl Lexer {
         }
     }
 
-    fn read_identifier_or_keyword(self: &mut Lexer) -> Token {
+    fn read_identifier_or_keyword(self: & mut Lexer) -> Token {
         var line: i64 = self.line;
         var col: i64 = self.col;
         var start_pos: i64 = self.pos;
@@ -294,7 +327,7 @@ impl Lexer {
         return token_new(kind, line, col);
     }
 
-    fn read_number(self: &mut Lexer) -> Token {
+    fn read_number(self: & mut Lexer) -> Token {
         var line: i64 = self.line;
         var col: i64 = self.col;
         var start_pos: i64 = self.pos;
@@ -305,8 +338,10 @@ impl Lexer {
             var next: i64 = self.peek_at(1);
             if next == 120 || next == 88 {
                 // 0x / 0X
-                self.advance(); // 0
-                self.advance(); // x
+                self.advance();
+                // 0
+                self.advance();
+                // x
                 while self.pos < self.src_len && lex_is_hexdigit(self.peek()) {
                     self.advance();
                 }
@@ -316,8 +351,10 @@ impl Lexer {
             }
             if next == 98 || next == 66 {
                 // 0b / 0B
-                self.advance(); // 0
-                self.advance(); // b
+                self.advance();
+                // 0
+                self.advance();
+                // b
                 while self.pos < self.src_len && (self.peek() == 48 || self.peek() == 49) {
                     self.advance();
                 }
@@ -327,8 +364,10 @@ impl Lexer {
             }
             if next == 111 || next == 79 {
                 // 0o / 0O
-                self.advance(); // 0
-                self.advance(); // o
+                self.advance();
+                // 0
+                self.advance();
+                // o
                 while self.pos < self.src_len && self.peek() >= 48 && self.peek() <= 55 {
                     self.advance();
                 }
@@ -337,7 +376,6 @@ impl Lexer {
                 return token_new(TokenKind::IntLit(val), line, col);
             }
         }
-
         // Decimal integer part (with optional '_' separators)
         while self.pos < self.src_len && (lex_is_digit(self.peek()) || self.peek() == 95) {
             self.advance();
@@ -346,7 +384,8 @@ impl Lexer {
         // Float: fractional part
         if self.peek() == 46 && lex_is_digit(self.peek_at(1)) {
             // '.' followed by digit
-            self.advance(); // '.'
+            self.advance();
+            // '.'
             while self.pos < self.src_len && (lex_is_digit(self.peek()) || self.peek() == 95) {
                 self.advance();
             }
@@ -357,8 +396,7 @@ impl Lexer {
                 if self.peek() == 43 || self.peek() == 45 {
                     // '+' / '-'
                     self.advance();
-                }
-                while self.pos < self.src_len && lex_is_digit(self.peek()) {
+                } while self.pos < self.src_len && lex_is_digit(self.peek()) {
                     self.advance();
                 }
             }
@@ -374,11 +412,15 @@ impl Lexer {
         // e (after an optional sign), so `5.e` and names stay as they were.
         if self.peek() == 101 || self.peek() == 69 {
             var ex: i64 = 1;
-            if self.peek_at(1) == 43 || self.peek_at(1) == 45 { ex = 2; }
+            if self.peek_at(1) == 43 || self.peek_at(1) == 45 {
+                ex = 2;
+            }
             if lex_is_digit(self.peek_at(ex)) {
                 var k: i64 = 0;
-                while k < ex { self.advance(); k = k + 1; }
-                while self.pos < self.src_len && lex_is_digit(self.peek()) {
+                while k < ex {
+                    self.advance();
+                    k = k + 1;
+                } while self.pos < self.src_len && lex_is_digit(self.peek()) {
                     self.advance();
                 }
                 var eraw: str = str_slice_len(self.source, self.src_len, start_pos, self.pos);
@@ -396,40 +438,67 @@ impl Lexer {
 
     /// Remove underscore separators from a numeric string (e.g. "1_000" -> "1000")
 
-    fn read_fstring(self: &mut Lexer) -> Token {
+    fn read_fstring(self: & mut Lexer) -> Token {
         var line: i64 = self.line;
         var col: i64 = self.col;
-        self.advance(); // consume 'f'
-        self.advance(); // consume opening '"'
+        self.advance();
+        // consume 'f'
+        self.advance();
+        // consume opening '"'
 
         var s: str = "";
-        var nul_at: i64 = -1;
+        var nul_at: i64 = - 1;
         while self.pos < self.src_len && self.peek() != 34 {
             var c: i64 = self.peek();
             if c == 92 {
                 // '\'
                 self.advance();
                 var esc: i64 = self.advance();
-                if esc == 110 { s = str_concat(s, "\n"); }       // n
-                else if esc == 116 { s = str_concat(s, "\t"); }  // t
-                else if esc == 114 { s = str_concat(s, "\r"); }  // r
-                else if esc == 92 { s = str_concat(s, "\\"); }   // backslash
-                else if esc == 34 { s = str_concat(s, "\""); }   // '"'
-                else if esc == 48 { if nul_at < 0 { nul_at = str_len(s); } } // NUL: the C string ends here
-                else if esc == 120 || (esc == 117 && self.peek() == 123) {    // xHH, u{...}
+                if esc == 110 {
+                    s = str_concat(s, "\n");
+                }  // n
+                else if esc == 116 {
+                    s = str_concat(s, "\t");
+                }  // t
+                else if esc == 114 {
+                    s = str_concat(s, "\r");
+                }  // r
+                else if esc == 92 {
+                    s = str_concat(s, "\\");
+                }  // backslash
+                else if esc == 34 {
+                    s = str_concat(s, "\"");
+                }  // '"'
+                else if esc == 48 {
+                    if nul_at < 0 {
+                        nul_at = str_len(s);
+                    }
+                }  // NUL: the C string ends here
+                else if esc == 120 || (esc == 117 && self.peek() == 123) {
+                    // xHH, u{...}
                     var hv: i64 = 0;
-                    if esc == 120 { hv = self.read_hex_value(line, col, 2, false); }
-                    else { self.advance(); hv = self.read_hex_value(line, col, 6, true); }
-                    if hv == 0 { if nul_at < 0 { nul_at = str_len(s); } }   // NUL: the C string ends here
-                    else { s = str_concat(s, lex_utf8_encode(hv)); }
-                }
-                else {
+                    if esc == 120 {
+                        hv = self.read_hex_value(line, col, 2, false);
+                    } else {
+                        self.advance();
+                        hv = self.read_hex_value(line, col, 6, true);
+                    }
+                    if hv == 0 {
+                        if nul_at < 0 {
+                            nul_at = str_len(s);
+                        }
+                    }  // NUL: the C string ends here
+                    else {
+                        s = str_concat(s, lex_utf8_encode(hv));
+                    }
+                } else {
                     self.errors.push(lex_error(line, col, "unknown escape sequence \\" + byte_to_str(esc)));
                     s = str_concat(s, byte_to_str(esc));
                 }
             } else if c == 123 {
                 // '{' -- expression interpolation {expr}
-                self.advance(); // consume '{'
+                self.advance();
+                // consume '{'
                 s = str_concat(s, "{");
                 var depth: i64 = 1;
                 while self.pos < self.src_len && depth > 0 {
@@ -441,7 +510,8 @@ impl Lexer {
                         // '}'
                         depth = depth - 1;
                         if depth == 0 {
-                            self.advance(); // consume '}'
+                            self.advance();
+                            // consume '}'
                             s = str_concat(s, "}");
                             break;
                         }
@@ -456,42 +526,70 @@ impl Lexer {
         }
 
         if self.pos < self.src_len {
-            self.advance(); // consume closing '"'
+            self.advance();
+            // consume closing '"'
         } else {
             self.errors.push(lex_error(line, col, "unterminated f-string"));
         }
-        if nul_at >= 0 { s = str_slice(s, 0, nul_at); }
+        if nul_at >= 0 {
+            s = str_slice(s, 0, nul_at);
+        }
 
         return token_new(TokenKind::FString(s), line, col);
     }
 
-    fn read_string(self: &mut Lexer) -> Token {
+    fn read_string(self: & mut Lexer) -> Token {
         var line: i64 = self.line;
         var col: i64 = self.col;
-        self.advance(); // consume opening '"'
+        self.advance();
+        // consume opening '"'
 
         var s: str = "";
-        var nul_at: i64 = -1;
+        var nul_at: i64 = - 1;
         while self.pos < self.src_len && self.peek() != 34 {
             var c: i64 = self.peek();
             if c == 92 {
                 // '\'
                 self.advance();
                 var esc: i64 = self.advance();
-                if esc == 110 { s = str_concat(s, "\n"); }       // n
-                else if esc == 116 { s = str_concat(s, "\t"); }  // t
-                else if esc == 114 { s = str_concat(s, "\r"); }  // r
-                else if esc == 92 { s = str_concat(s, "\\"); }   // backslash
-                else if esc == 34 { s = str_concat(s, "\""); }   // '"'
-                else if esc == 48 { if nul_at < 0 { nul_at = str_len(s); } } // NUL: the C string ends here
-                else if esc == 120 || (esc == 117 && self.peek() == 123) {    // xHH, u{...}
+                if esc == 110 {
+                    s = str_concat(s, "\n");
+                }  // n
+                else if esc == 116 {
+                    s = str_concat(s, "\t");
+                }  // t
+                else if esc == 114 {
+                    s = str_concat(s, "\r");
+                }  // r
+                else if esc == 92 {
+                    s = str_concat(s, "\\");
+                }  // backslash
+                else if esc == 34 {
+                    s = str_concat(s, "\"");
+                }  // '"'
+                else if esc == 48 {
+                    if nul_at < 0 {
+                        nul_at = str_len(s);
+                    }
+                }  // NUL: the C string ends here
+                else if esc == 120 || (esc == 117 && self.peek() == 123) {
+                    // xHH, u{...}
                     var hv: i64 = 0;
-                    if esc == 120 { hv = self.read_hex_value(line, col, 2, false); }
-                    else { self.advance(); hv = self.read_hex_value(line, col, 6, true); }
-                    if hv == 0 { if nul_at < 0 { nul_at = str_len(s); } }   // NUL: the C string ends here
-                    else { s = str_concat(s, lex_utf8_encode(hv)); }
-                }
-                else {
+                    if esc == 120 {
+                        hv = self.read_hex_value(line, col, 2, false);
+                    } else {
+                        self.advance();
+                        hv = self.read_hex_value(line, col, 6, true);
+                    }
+                    if hv == 0 {
+                        if nul_at < 0 {
+                            nul_at = str_len(s);
+                        }
+                    }  // NUL: the C string ends here
+                    else {
+                        s = str_concat(s, lex_utf8_encode(hv));
+                    }
+                } else {
                     self.errors.push(lex_error(line, col, "unknown escape sequence \\" + byte_to_str(esc)));
                     s = str_concat(s, byte_to_str(esc));
                 }
@@ -501,11 +599,14 @@ impl Lexer {
         }
 
         if self.pos < self.src_len {
-            self.advance(); // consume closing '"'
+            self.advance();
+            // consume closing '"'
         } else {
             self.errors.push(lex_error(line, col, "unterminated string"));
         }
-        if nul_at >= 0 { s = str_slice(s, 0, nul_at); }
+        if nul_at >= 0 {
+            s = str_slice(s, 0, nul_at);
+        }
 
         return token_new(TokenKind::StringLit(s), line, col);
     }
@@ -513,10 +614,11 @@ impl Lexer {
     /// Read a raw string: r"..." or r#"..."# (with N hash signs).
     /// No escape sequences are processed -- content is taken literally.
     /// The closing delimiter is '"' followed by the same number of '#'.
-    fn read_raw_string(self: &mut Lexer) -> Token {
+    fn read_raw_string(self: & mut Lexer) -> Token {
         var line: i64 = self.line;
         var col: i64 = self.col;
-        self.advance(); // consume 'r'
+        self.advance();
+        // consume 'r'
 
         // Count '#' signs (0 or more)
         var hash_count: i64 = 0;
@@ -530,7 +632,8 @@ impl Lexer {
             self.errors.push(lex_error(line, col, "expected '\"' after r" + repeat_char(35, hash_count)));
             return token_new(TokenKind::StringLit(""), line, col);
         }
-        self.advance(); // consume opening '"'
+        self.advance();
+        // consume opening '"'
 
         var s: str = "";
         // Read until we find '"' followed by exactly hash_count '#' signs
@@ -547,10 +650,12 @@ impl Lexer {
                     i = i + 1;
                 }
                 if matched {
-                    self.advance(); // consume '"'
+                    self.advance();
+                    // consume '"'
                     var j: i64 = 0;
                     while j < hash_count {
-                        self.advance(); // consume each '#'
+                        self.advance();
+                        // consume each '#'
                         j = j + 1;
                     }
                     return token_new(TokenKind::StringLit(s), line, col);
@@ -563,7 +668,7 @@ impl Lexer {
         return token_new(TokenKind::StringLit(s), line, col);
     }
 
-    fn read_operator(self: &mut Lexer) -> Token {
+    fn read_operator(self: & mut Lexer) -> Token {
         var line: i64 = self.line;
         var col: i64 = self.col;
         var c: i64 = self.advance();
@@ -572,77 +677,177 @@ impl Lexer {
 
         if c == 43 {
             // '+'
-            if self.peek() == 61 { self.advance(); kind = TokenKind::PlusEq; }
-            else { kind = TokenKind::Plus; }
+            if self.peek() == 61 {
+                self.advance();
+                kind = TokenKind::PlusEq;
+            } else {
+                kind = TokenKind::Plus;
+            }
         } else if c == 45 {
             // '-'
-            if self.peek() == 62 { self.advance(); kind = TokenKind::Arrow; }       // '->'
-            else if self.peek() == 61 { self.advance(); kind = TokenKind::MinusEq; } // '-='
-            else { kind = TokenKind::Minus; }
+            if self.peek() == 62 {
+                self.advance();
+                kind = TokenKind::Arrow;
+            }  // '->'
+            else if self.peek() == 61 {
+                self.advance();
+                kind = TokenKind::MinusEq;
+            }  // '-='
+            else {
+                kind = TokenKind::Minus;
+            }
         } else if c == 42 {
             // '*'
-            if self.peek() == 61 { self.advance(); kind = TokenKind::StarEq; }
-            else { kind = TokenKind::Star; }
+            if self.peek() == 61 {
+                self.advance();
+                kind = TokenKind::StarEq;
+            } else {
+                kind = TokenKind::Star;
+            }
         } else if c == 47 {
             // '/'
-            if self.peek() == 61 { self.advance(); kind = TokenKind::SlashEq; }
-            else { kind = TokenKind::Slash; }
+            if self.peek() == 61 {
+                self.advance();
+                kind = TokenKind::SlashEq;
+            } else {
+                kind = TokenKind::Slash;
+            }
         } else if c == 37 {
             // '%'
-            if self.peek() == 61 { self.advance(); kind = TokenKind::PercentEq; }
-            else { kind = TokenKind::Percent; }
+            if self.peek() == 61 {
+                self.advance();
+                kind = TokenKind::PercentEq;
+            } else {
+                kind = TokenKind::Percent;
+            }
         } else if c == 61 {
             // '='
-            if self.peek() == 61 { self.advance(); kind = TokenKind::EqEq; }        // '=='
-            else if self.peek() == 62 { self.advance(); kind = TokenKind::FatArrow; } // '=>'
-            else { kind = TokenKind::Eq; }
+            if self.peek() == 61 {
+                self.advance();
+                kind = TokenKind::EqEq;
+            }  // '=='
+            else if self.peek() == 62 {
+                self.advance();
+                kind = TokenKind::FatArrow;
+            }  // '=>'
+            else {
+                kind = TokenKind::Eq;
+            }
         } else if c == 33 {
             // '!'
-            if self.peek() == 61 { self.advance(); kind = TokenKind::BangEq; }
-            else { kind = TokenKind::Bang; }
+            if self.peek() == 61 {
+                self.advance();
+                kind = TokenKind::BangEq;
+            } else {
+                kind = TokenKind::Bang;
+            }
         } else if c == 60 {
             // '<'
-            if self.peek() == 61 { self.advance(); kind = TokenKind::LtEq; }       // '<='
+            if self.peek() == 61 {
+                self.advance();
+                kind = TokenKind::LtEq;
+            }  // '<='
             else if self.peek() == 60 {
-                self.advance(); // consume second '<'
-                if self.peek() == 61 { self.advance(); kind = TokenKind::ShlEq; }  // '<<='
-                else { kind = TokenKind::Shl; }                                    // '<<'
-            } else { kind = TokenKind::Lt; }
+                self.advance();
+                // consume second '<'
+                if self.peek() == 61 {
+                    self.advance();
+                    kind = TokenKind::ShlEq;
+                }  // '<<='
+                else {
+                    kind = TokenKind::Shl;
+                }
+                // '<<'
+            } else {
+                kind = TokenKind::Lt;
+            }
         } else if c == 62 {
             // '>'
-            if self.peek() == 61 { self.advance(); kind = TokenKind::GtEq; }       // '>='
+            if self.peek() == 61 {
+                self.advance();
+                kind = TokenKind::GtEq;
+            }  // '>='
             else if self.peek() == 62 {
-                self.advance(); // consume second '>'
-                if self.peek() == 61 { self.advance(); kind = TokenKind::ShrEq; }  // '>>='
-                else { kind = TokenKind::Shr; }                                    // '>>'
-            } else { kind = TokenKind::Gt; }
+                self.advance();
+                // consume second '>'
+                if self.peek() == 61 {
+                    self.advance();
+                    kind = TokenKind::ShrEq;
+                }  // '>>='
+                else {
+                    kind = TokenKind::Shr;
+                }
+                // '>>'
+            } else {
+                kind = TokenKind::Gt;
+            }
         } else if c == 38 {
             // '&'
-            if self.peek() == 38 { self.advance(); kind = TokenKind::And; }        // '&&'
-            else if self.peek() == 61 { self.advance(); kind = TokenKind::AmpEq; } // '&='
-            else { kind = TokenKind::Ampersand; }
+            if self.peek() == 38 {
+                self.advance();
+                kind = TokenKind::And;
+            }  // '&&'
+            else if self.peek() == 61 {
+                self.advance();
+                kind = TokenKind::AmpEq;
+            }  // '&='
+            else {
+                kind = TokenKind::Ampersand;
+            }
         } else if c == 124 {
             // '|'
-            if self.peek() == 124 { self.advance(); kind = TokenKind::Or; }         // '||'
-            else if self.peek() == 62 { self.advance(); kind = TokenKind::PipeArrow; } // '|>'
-            else if self.peek() == 61 { self.advance(); kind = TokenKind::PipeEq; } // '|='
-            else { kind = TokenKind::Pipe; }
+            if self.peek() == 124 {
+                self.advance();
+                kind = TokenKind::Or;
+            }  // '||'
+            else if self.peek() == 62 {
+                self.advance();
+                kind = TokenKind::PipeArrow;
+            }  // '|>'
+            else if self.peek() == 61 {
+                self.advance();
+                kind = TokenKind::PipeEq;
+            }  // '|='
+            else {
+                kind = TokenKind::Pipe;
+            }
         } else if c == 94 {
             // '^'
-            if self.peek() == 61 { self.advance(); kind = TokenKind::CaretEq; }
-            else { kind = TokenKind::Caret; }
+            if self.peek() == 61 {
+                self.advance();
+                kind = TokenKind::CaretEq;
+            } else {
+                kind = TokenKind::Caret;
+            }
         } else if c == 126 {
             // '~'
-            if self.peek() == 62 { self.advance(); kind = TokenKind::TildeArrow; } // '~>'
-            else { kind = TokenKind::Tilde; }
+            if self.peek() == 62 {
+                self.advance();
+                kind = TokenKind::TildeArrow;
+            }  // '~>'
+            else {
+                kind = TokenKind::Tilde;
+            }
         } else if c == 46 {
             // '.'
             if self.peek() == 46 {
-                self.advance(); // consume second '.'
-                if self.peek() == 61 { self.advance(); kind = TokenKind::DotDotEq; } // '..='
-                else if self.peek() == 46 { self.advance(); kind = TokenKind::DotDotDot; } // '...'
-                else { kind = TokenKind::DotDot; }                                  // '..'
-            } else { kind = TokenKind::Dot; }
+                self.advance();
+                // consume second '.'
+                if self.peek() == 61 {
+                    self.advance();
+                    kind = TokenKind::DotDotEq;
+                }  // '..='
+                else if self.peek() == 46 {
+                    self.advance();
+                    kind = TokenKind::DotDotDot;
+                }  // '...'
+                else {
+                    kind = TokenKind::DotDot;
+                }
+                // '..'
+            } else {
+                kind = TokenKind::Dot;
+            }
         } else if c == 35 {
             // '#'
             kind = TokenKind::Hash;
@@ -654,16 +859,28 @@ impl Lexer {
             kind = TokenKind::Comma;
         } else if c == 58 {
             // ':'
-            if self.peek() == 58 { self.advance(); kind = TokenKind::DoubleColon; }
-            else { kind = TokenKind::Colon; }
+            if self.peek() == 58 {
+                self.advance();
+                kind = TokenKind::DoubleColon;
+            } else {
+                kind = TokenKind::Colon;
+            }
         } else if c == 59 {
             // ';'
             kind = TokenKind::Semicolon;
         } else if c == 63 {
             // '?'
-            if self.peek() == 63 { self.advance(); kind = TokenKind::QuestionQuestion; } // '??'
-            else if self.peek() == 46 { self.advance(); kind = TokenKind::QuestionDot; } // '?.'
-            else { kind = TokenKind::Question; }
+            if self.peek() == 63 {
+                self.advance();
+                kind = TokenKind::QuestionQuestion;
+            }  // '??'
+            else if self.peek() == 46 {
+                self.advance();
+                kind = TokenKind::QuestionDot;
+            }  // '?.'
+            else {
+                kind = TokenKind::Question;
+            }
         } else if c == 40 {
             // '('
             kind = TokenKind::LParen;
@@ -743,138 +960,312 @@ pub fn keyword_or_ident(s: str) -> TokenKind {
                                                         TokenKind::Ident(_) => {
                                                             return keyword_or_ident_type(s);
                                                         }
-                                                        other7 => { return other7; }
+                                                        other7 => {
+                                                            return other7;
+                                                        }
                                                     }
                                                 }
-                                                other6 => { return other6; }
+                                                other6 => {
+                                                    return other6;
+                                                }
                                             }
                                         }
-                                        other5 => { return other5; }
+                                        other5 => {
+                                            return other5;
+                                        }
                                     }
                                 }
-                                other4 => { return other4; }
+                                other4 => {
+                                    return other4;
+                                }
                             }
                         }
-                        other3 => { return other3; }
+                        other3 => {
+                            return other3;
+                        }
                     }
                 }
-                other2 => { return other2; }
+                other2 => {
+                    return other2;
+                }
             }
         }
-        other => { return other; }
+        other => {
+            return other;
+        }
     }
 }
 
 fn keyword_or_ident_a(s: str) -> TokenKind {
-    if s == "fn" { return TokenKind::Fn; }
-    if s == "val" { return TokenKind::Val; }
-    if s == "var" { return TokenKind::Var; }
-    if s == "mut" { return TokenKind::Mut; }
-    if s == "const" { return TokenKind::Const; }
-    if s == "given" { return TokenKind::Given; }
-    if s == "ensure" { return TokenKind::Ensure; }
-    if s == "cap" { return TokenKind::Cap; }
-    if s == "type" { return TokenKind::Type; }
-    if s == "return" { return TokenKind::Return; }
+    if s == "fn" {
+        return TokenKind::Fn;
+    }
+    if s == "val" {
+        return TokenKind::Val;
+    }
+    if s == "var" {
+        return TokenKind::Var;
+    }
+    if s == "mut" {
+        return TokenKind::Mut;
+    }
+    if s == "const" {
+        return TokenKind::Const;
+    }
+    if s == "given" {
+        return TokenKind::Given;
+    }
+    if s == "ensure" {
+        return TokenKind::Ensure;
+    }
+    if s == "cap" {
+        return TokenKind::Cap;
+    }
+    if s == "type" {
+        return TokenKind::Type;
+    }
+    if s == "return" {
+        return TokenKind::Return;
+    }
     return TokenKind::Ident(s);
 }
 
 fn keyword_or_ident_b(s: str) -> TokenKind {
-    if s == "if" { return TokenKind::If; }
-    if s == "else" { return TokenKind::Else; }
-    if s == "match" { return TokenKind::Match; }
-    if s == "select" { return TokenKind::Select; }
-    if s == "struct" { return TokenKind::Struct; }
-    if s == "enum" { return TokenKind::Enum; }
-    if s == "impl" { return TokenKind::Impl; }
-    if s == "pub" { return TokenKind::Pub; }
-    if s == "use" { return TokenKind::Use; }
-    if s == "module" { return TokenKind::Module; }
+    if s == "if" {
+        return TokenKind::If;
+    }
+    if s == "else" {
+        return TokenKind::Else;
+    }
+    if s == "match" {
+        return TokenKind::Match;
+    }
+    if s == "select" {
+        return TokenKind::Select;
+    }
+    if s == "struct" {
+        return TokenKind::Struct;
+    }
+    if s == "enum" {
+        return TokenKind::Enum;
+    }
+    if s == "impl" {
+        return TokenKind::Impl;
+    }
+    if s == "pub" {
+        return TokenKind::Pub;
+    }
+    if s == "use" {
+        return TokenKind::Use;
+    }
+    if s == "module" {
+        return TokenKind::Module;
+    }
     return TokenKind::Ident(s);
 }
 
 fn keyword_or_ident_c(s: str) -> TokenKind {
-    if s == "with" { return TokenKind::With; }
-    if s == "async" { return TokenKind::Async; }
-    if s == "await" { return TokenKind::Await; }
-    if s == "comptime" { return TokenKind::Comptime; }
-    if s == "defer" { return TokenKind::Defer; }
-    if s == "spawn" { return TokenKind::Spawn; }
-    if s == "yield" { return TokenKind::Yield; }
-    if s == "move" { return TokenKind::Move; }
-    if s == "static" { return TokenKind::Static; }
-    if s == "try" { return TokenKind::Try; }
-    if s == "in" { return TokenKind::In; }
+    if s == "with" {
+        return TokenKind::With;
+    }
+    if s == "async" {
+        return TokenKind::Async;
+    }
+    if s == "await" {
+        return TokenKind::Await;
+    }
+    if s == "comptime" {
+        return TokenKind::Comptime;
+    }
+    if s == "defer" {
+        return TokenKind::Defer;
+    }
+    if s == "spawn" {
+        return TokenKind::Spawn;
+    }
+    if s == "yield" {
+        return TokenKind::Yield;
+    }
+    if s == "move" {
+        return TokenKind::Move;
+    }
+    if s == "static" {
+        return TokenKind::Static;
+    }
+    if s == "try" {
+        return TokenKind::Try;
+    }
+    if s == "in" {
+        return TokenKind::In;
+    }
     return TokenKind::Ident(s);
 }
 
 fn keyword_or_ident_d(s: str) -> TokenKind {
-    if s == "as" { return TokenKind::As; }
-    if s == "dyn" { return TokenKind::Dyn; }
-    if s == "where" { return TokenKind::Where; }
-    if s == "region" { return TokenKind::Region; }
-    if s == "sandbox" { return TokenKind::Sandbox; }
-    if s == "unsafe" { return TokenKind::Unsafe; }
-    if s == "txn" { return TokenKind::Txn; }
-    if s == "persist" { return TokenKind::Persist; }
-    if s == "for" { return TokenKind::For; }
-    if s == "while" { return TokenKind::While; }
+    if s == "as" {
+        return TokenKind::As;
+    }
+    if s == "dyn" {
+        return TokenKind::Dyn;
+    }
+    if s == "where" {
+        return TokenKind::Where;
+    }
+    if s == "region" {
+        return TokenKind::Region;
+    }
+    if s == "sandbox" {
+        return TokenKind::Sandbox;
+    }
+    if s == "unsafe" {
+        return TokenKind::Unsafe;
+    }
+    if s == "txn" {
+        return TokenKind::Txn;
+    }
+    if s == "persist" {
+        return TokenKind::Persist;
+    }
+    if s == "for" {
+        return TokenKind::For;
+    }
+    if s == "while" {
+        return TokenKind::While;
+    }
     return TokenKind::Ident(s);
 }
 
 fn keyword_or_ident_e(s: str) -> TokenKind {
-    if s == "loop" { return TokenKind::Loop; }
-    if s == "break" { return TokenKind::Break; }
-    if s == "continue" { return TokenKind::Continue; }
-    if s == "handle" { return TokenKind::Handle; }
-    if s == "do" { return TokenKind::Do; }
-    if s == "interrupt" { return TokenKind::Interrupt; }
-    if s == "extern" { return TokenKind::Extern; }
-    if s == "guard" { return TokenKind::Guard; }
-    if s == "is" { return TokenKind::Is; }
-    if s == "resume" { return TokenKind::Resume; }
-    if s == "true" { return TokenKind::True; }
-    if s == "false" { return TokenKind::False; }
+    if s == "loop" {
+        return TokenKind::Loop;
+    }
+    if s == "break" {
+        return TokenKind::Break;
+    }
+    if s == "continue" {
+        return TokenKind::Continue;
+    }
+    if s == "handle" {
+        return TokenKind::Handle;
+    }
+    if s == "do" {
+        return TokenKind::Do;
+    }
+    if s == "interrupt" {
+        return TokenKind::Interrupt;
+    }
+    if s == "extern" {
+        return TokenKind::Extern;
+    }
+    if s == "guard" {
+        return TokenKind::Guard;
+    }
+    if s == "is" {
+        return TokenKind::Is;
+    }
+    if s == "resume" {
+        return TokenKind::Resume;
+    }
+    if s == "true" {
+        return TokenKind::True;
+    }
+    if s == "false" {
+        return TokenKind::False;
+    }
     return TokenKind::Ident(s);
 }
 
 fn keyword_or_ident_ml(s: str) -> TokenKind {
-    if s == "layer" { return TokenKind::Layer; }
-    if s == "model" { return TokenKind::Model; }
-    if s == "grad" { return TokenKind::Grad; }
-    if s == "backward" { return TokenKind::Backward; }
-    if s == "kernel" { return TokenKind::Kernel; }
+    if s == "layer" {
+        return TokenKind::Layer;
+    }
+    if s == "model" {
+        return TokenKind::Model;
+    }
+    if s == "grad" {
+        return TokenKind::Grad;
+    }
+    if s == "backward" {
+        return TokenKind::Backward;
+    }
+    if s == "kernel" {
+        return TokenKind::Kernel;
+    }
     return TokenKind::Ident(s);
 }
 
 fn keyword_or_ident_game(s: str) -> TokenKind {
-    if s == "component" { return TokenKind::Component; }
-    if s == "system" { return TokenKind::System; }
-    if s == "query" { return TokenKind::Query; }
-    if s == "state" { return TokenKind::State; }
-    if s == "on" { return TokenKind::On; }
+    if s == "component" {
+        return TokenKind::Component;
+    }
+    if s == "system" {
+        return TokenKind::System;
+    }
+    if s == "query" {
+        return TokenKind::Query;
+    }
+    if s == "state" {
+        return TokenKind::State;
+    }
+    if s == "on" {
+        return TokenKind::On;
+    }
     return TokenKind::Ident(s);
 }
 
 fn keyword_or_ident_type(s: str) -> TokenKind {
     // q8/q4 are aliases for I8 (quantized 8/4-bit, stored in i8)
-    if s == "q8" { return TokenKind::I8; }
-    if s == "q4" { return TokenKind::I8; }
-    if s == "i8" { return TokenKind::I8; }
-    if s == "i16" { return TokenKind::I16; }
-    if s == "i32" { return TokenKind::I32; }
-    if s == "i64" { return TokenKind::I64; }
-    if s == "i128" { return TokenKind::I128; }
-    if s == "u8" { return TokenKind::U8; }
-    if s == "u16" { return TokenKind::U16; }
-    if s == "u32" { return TokenKind::U32; }
-    if s == "u64" { return TokenKind::U64; }
-    if s == "u128" { return TokenKind::U128; }
-    if s == "f32" { return TokenKind::F32; }
-    if s == "f64" { return TokenKind::F64; }
-    if s == "bool" { return TokenKind::Bool; }
-    if s == "str" { return TokenKind::Str; }
-    if s == "void" { return TokenKind::Void; }
+    if s == "q8" {
+        return TokenKind::I8;
+    }
+    if s == "q4" {
+        return TokenKind::I8;
+    }
+    if s == "i8" {
+        return TokenKind::I8;
+    }
+    if s == "i16" {
+        return TokenKind::I16;
+    }
+    if s == "i32" {
+        return TokenKind::I32;
+    }
+    if s == "i64" {
+        return TokenKind::I64;
+    }
+    if s == "i128" {
+        return TokenKind::I128;
+    }
+    if s == "u8" {
+        return TokenKind::U8;
+    }
+    if s == "u16" {
+        return TokenKind::U16;
+    }
+    if s == "u32" {
+        return TokenKind::U32;
+    }
+    if s == "u64" {
+        return TokenKind::U64;
+    }
+    if s == "u128" {
+        return TokenKind::U128;
+    }
+    if s == "f32" {
+        return TokenKind::F32;
+    }
+    if s == "f64" {
+        return TokenKind::F64;
+    }
+    if s == "bool" {
+        return TokenKind::Bool;
+    }
+    if s == "str" {
+        return TokenKind::Str;
+    }
+    if s == "void" {
+        return TokenKind::Void;
+    }
     return TokenKind::Ident(s);
 }
 
@@ -903,7 +1294,9 @@ pub fn lex_is_alphanumeric(c: i64) -> bool {
 /// UTF-8 encoding of the scalar `cp` (escape sequences in strings: Rust's
 /// String::push(char) in src/lexer.rs stores the char as UTF-8).
 pub fn lex_utf8_encode(cp: i64) -> str {
-    if cp < 128 { return byte_to_str(cp); }
+    if cp < 128 {
+        return byte_to_str(cp);
+    }
     if cp < 2048 {
         return byte_to_str(192 + cp / 64) + byte_to_str(128 + cp % 64);
     }
@@ -914,23 +1307,23 @@ pub fn lex_utf8_encode(cp: i64) -> str {
 }
 
 pub fn lex_is_hexdigit(c: i64) -> bool {
-    return (c >= 48 && c <= 57)   // '0'..'9'
-        || (c >= 65 && c <= 70)   // 'A'..'F'
-        || (c >= 97 && c <= 102); // 'a'..'f'
+    return (c >= 48 && c <= 57)  // '0'..'9'
+    || (c >= 65 && c <= 70)  // 'A'..'F'
+    || (c >= 97 && c <= 102);
+    // 'a'..'f'
 }
 
 // --- Number parsing helpers -----------------------------------------------
 
 /// Parse `s` as an integer in the given radix (2, 8, 10, 16). Returns 0 on
 /// any non-digit. Used for binary/octal literals (str_parse_hex handles 16).
-@wrapping
-pub fn parse_radix(s: str, radix: i64) -> i64 {
+@wrapping pub fn parse_radix(s: str, radix: i64) -> i64 {
     var result: i64 = 0;
     var i: i64 = 0;
     var n: i64 = str_len(s);
     while i < n {
         var b: i64 = str_byte_at(s, i);
-        var digit: i64 = -1;
+        var digit: i64 = - 1;
         if b >= 48 && b <= 57 {
             digit = b - 48;
         } else if b >= 65 && b <= 90 {
@@ -972,8 +1365,7 @@ pub fn lex_error(line: i64, col: i64, msg: str) -> str {
 
 /// The value of a decimal literal. One above i64::MAX is a u64: it keeps its
 /// bits.
-@wrapping
-fn lex_parse_int(s: str) -> i64 {
+@wrapping fn lex_parse_int(s: str) -> i64 {
     var v: i64 = 0;
     var i: i64 = 0;
     var n: i64 = str_len(s);

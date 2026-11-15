@@ -22,18 +22,14 @@
 //   }
 
 module ota;
-
-use vec;
-use crypto;
-
+ use vec; use crypto;
 // ─── Simple Hash (for verification) ────────────────────────────────────
 //
 // Uses a simple FNV-1a hash for checksum verification.
 // For production use, replace with crypto_sha256 from crypto.fd.
 
 /// Compute a simple hash of binary data and return as hex string.
-@wrapping
-fn ota_hash_hex(data: Vec<i64>) -> str {
+@wrapping fn ota_hash_hex(data: Vec<i64>) -> str {
     var h = 0xcbf29ce484222325;
     for i in 0..data.len() {
         h = (h ^ data.get(i)) & 0xFFFFFFFFFFFFFFFF;
@@ -52,23 +48,30 @@ fn ota_hash_hex(data: Vec<i64>) -> str {
 
 // ─── OTA States ────────────────────────────────────────────────────────
 
-pub const OTA_STATE_IDLE: i64        = 0;
-pub const OTA_STATE_DOWNLOADING: i64 = 1;
-pub const OTA_STATE_VERIFYING: i64   = 2;
-pub const OTA_STATE_APPLYING: i64    = 3;
-pub const OTA_STATE_COMMITTED: i64   = 4;
-pub const OTA_STATE_ROLLBACK: i64    = 5;
-pub const OTA_STATE_FAILED: i64      = 6;
-
+pub const OTA_STATE_IDLE: i64 = 0; pub const OTA_STATE_DOWNLOADING: i64 = 1; pub const OTA_STATE_VERIFYING: i64 = 2; pub const OTA_STATE_APPLYING: i64 = 3; pub const OTA_STATE_COMMITTED: i64 = 4; pub const OTA_STATE_ROLLBACK: i64 = 5; pub const OTA_STATE_FAILED: i64 = 6;
 /// Get OTA state name.
 pub fn ota_state_name(state: i64) -> str {
-    if state == OTA_STATE_IDLE        { return "IDLE"; }
-    if state == OTA_STATE_DOWNLOADING { return "DOWNLOADING"; }
-    if state == OTA_STATE_VERIFYING   { return "VERIFYING"; }
-    if state == OTA_STATE_APPLYING    { return "APPLYING"; }
-    if state == OTA_STATE_COMMITTED   { return "COMMITTED"; }
-    if state == OTA_STATE_ROLLBACK    { return "ROLLBACK"; }
-    if state == OTA_STATE_FAILED      { return "FAILED"; }
+    if state == OTA_STATE_IDLE {
+        return "IDLE";
+    }
+    if state == OTA_STATE_DOWNLOADING {
+        return "DOWNLOADING";
+    }
+    if state == OTA_STATE_VERIFYING {
+        return "VERIFYING";
+    }
+    if state == OTA_STATE_APPLYING {
+        return "APPLYING";
+    }
+    if state == OTA_STATE_COMMITTED {
+        return "COMMITTED";
+    }
+    if state == OTA_STATE_ROLLBACK {
+        return "ROLLBACK";
+    }
+    if state == OTA_STATE_FAILED {
+        return "FAILED";
+    }
     return "UNKNOWN";
 }
 
@@ -82,45 +85,42 @@ pub fn ota_state_name(state: i64) -> str {
 pub struct OTAManifest {
     pub version: str,
     pub filename: str,
-    pub size: i64,             // in bytes
-    pub checksum: str,         // "sha256:hexstring"
-    pub signature: str,        // hex signature (empty if unsigned)
-    pub min_version: str,      // minimum current version required
-    pub max_version: str,      // maximum current version allowed
-    pub timestamp: i64,        // manifest creation time
+    pub size: i64,
+    // in bytes
+    pub checksum: str,
+    // "sha256:hexstring"
+    pub signature: str,
+    // hex signature (empty if unsigned)
+    pub min_version: str,
+    // minimum current version required
+    pub max_version: str,
+    // maximum current version allowed
+    pub timestamp: i64,
+    // manifest creation time
     pub description: str,
 }
 
 /// Create a new OTA manifest.
 pub fn ota_manifest_new(filename: str, size: i64, checksum: str) -> OTAManifest {
     return OTAManifest {
-        version: "",
-        filename: filename,
-        size: size,
-        checksum: checksum,
-        signature: "",
-        min_version: "",
-        max_version: "",
-        timestamp: 0,
-        description: "",
+        version: "", filename: filename, size: size, checksum: checksum, signature: "", min_version: "", max_version: "", timestamp: 0, description: "",
     };
 }
 
 /// Set version information.
-pub fn ota_manifest_set_version(manifest: &mut OTAManifest, version: str,
-                                 min_ver: str, max_ver: str) -> void {
+pub fn ota_manifest_set_version(manifest: & mut OTAManifest, version: str, min_ver: str, max_ver: str) -> void {
     manifest.version = version;
     manifest.min_version = min_ver;
     manifest.max_version = max_ver;
 }
 
 /// Set signature.
-pub fn ota_manifest_set_signature(manifest: &mut OTAManifest, signature: str) -> void {
+pub fn ota_manifest_set_signature(manifest: & mut OTAManifest, signature: str) -> void {
     manifest.signature = signature;
 }
 
 /// Set description.
-pub fn ota_manifest_set_description(manifest: &mut OTAManifest, desc: str) -> void {
+pub fn ota_manifest_set_description(manifest: & mut OTAManifest, desc: str) -> void {
     manifest.description = desc;
 }
 
@@ -136,9 +136,15 @@ pub fn ota_verify_payload(manifest: OTAManifest, payload: str) -> bool {
 /// Are the manifest's fields well formed? This only looks at the manifest: it
 /// says nothing about the update itself, which is ota_verify_payload's work.
 pub fn ota_verify_manifest(manifest: OTAManifest) -> bool {
-    if manifest.filename == "" { return false; }
-    if manifest.size <= 0 { return false; }
-    if manifest.checksum == "" { return false; }
+    if manifest.filename == "" {
+        return false;
+    }
+    if manifest.size <= 0 {
+        return false;
+    }
+    if manifest.checksum == "" {
+        return false;
+    }
     // Check checksum starts with "sha256:"
     if str_len(manifest.checksum) < 8 {
         return false;
@@ -183,24 +189,18 @@ pub struct OTASession {
 /// Create a new OTA session from a manifest.
 pub fn ota_session_new(manifest: OTAManifest) -> OTASession {
     return OTASession {
-        manifest: manifest,
-        state: OTA_STATE_IDLE,
-        bytes_downloaded: 0,
-        bytes_verified: 0,
-        error_msg: "",
-        retry_count: 0,
-        max_retries: 3,
+        manifest: manifest, state: OTA_STATE_IDLE, bytes_downloaded: 0, bytes_verified: 0, error_msg: "", retry_count: 0, max_retries: 3,
     };
 }
 
 /// Start downloading the update.
-pub fn ota_session_start_download(session: &mut OTASession) -> void {
+pub fn ota_session_start_download(session: & mut OTASession) -> void {
     session.state = OTA_STATE_DOWNLOADING;
     session.bytes_downloaded = 0;
 }
 
 /// Update download progress.
-pub fn ota_session_download_progress(session: &mut OTASession, bytes: i64) -> void {
+pub fn ota_session_download_progress(session: & mut OTASession, bytes: i64) -> void {
     session.bytes_downloaded = session.bytes_downloaded + bytes;
     if session.bytes_downloaded >= session.manifest.size {
         session.state = OTA_STATE_VERIFYING;
@@ -218,7 +218,7 @@ pub fn ota_session_download_percent(session: OTASession) -> i64 {
 /// Verify the downloaded binary against the manifest checksum.
 /// binary_data: the downloaded bytes.
 /// Returns true if verification succeeds.
-pub fn ota_session_verify(session: &mut OTASession, binary_data: Vec<i64>) -> bool {
+pub fn ota_session_verify(session: & mut OTASession, binary_data: Vec<i64>) -> bool {
     if binary_data.len() != session.manifest.size {
         session.error_msg = "Size mismatch";
         session.state = OTA_STATE_FAILED;
@@ -239,22 +239,22 @@ pub fn ota_session_verify(session: &mut OTASession, binary_data: Vec<i64>) -> bo
 }
 
 /// Apply the update (transition to applying state).
-pub fn ota_session_apply(session: &mut OTASession) -> void {
+pub fn ota_session_apply(session: & mut OTASession) -> void {
     session.state = OTA_STATE_APPLYING;
 }
 
 /// Commit the update (mark as committed, can't rollback).
-pub fn ota_session_commit(session: &mut OTASession) -> void {
+pub fn ota_session_commit(session: & mut OTASession) -> void {
     session.state = OTA_STATE_COMMITTED;
 }
 
 /// Rollback the update (revert to previous version).
-pub fn ota_session_rollback(session: &mut OTASession) -> void {
+pub fn ota_session_rollback(session: & mut OTASession) -> void {
     session.state = OTA_STATE_ROLLBACK;
 }
 
 /// Mark the session as failed.
-pub fn ota_session_fail(session: &mut OTASession, error_msg: str) -> void {
+pub fn ota_session_fail(session: & mut OTASession, error_msg: str) -> void {
     session.state = OTA_STATE_FAILED;
     session.error_msg = error_msg;
 }
@@ -265,7 +265,7 @@ pub fn ota_session_can_retry(session: OTASession) -> bool {
 }
 
 /// Retry the download.
-pub fn ota_session_retry(session: &mut OTASession) -> void {
+pub fn ota_session_retry(session: & mut OTASession) -> void {
     session.retry_count = session.retry_count + 1;
     session.state = OTA_STATE_DOWNLOADING;
     session.bytes_downloaded = 0;

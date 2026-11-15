@@ -7,61 +7,133 @@
 // directly interpreting their AST bodies when called from a comptime context.
 
 module compiler::comptime_eval;
-
-use core;
-use vec;
-use string;
-use compiler::ast;
-use compiler::token;
-use compiler::lexer;
-use compiler::parser;
-
+ use core; use vec; use string; use compiler::ast; use compiler::token; use compiler::lexer; use compiler::parser;
 // --- Box helpers ---------------------------------------------------------
 // Each module defines its own box_expr_unbox because Fides has no trait-based
 // generic unbox. This mirrors the pattern in lower.fd, typechecker.fd, etc.
 
 pub fn ct_box_expr_unbox(b: Box<Expr>) -> Expr {
     match b {
-        Expr::IntLit(v) => { return Expr::IntLit(v); }
-        Expr::FloatLit(v) => { return Expr::FloatLit(v); }
-        Expr::StringLit(v) => { return Expr::StringLit(v); }
-        Expr::BoolLit(v) => { return Expr::BoolLit(v); }
-        Expr::Ident(n) => { return Expr::Ident(n); }
-        Expr::Binary(op, l, r) => { return Expr::Binary(op, l, r); }
-        Expr::Unary(op, e) => { return Expr::Unary(op, e); }
-        Expr::Call(n, a) => { return Expr::Call(n, a); }
-        Expr::FieldAccess(e, f) => { return Expr::FieldAccess(e, f); }
-        Expr::OptionalFieldAccess(e, f) => { return Expr::OptionalFieldAccess(e, f); }
-        Expr::StructLit(n, f, s) => { return Expr::StructLit(n, f, s); }
-        Expr::If(c, t, e) => { return Expr::If(c, t, e); }
-        Expr::Range(a, b, i) => { return Expr::Range(a, b, i); }
-        Expr::Block(s) => { return Expr::Block(s); }
-        Expr::MethodCall(r, m, a) => { return Expr::MethodCall(r, m, a); }
-        Expr::ArrayLit(e, a) => { return Expr::ArrayLit(e, a); }
-        Expr::Index(a, i) => { return Expr::Index(a, i); }
-        Expr::FString(p) => { return Expr::FString(p); }
-        Expr::Match(e, a) => { return Expr::Match(e, a); }
-        Expr::EnumLit(en, v, a) => { return Expr::EnumLit(en, v, a); }
-        Expr::Ref(e, m) => { return Expr::Ref(e, m); }
-        Expr::Deref(e) => { return Expr::Deref(e); }
-        Expr::StrConcat(l, r) => { return Expr::StrConcat(l, r); }
-        Expr::Try(e) => { return Expr::Try(e); }
-        Expr::Coalesce(l, r) => { return Expr::Coalesce(l, r); }
-        Expr::IsCheck(e, n) => { return Expr::IsCheck(e, n); }
-        Expr::TryBlock(s) => { return Expr::TryBlock(s); }
-        Expr::TupleLit(e) => { return Expr::TupleLit(e); }
-        Expr::Closure(p, b, r) => { return Expr::Closure(p, b, r); }
-        Expr::Cast(e, ty) => { return Expr::Cast(e, ty); }
-        Expr::Asm(s, o) => { return Expr::Asm(s, o); }
-        Expr::Comptime(e) => { return Expr::Comptime(e); }
-        Expr::ComptimeBlock(s) => { return Expr::ComptimeBlock(s); }
-        Expr::ComptimeReflect(n, a) => { return Expr::ComptimeReflect(n, a); }
-        Expr::PipeForward(l, r) => { return Expr::PipeForward(l, r); }
-        Expr::QuantCast(e, ty) => { return Expr::QuantCast(e, ty); }
-        Expr::Await(e) => { return Expr::Await(e); }
-        Expr::Spawn(e) => { return Expr::Spawn(e); }
-        Expr::Yield(e) => { return Expr::Yield(e); }
-        Expr::NamedArg(name, e) => { return Expr::NamedArg(name, e); }
+        Expr::IntLit(v) => {
+            return Expr::IntLit(v);
+        }
+        Expr::FloatLit(v) => {
+            return Expr::FloatLit(v);
+        }
+        Expr::StringLit(v) => {
+            return Expr::StringLit(v);
+        }
+        Expr::BoolLit(v) => {
+            return Expr::BoolLit(v);
+        }
+        Expr::Ident(n) => {
+            return Expr::Ident(n);
+        }
+        Expr::Binary(op, l, r) => {
+            return Expr::Binary(op, l, r);
+        }
+        Expr::Unary(op, e) => {
+            return Expr::Unary(op, e);
+        }
+        Expr::Call(n, a) => {
+            return Expr::Call(n, a);
+        }
+        Expr::FieldAccess(e, f) => {
+            return Expr::FieldAccess(e, f);
+        }
+        Expr::OptionalFieldAccess(e, f) => {
+            return Expr::OptionalFieldAccess(e, f);
+        }
+        Expr::StructLit(n, f, s) => {
+            return Expr::StructLit(n, f, s);
+        }
+        Expr::If(c, t, e) => {
+            return Expr::If(c, t, e);
+        }
+        Expr::Range(a, b, i) => {
+            return Expr::Range(a, b, i);
+        }
+        Expr::Block(s) => {
+            return Expr::Block(s);
+        }
+        Expr::MethodCall(r, m, a) => {
+            return Expr::MethodCall(r, m, a);
+        }
+        Expr::ArrayLit(e, a) => {
+            return Expr::ArrayLit(e, a);
+        }
+        Expr::Index(a, i) => {
+            return Expr::Index(a, i);
+        }
+        Expr::FString(p) => {
+            return Expr::FString(p);
+        }
+        Expr::Match(e, a) => {
+            return Expr::Match(e, a);
+        }
+        Expr::EnumLit(en, v, a) => {
+            return Expr::EnumLit(en, v, a);
+        }
+        Expr::Ref(e, m) => {
+            return Expr::Ref(e, m);
+        }
+        Expr::Deref(e) => {
+            return Expr::Deref(e);
+        }
+        Expr::StrConcat(l, r) => {
+            return Expr::StrConcat(l, r);
+        }
+        Expr::Try(e) => {
+            return Expr::Try(e);
+        }
+        Expr::Coalesce(l, r) => {
+            return Expr::Coalesce(l, r);
+        }
+        Expr::IsCheck(e, n) => {
+            return Expr::IsCheck(e, n);
+        }
+        Expr::TryBlock(s) => {
+            return Expr::TryBlock(s);
+        }
+        Expr::TupleLit(e) => {
+            return Expr::TupleLit(e);
+        }
+        Expr::Closure(p, b, r) => {
+            return Expr::Closure(p, b, r);
+        }
+        Expr::Cast(e, ty) => {
+            return Expr::Cast(e, ty);
+        }
+        Expr::Asm(s, o) => {
+            return Expr::Asm(s, o);
+        }
+        Expr::Comptime(e) => {
+            return Expr::Comptime(e);
+        }
+        Expr::ComptimeBlock(s) => {
+            return Expr::ComptimeBlock(s);
+        }
+        Expr::ComptimeReflect(n, a) => {
+            return Expr::ComptimeReflect(n, a);
+        }
+        Expr::PipeForward(l, r) => {
+            return Expr::PipeForward(l, r);
+        }
+        Expr::QuantCast(e, ty) => {
+            return Expr::QuantCast(e, ty);
+        }
+        Expr::Await(e) => {
+            return Expr::Await(e);
+        }
+        Expr::Spawn(e) => {
+            return Expr::Spawn(e);
+        }
+        Expr::Yield(e) => {
+            return Expr::Yield(e);
+        }
+        Expr::NamedArg(name, e) => {
+            return Expr::NamedArg(name, e);
+        }
     }
     return Expr::IntLit(0);
 }
@@ -75,10 +147,12 @@ pub struct ComptimeEnv {
 }
 
 pub fn ComptimeEnv_new() -> ComptimeEnv {
-    return ComptimeEnv { names: Vec::new(), values: Vec::new() };
+    return ComptimeEnv {
+        names: Vec::new(), values: Vec::new()
+    };
 }
 
-pub fn ComptimeEnv_get(env: &ComptimeEnv, name: str) -> OptExpr {
+pub fn ComptimeEnv_get(env: & ComptimeEnv, name: str) -> OptExpr {
     var i: i64 = 0;
     while i < env.names.len() {
         if env.names.get(i) == name {
@@ -89,7 +163,7 @@ pub fn ComptimeEnv_get(env: &ComptimeEnv, name: str) -> OptExpr {
     return OptExpr::None;
 }
 
-pub fn ComptimeEnv_set(env: &mut ComptimeEnv, name: str, v: Expr) {
+pub fn ComptimeEnv_set(env: & mut ComptimeEnv, name: str, v: Expr) {
     var i: i64 = 0;
     while i < env.names.len() {
         if env.names.get(i) == name {
@@ -102,7 +176,7 @@ pub fn ComptimeEnv_set(env: &mut ComptimeEnv, name: str, v: Expr) {
     env.values.push(v);
 }
 
-pub fn ComptimeEnv_clone(env: &ComptimeEnv) -> ComptimeEnv {
+pub fn ComptimeEnv_clone(env: & ComptimeEnv) -> ComptimeEnv {
     var new_env: ComptimeEnv = ComptimeEnv_new();
     var i: i64 = 0;
     while i < env.names.len() {
@@ -126,37 +200,51 @@ pub fn ct_vec_of(elem_ty: Type, elements: Vec<Expr>) -> Expr {
 }
 
 /// The elements of comptime Vec `e`, when it is one.
-pub fn ct_vec_elems(e: Expr, out: &mut Vec<Expr>) -> bool {
+pub fn ct_vec_elems(e: Expr, out: & mut Vec<Expr>) -> bool {
     match e {
         Expr::ArrayLit(t, els) => {
             match ct_box_type_unbox(t) {
                 Type::Generic(n, _) => {
                     if n == "__ctvec" {
                         var i: i64 = 0;
-                        while i < els.len() { out.push(els.get(i)); i = i + 1; }
+                        while i < els.len() {
+                            out.push(els.get(i));
+                            i = i + 1;
+                        }
                         return true;
                     }
                 }
-                _ => {}
+                _ => {
+                }
             }
         }
-        _ => {}
+        _ => {
+        }
     }
     return false;
 }
 
 fn ct_box_type_unbox(b: Box<Type>) -> Type {
-    return *b;
+    return * b;
 }
 
 /// The type of a computed element: what its literal is.
 fn ct_lit_type(e: Expr) -> Type {
     match e {
-        Expr::IntLit(_) => { return Type::I64; }
-        Expr::FloatLit(_) => { return Type::F64; }
-        Expr::StringLit(_) => { return Type::Str; }
-        Expr::BoolLit(_) => { return Type::Bool; }
-        _ => {}
+        Expr::IntLit(_) => {
+            return Type::I64;
+        }
+        Expr::FloatLit(_) => {
+            return Type::F64;
+        }
+        Expr::StringLit(_) => {
+            return Type::Str;
+        }
+        Expr::BoolLit(_) => {
+            return Type::Bool;
+        }
+        _ => {
+        }
     }
     return Type::I64;
 }
@@ -165,15 +253,18 @@ fn ct_lit_type(e: Expr) -> Type {
 /// `{ var __ctv: Vec<T> = Vec::new(); __ctv.push(e0); ...; __ctv }`.
 pub fn ct_materialize(v: Expr) -> Expr {
     var els: Vec<Expr> = Vec::new();
-    if !ct_vec_elems(v, &mut els) { return v; }
+    if !ct_vec_elems(v, & mut els) {
+        return v;
+    }
     var et: Type = Type::I64;
-    if els.len() > 0 { et = ct_lit_type(els.get(0)); }
+    if els.len() > 0 {
+        et = ct_lit_type(els.get(0));
+    }
     var targs: Vec<Type> = Vec::new();
     targs.push(et);
     var no_args: Vec<Expr> = Vec::new();
     var body: Vec<Stmt> = Vec::new();
-    body.push(Stmt::Let("__ctv", OptType::Some(Type::Generic("Vec", targs)),
-        Expr::MethodCall(Box::new(Expr::Ident("Vec")), "new", no_args), true, false, Vec::new(), 0));
+    body.push(Stmt::Let("__ctv", OptType::Some(Type::Generic("Vec", targs)), Expr::MethodCall(Box::new(Expr::Ident("Vec")), "new", no_args), true, false, Vec::new(), 0));
     var i: i64 = 0;
     while i < els.len() {
         var pa: Vec<Expr> = Vec::new();
@@ -187,13 +278,17 @@ pub fn ct_materialize(v: Expr) -> Expr {
 
 // Explicit `comptime` that could not be evaluated: reported once each (it
 // then runs when the program does; it used to be silent).
-var g_ct_warn_on: bool = false;
-var g_ct_warned: i64 = 0;
-
-fn ct_warn(msg: str) {
-    if !g_ct_warn_on { return; }
-    if g_ct_warned == 0 { g_ct_warned = HashMap_new(); }
-    if HashMap_get(g_ct_warned, msg) != 0 { return; }
+var g_ct_warn_on: bool = false; var g_ct_warned: i64 = 0;
+ fn ct_warn(msg: str) {
+    if !g_ct_warn_on {
+        return;
+    }
+    if g_ct_warned == 0 {
+        g_ct_warned = HashMap_new();
+    }
+    if HashMap_get(g_ct_warned, msg) != 0 {
+        return;
+    }
     HashMap_insert(g_ct_warned, msg, 1);
     p_eprint_str("warning: comptime: " + msg + " -- evaluated when the program runs instead\n");
 }
@@ -217,8 +312,7 @@ pub enum ResultExpr {
 // The errors of the last process_gen (they were dropped before: a failed
 // parse of generated code or an evaluation error was silent)
 var g_ct_gen_errors: Vec<str> = Vec::new();
-
-pub fn comptime_gen_errors() -> Vec<str> {
+ pub fn comptime_gen_errors() -> Vec<str> {
     return g_ct_gen_errors;
 }
 
@@ -230,7 +324,7 @@ pub fn process_gen(program: Program) -> Program {
     var errs: Vec<str> = Vec::new();
     var fi: i64 = 0;
     while fi < prog.funcs.len() {
-        substitute_comptime_gen_blocks(&mut prog.funcs, fi, &prog, &mut errs);
+        substitute_comptime_gen_blocks(& mut prog.funcs, fi, & prog, & mut errs);
         fi = fi + 1;
     }
 
@@ -240,7 +334,7 @@ pub fn process_gen(program: Program) -> Program {
     var func_count: i64 = prog.funcs.len();
     var idx: i64 = 0;
     while idx < func_count {
-        process_comptime_gen_in_func(&mut prog.funcs, idx, &prog, &mut generated_funcs, &mut generated_structs, &mut errs);
+        process_comptime_gen_in_func(& mut prog.funcs, idx, & prog, & mut generated_funcs, & mut generated_structs, & mut errs);
         idx = idx + 1;
     }
 
@@ -259,24 +353,25 @@ pub fn process_gen(program: Program) -> Program {
     return prog;
 }
 
-fn substitute_comptime_gen_blocks(funcs: &mut Vec<Func>, idx: i64, original: &Program, errs: &mut Vec<str>) {
+fn substitute_comptime_gen_blocks(funcs: & mut Vec<Func>, idx: i64, original: & Program, errs: & mut Vec<str>) {
     var func: Func = funcs.get(idx);
     var si: i64 = 0;
     while si < func.body.len() {
         match func.body.get(si) {
             Stmt::ComptimeGen(block, gen_line) => {
                 var block_copy: Vec<Stmt> = block;
-                substitute_stmts(&mut block_copy, original, errs);
+                substitute_stmts(& mut block_copy, original, errs);
                 func.body.set(si, Stmt::ComptimeGen(block_copy, gen_line));
             }
-            _ => {}
+            _ => {
+            }
         }
         si = si + 1;
     }
     funcs.set(idx, func);
 }
 
-fn process_comptime_gen_in_func(funcs: &mut Vec<Func>, idx: i64, original: &Program, generated_funcs: &mut Vec<Func>, generated_structs: &mut Vec<StructDef>, errs: &mut Vec<str>) {
+fn process_comptime_gen_in_func(funcs: & mut Vec<Func>, idx: i64, original: & Program, generated_funcs: & mut Vec<Func>, generated_structs: & mut Vec<StructDef>, errs: & mut Vec<str>) {
     var func: Func = funcs.get(idx);
     var new_body: Vec<Stmt> = Vec::new();
     var si: i64 = 0;
@@ -330,7 +425,9 @@ fn process_comptime_gen_in_func(funcs: &mut Vec<Func>, idx: i64, original: &Prog
                     }
                 }
             }
-            other => { new_body.push(other); }
+            other => {
+                new_body.push(other);
+            }
         }
         si = si + 1;
     }
@@ -343,34 +440,44 @@ pub enum OptProgram {
     None,
 }
 
-fn ct_gen_func_taken(original: &Program, generated: &Vec<Func>, name: str) -> bool {
+fn ct_gen_func_taken(original: & Program, generated: & Vec<Func>, name: str) -> bool {
     var i: i64 = 0;
     while i < original.funcs.len() {
-        if original.funcs.get(i).name == name { return true; }
+        if original.funcs.get(i).name == name {
+            return true;
+        }
         i = i + 1;
     }
     i = 0;
     while i < generated.len() {
-        if generated.get(i).name == name { return true; }
+        if generated.get(i).name == name {
+            return true;
+        }
         i = i + 1;
     }
     return false;
 }
 
-fn ct_gen_struct_taken(original: &Program, generated: &Vec<StructDef>, name: str) -> bool {
+fn ct_gen_struct_taken(original: & Program, generated: & Vec<StructDef>, name: str) -> bool {
     var i: i64 = 0;
     while i < original.structs.len() {
-        if original.structs.get(i).name == name { return true; }
+        if original.structs.get(i).name == name {
+            return true;
+        }
         i = i + 1;
     }
     i = 0;
     while i < original.enums.len() {
-        if original.enums.get(i).name == name { return true; }
+        if original.enums.get(i).name == name {
+            return true;
+        }
         i = i + 1;
     }
     i = 0;
     while i < generated.len() {
-        if generated.get(i).name == name { return true; }
+        if generated.get(i).name == name {
+            return true;
+        }
         i = i + 1;
     }
     return false;
@@ -382,8 +489,12 @@ fn parse_generated_code(source: str) -> OptProgram {
     var parser_obj: Parser = Parser_new(tokens);
     var result: ParseResultProgram = parser_obj.parse();
     match result {
-        ParseResultProgram::Ok(prog) => { return OptProgram::Some(prog); }
-        ParseResultProgram::Err(_) => { return OptProgram::None; }
+        ParseResultProgram::Ok(prog) => {
+            return OptProgram::Some(prog);
+        }
+        ParseResultProgram::Err(_) => {
+            return OptProgram::None;
+        }
     }
     return OptProgram::None;
 }
@@ -415,7 +526,9 @@ pub fn substitute(program: Program) -> Program {
     while iter < 8 {
         var fi: i64 = 0;
         while fi < prog.funcs.len() {
-            if need.get(fi) { substitute_func(&mut prog.funcs, fi, &prog, &mut errs); }
+            if need.get(fi) {
+                substitute_func(& mut prog.funcs, fi, & prog, & mut errs);
+            }
             fi = fi + 1;
         }
         iter = iter + 1;
@@ -427,7 +540,7 @@ pub fn substitute(program: Program) -> Program {
     while fi2 < prog.funcs.len() {
         if need.get(fi2) {
             g_ct_warn_on = !prog.funcs.get(fi2).is_comptime;
-            substitute_func(&mut prog.funcs, fi2, &prog, &mut errs);
+            substitute_func(& mut prog.funcs, fi2, & prog, & mut errs);
             g_ct_warn_on = false;
         }
         fi2 = fi2 + 1;
@@ -439,7 +552,7 @@ pub fn substitute(program: Program) -> Program {
         var cd: ConstDef = prog.consts.get(ci);
         if ct_scan_expr_sub(cd.expr) {
             g_ct_warn_on = true;
-            substitute_expr(&mut cd.expr, &prog, &mut errs);
+            substitute_expr(& mut cd.expr, & prog, & mut errs);
             g_ct_warn_on = false;
             prog.consts.set(ci, cd);
         }
@@ -466,7 +579,9 @@ pub fn substitute(program: Program) -> Program {
     while iter2 < 4 {
         var fi3: i64 = 0;
         while fi3 < prog.funcs.len() {
-            if need3.get(fi3) { aggressive_comptime_func(&mut prog.funcs, fi3, &prog); }
+            if need3.get(fi3) {
+                aggressive_comptime_func(& mut prog.funcs, fi3, & prog);
+            }
             fi3 = fi3 + 1;
         }
         iter2 = iter2 + 1;
@@ -483,7 +598,9 @@ pub fn substitute(program: Program) -> Program {
 fn ct_scan_stmts_sub(stmts: Vec<Stmt>) -> bool {
     var i: i64 = 0;
     while i < stmts.len() {
-        if ct_scan_stmt_sub(stmts.get(i)) { return true; }
+        if ct_scan_stmt_sub(stmts.get(i)) {
+            return true;
+        }
         i = i + 1;
     }
     return false;
@@ -491,8 +608,11 @@ fn ct_scan_stmts_sub(stmts: Vec<Stmt>) -> bool {
 
 fn ct_scan_opt_sub(o: OptStmts) -> bool {
     match o {
-        OptStmts::Some(b) => { return ct_scan_stmts_sub(b); }
-        OptStmts::None => {}
+        OptStmts::Some(b) => {
+            return ct_scan_stmts_sub(b);
+        }
+        OptStmts::None => {
+        }
     }
     return false;
 }
@@ -500,7 +620,9 @@ fn ct_scan_opt_sub(o: OptStmts) -> bool {
 fn ct_scan_arms_sub(arms: Vec<MatchArm>) -> bool {
     var i: i64 = 0;
     while i < arms.len() {
-        if ct_scan_stmts_sub(arms.get(i).body) { return true; }
+        if ct_scan_stmts_sub(arms.get(i).body) {
+            return true;
+        }
         i = i + 1;
     }
     return false;
@@ -508,49 +630,101 @@ fn ct_scan_arms_sub(arms: Vec<MatchArm>) -> bool {
 
 fn ct_scan_stmt_sub(stmt: Stmt) -> bool {
     match stmt {
-        Stmt::Let(_, _, e, _, _, _, _) => { return ct_scan_expr_sub(e); }
-        Stmt::LetTuple(_, e, _) => { return ct_scan_expr_sub(e); }
-        Stmt::Assign(_, _, e, _) => { return ct_scan_expr_sub(e); }
-        Stmt::IndexAssign(_, ix, _, e, _) => { return ct_scan_expr_sub(ix) || ct_scan_expr_sub(e); }
-        Stmt::DerefAssign(pe, _, e, _) => { return ct_scan_expr_sub(pe) || ct_scan_expr_sub(e); }
-        Stmt::FieldAssign(ob, _, _, e, _) => { return ct_scan_expr_sub(ob) || ct_scan_expr_sub(e); }
-        Stmt::Expr(e, _) => { return ct_scan_expr_sub(e); }
+        Stmt::Let(_, _, e, _, _, _, _) => {
+            return ct_scan_expr_sub(e);
+        }
+        Stmt::LetTuple(_, e, _) => {
+            return ct_scan_expr_sub(e);
+        }
+        Stmt::Assign(_, _, e, _) => {
+            return ct_scan_expr_sub(e);
+        }
+        Stmt::IndexAssign(_, ix, _, e, _) => {
+            return ct_scan_expr_sub(ix) || ct_scan_expr_sub(e);
+        }
+        Stmt::DerefAssign(pe, _, e, _) => {
+            return ct_scan_expr_sub(pe) || ct_scan_expr_sub(e);
+        }
+        Stmt::FieldAssign(ob, _, _, e, _) => {
+            return ct_scan_expr_sub(ob) || ct_scan_expr_sub(e);
+        }
+        Stmt::Expr(e, _) => {
+            return ct_scan_expr_sub(e);
+        }
         Stmt::Return(opt, _) => {
             match opt {
-                OptBoxExpr::Some(b) => { return ct_scan_expr_sub(ct_box_expr_unbox(b)); }
-                OptBoxExpr::None => {}
+                OptBoxExpr::Some(b) => {
+                    return ct_scan_expr_sub(ct_box_expr_unbox(b));
+                }
+                OptBoxExpr::None => {
+                }
             }
         }
-        Stmt::If(c, t, e, _) => { return ct_scan_expr_sub(c) || ct_scan_stmts_sub(t) || ct_scan_opt_sub(e); }
-        Stmt::While(c, b, _) => { return ct_scan_expr_sub(c) || ct_scan_stmts_sub(b); }
-        Stmt::For(_, it, b, _) => { return ct_scan_expr_sub(it) || ct_scan_stmts_sub(b); }
-        Stmt::Match(e, arms, _) => { return ct_scan_expr_sub(e) || ct_scan_arms_sub(arms); }
-        Stmt::Defer(b, _) => { return ct_scan_stmts_sub(b); }
-        Stmt::Txn(b, _) => { return ct_scan_stmts_sub(b); }
-        Stmt::RegionBlock(_, _, _, _, _, b, _) => { return ct_scan_stmts_sub(b); }
-        Stmt::Sandbox(b, _) => { return ct_scan_stmts_sub(b); }
-        Stmt::Unsafe(b, _) => { return ct_scan_stmts_sub(b); }
-        Stmt::ComptimeGen(_, _) => { return true; }
+        Stmt::If(c, t, e, _) => {
+            return ct_scan_expr_sub(c) || ct_scan_stmts_sub(t) || ct_scan_opt_sub(e);
+        }
+        Stmt::While(c, b, _) => {
+            return ct_scan_expr_sub(c) || ct_scan_stmts_sub(b);
+        }
+        Stmt::For(_, it, b, _) => {
+            return ct_scan_expr_sub(it) || ct_scan_stmts_sub(b);
+        }
+        Stmt::Match(e, arms, _) => {
+            return ct_scan_expr_sub(e) || ct_scan_arms_sub(arms);
+        }
+        Stmt::Defer(b, _) => {
+            return ct_scan_stmts_sub(b);
+        }
+        Stmt::Txn(b, _) => {
+            return ct_scan_stmts_sub(b);
+        }
+        Stmt::RegionBlock(_, _, _, _, _, b, _) => {
+            return ct_scan_stmts_sub(b);
+        }
+        Stmt::Sandbox(b, _) => {
+            return ct_scan_stmts_sub(b);
+        }
+        Stmt::Unsafe(b, _) => {
+            return ct_scan_stmts_sub(b);
+        }
+        Stmt::ComptimeGen(_, _) => {
+            return true;
+        }
         Stmt::Handle(b, hs, _) => {
-            if ct_scan_stmts_sub(b) { return true; }
+            if ct_scan_stmts_sub(b) {
+                return true;
+            }
             var hi: i64 = 0;
             while hi < hs.len() {
-                if ct_scan_stmts_sub(hs.get(hi).body) { return true; }
+                if ct_scan_stmts_sub(hs.get(hi).body) {
+                    return true;
+                }
                 hi = hi + 1;
             }
         }
-        Stmt::Query(_, b, _) => { return ct_scan_stmts_sub(b); }
+        Stmt::Query(_, b, _) => {
+            return ct_scan_stmts_sub(b);
+        }
         Stmt::Parallel(brs, _) => {
             var bi: i64 = 0;
             while bi < brs.len() {
-                if ct_scan_stmts_sub(brs.get(bi)) { return true; }
+                if ct_scan_stmts_sub(brs.get(bi)) {
+                    return true;
+                }
                 bi = bi + 1;
             }
         }
-        Stmt::Backward(l, _) => { return ct_scan_expr_sub(l); }
-        Stmt::Resume(c, v, _) => { return ct_scan_expr_sub(c) || ct_scan_expr_sub(v); }
-        Stmt::SpawnScope(b, _) => { return ct_scan_stmts_sub(b); }
-        _ => {}
+        Stmt::Backward(l, _) => {
+            return ct_scan_expr_sub(l);
+        }
+        Stmt::Resume(c, v, _) => {
+            return ct_scan_expr_sub(c) || ct_scan_expr_sub(v);
+        }
+        Stmt::SpawnScope(b, _) => {
+            return ct_scan_stmts_sub(b);
+        }
+        _ => {
+        }
     }
     return false;
 }
@@ -558,7 +732,9 @@ fn ct_scan_stmt_sub(stmt: Stmt) -> bool {
 fn ct_scan_exprs_sub(es: Vec<Expr>) -> bool {
     var i: i64 = 0;
     while i < es.len() {
-        if ct_scan_expr_sub(es.get(i)) { return true; }
+        if ct_scan_expr_sub(es.get(i)) {
+            return true;
+        }
         i = i + 1;
     }
     return false;
@@ -566,32 +742,71 @@ fn ct_scan_exprs_sub(es: Vec<Expr>) -> bool {
 
 fn ct_scan_expr_sub(expr: Expr) -> bool {
     match expr {
-        Expr::Binary(_, l, r) => { return ct_scan_expr_sub(ct_box_expr_unbox(l)) || ct_scan_expr_sub(ct_box_expr_unbox(r)); }
-        Expr::Unary(_, e) => { return ct_scan_expr_sub(ct_box_expr_unbox(e)); }
-        Expr::Call(_, args) => { return ct_scan_exprs_sub(args); }
-        Expr::MethodCall(r, _, args) => { return ct_scan_expr_sub(ct_box_expr_unbox(r)) || ct_scan_exprs_sub(args); }
-        Expr::FieldAccess(e, _) => { return ct_scan_expr_sub(ct_box_expr_unbox(e)); }
+        Expr::Binary(_, l, r) => {
+            return ct_scan_expr_sub(ct_box_expr_unbox(l)) || ct_scan_expr_sub(ct_box_expr_unbox(r));
+        }
+        Expr::Unary(_, e) => {
+            return ct_scan_expr_sub(ct_box_expr_unbox(e));
+        }
+        Expr::Call(_, args) => {
+            return ct_scan_exprs_sub(args);
+        }
+        Expr::MethodCall(r, _, args) => {
+            return ct_scan_expr_sub(ct_box_expr_unbox(r)) || ct_scan_exprs_sub(args);
+        }
+        Expr::FieldAccess(e, _) => {
+            return ct_scan_expr_sub(ct_box_expr_unbox(e));
+        }
         Expr::StructLit(_, fields, _) => {
             var fi: i64 = 0;
             while fi < fields.len() {
-                if ct_scan_expr_sub(fields.get(fi).value) { return true; }
+                if ct_scan_expr_sub(fields.get(fi).value) {
+                    return true;
+                }
                 fi = fi + 1;
             }
         }
-        Expr::If(c, t, e) => { return ct_scan_expr_sub(c) || ct_scan_stmts_sub(t) || ct_scan_opt_sub(e); }
-        Expr::Block(b) => { return ct_scan_stmts_sub(b); }
-        Expr::Index(a, i) => { return ct_scan_expr_sub(ct_box_expr_unbox(a)) || ct_scan_expr_sub(ct_box_expr_unbox(i)); }
-        Expr::ArrayLit(_, els) => { return ct_scan_exprs_sub(els); }
-        Expr::Match(e, arms) => { return ct_scan_expr_sub(e) || ct_scan_arms_sub(arms); }
-        Expr::Range(a, b, _) => { return ct_scan_expr_sub(ct_box_expr_unbox(a)) || ct_scan_expr_sub(ct_box_expr_unbox(b)); }
-        Expr::Ref(e, _) => { return ct_scan_expr_sub(ct_box_expr_unbox(e)); }
-        Expr::Deref(e) => { return ct_scan_expr_sub(ct_box_expr_unbox(e)); }
-        Expr::StrConcat(l, r) => { return ct_scan_expr_sub(ct_box_expr_unbox(l)) || ct_scan_expr_sub(ct_box_expr_unbox(r)); }
-        Expr::Cast(e, _) => { return ct_scan_expr_sub(ct_box_expr_unbox(e)); }
-        Expr::Comptime(_) => { return true; }
-        Expr::ComptimeBlock(_) => { return true; }
-        Expr::ComptimeReflect(_, _) => { return true; }
-        _ => {}
+        Expr::If(c, t, e) => {
+            return ct_scan_expr_sub(c) || ct_scan_stmts_sub(t) || ct_scan_opt_sub(e);
+        }
+        Expr::Block(b) => {
+            return ct_scan_stmts_sub(b);
+        }
+        Expr::Index(a, i) => {
+            return ct_scan_expr_sub(ct_box_expr_unbox(a)) || ct_scan_expr_sub(ct_box_expr_unbox(i));
+        }
+        Expr::ArrayLit(_, els) => {
+            return ct_scan_exprs_sub(els);
+        }
+        Expr::Match(e, arms) => {
+            return ct_scan_expr_sub(e) || ct_scan_arms_sub(arms);
+        }
+        Expr::Range(a, b, _) => {
+            return ct_scan_expr_sub(ct_box_expr_unbox(a)) || ct_scan_expr_sub(ct_box_expr_unbox(b));
+        }
+        Expr::Ref(e, _) => {
+            return ct_scan_expr_sub(ct_box_expr_unbox(e));
+        }
+        Expr::Deref(e) => {
+            return ct_scan_expr_sub(ct_box_expr_unbox(e));
+        }
+        Expr::StrConcat(l, r) => {
+            return ct_scan_expr_sub(ct_box_expr_unbox(l)) || ct_scan_expr_sub(ct_box_expr_unbox(r));
+        }
+        Expr::Cast(e, _) => {
+            return ct_scan_expr_sub(ct_box_expr_unbox(e));
+        }
+        Expr::Comptime(_) => {
+            return true;
+        }
+        Expr::ComptimeBlock(_) => {
+            return true;
+        }
+        Expr::ComptimeReflect(_, _) => {
+            return true;
+        }
+        _ => {
+        }
     }
     return false;
 }
@@ -601,7 +816,9 @@ fn ct_scan_expr_sub(expr: Expr) -> bool {
 fn ct_scan_stmts_aggr(stmts: Vec<Stmt>) -> bool {
     var i: i64 = 0;
     while i < stmts.len() {
-        if ct_scan_stmt_aggr(stmts.get(i)) { return true; }
+        if ct_scan_stmt_aggr(stmts.get(i)) {
+            return true;
+        }
         i = i + 1;
     }
     return false;
@@ -609,24 +826,41 @@ fn ct_scan_stmts_aggr(stmts: Vec<Stmt>) -> bool {
 
 fn ct_scan_stmt_aggr(stmt: Stmt) -> bool {
     match stmt {
-        Stmt::Let(_, _, e, _, _, _, _) => { return ct_scan_expr_aggr(e); }
-        Stmt::Assign(_, _, e, _) => { return ct_scan_expr_aggr(e); }
-        Stmt::Expr(e, _) => { return ct_scan_expr_aggr(e); }
+        Stmt::Let(_, _, e, _, _, _, _) => {
+            return ct_scan_expr_aggr(e);
+        }
+        Stmt::Assign(_, _, e, _) => {
+            return ct_scan_expr_aggr(e);
+        }
+        Stmt::Expr(e, _) => {
+            return ct_scan_expr_aggr(e);
+        }
         Stmt::Return(opt, _) => {
             match opt {
-                OptBoxExpr::Some(b) => { return ct_scan_expr_aggr(ct_box_expr_unbox(b)); }
-                OptBoxExpr::None => {}
+                OptBoxExpr::Some(b) => {
+                    return ct_scan_expr_aggr(ct_box_expr_unbox(b));
+                }
+                OptBoxExpr::None => {
+                }
             }
         }
         Stmt::If(c, t, e, _) => {
             match c {
-                Expr::BoolLit(_) => { return true; }
-                _ => {}
+                Expr::BoolLit(_) => {
+                    return true;
+                }
+                _ => {
+                }
             }
-            if ct_scan_expr_aggr(c) || ct_scan_stmts_aggr(t) { return true; }
+            if ct_scan_expr_aggr(c) || ct_scan_stmts_aggr(t) {
+                return true;
+            }
             match e {
-                OptStmts::Some(eb) => { return ct_scan_stmts_aggr(eb); }
-                OptStmts::None => {}
+                OptStmts::Some(eb) => {
+                    return ct_scan_stmts_aggr(eb);
+                }
+                OptStmts::None => {
+                }
             }
         }
         Stmt::For(_, it, b, _) => {
@@ -636,259 +870,319 @@ fn ct_scan_stmt_aggr(stmt: Stmt) -> bool {
                     var z2: Expr = ct_box_expr_unbox(z);
                     var lit_a: bool = false;
                     var lit_z: bool = false;
-                    match a2 { Expr::IntLit(_) => { lit_a = true; } _ => {} }
-                    match z2 { Expr::IntLit(_) => { lit_z = true; } _ => {} }
-                    if lit_a && lit_z { return true; }
+                    match a2 {
+                        Expr::IntLit(_) => {
+                            lit_a = true;
+                        }
+                        _ => {
+                        }
+                    }
+                    match z2 {
+                        Expr::IntLit(_) => {
+                            lit_z = true;
+                        }
+                        _ => {
+                        }
+                    }
+                    if lit_a && lit_z {
+                        return true;
+                    }
                 }
-                _ => {}
+                _ => {
+                }
             }
             return ct_scan_expr_aggr(it) || ct_scan_stmts_aggr(b);
         }
-        Stmt::While(c, b, _) => { return ct_scan_expr_aggr(c) || ct_scan_stmts_aggr(b); }
-        _ => {}
+        Stmt::While(c, b, _) => {
+            return ct_scan_expr_aggr(c) || ct_scan_stmts_aggr(b);
+        }
+        _ => {
+        }
     }
     return false;
 }
 
 fn ct_scan_expr_aggr(expr: Expr) -> bool {
     match expr {
-        Expr::Binary(_, l, r) => { return ct_scan_expr_aggr(ct_box_expr_unbox(l)) || ct_scan_expr_aggr(ct_box_expr_unbox(r)); }
-        Expr::Unary(_, e) => { return ct_scan_expr_aggr(ct_box_expr_unbox(e)); }
+        Expr::Binary(_, l, r) => {
+            return ct_scan_expr_aggr(ct_box_expr_unbox(l)) || ct_scan_expr_aggr(ct_box_expr_unbox(r));
+        }
+        Expr::Unary(_, e) => {
+            return ct_scan_expr_aggr(ct_box_expr_unbox(e));
+        }
         Expr::Call(callee, args) => {
-            if HashMap_get(ct_comptime_fns, callee) != 0 { return true; }
+            if HashMap_get(ct_comptime_fns, callee) != 0 {
+                return true;
+            }
             var ai: i64 = 0;
             while ai < args.len() {
-                if ct_scan_expr_aggr(args.get(ai)) { return true; }
+                if ct_scan_expr_aggr(args.get(ai)) {
+                    return true;
+                }
                 ai = ai + 1;
             }
         }
         Expr::MethodCall(r, _, args) => {
-            if ct_scan_expr_aggr(ct_box_expr_unbox(r)) { return true; }
+            if ct_scan_expr_aggr(ct_box_expr_unbox(r)) {
+                return true;
+            }
             var mi: i64 = 0;
             while mi < args.len() {
-                if ct_scan_expr_aggr(args.get(mi)) { return true; }
+                if ct_scan_expr_aggr(args.get(mi)) {
+                    return true;
+                }
                 mi = mi + 1;
             }
         }
-        _ => {}
+        _ => {
+        }
     }
     return false;
 }
 
-fn substitute_func(funcs: &mut Vec<Func>, idx: i64, original: &Program, errs: &mut Vec<str>) {
+fn substitute_func(funcs: & mut Vec<Func>, idx: i64, original: & Program, errs: & mut Vec<str>) {
     var func: Func = funcs.get(idx);
     var si: i64 = 0;
     while si < func.body.len() {
         var stmt: Stmt = func.body.get(si);
-        substitute_stmt(&mut stmt, original, errs);
+        substitute_stmt(& mut stmt, original, errs);
         func.body.set(si, stmt);
         si = si + 1;
     }
     funcs.set(idx, func);
 }
 
-fn substitute_stmts(stmts: &mut Vec<Stmt>, original: &Program, errs: &mut Vec<str>) {
+fn substitute_stmts(stmts: & mut Vec<Stmt>, original: & Program, errs: & mut Vec<str>) {
     var si: i64 = 0;
     while si < stmts.len() {
         var stmt: Stmt = stmts.get(si);
-        substitute_stmt(&mut stmt, original, errs);
+        substitute_stmt(& mut stmt, original, errs);
         stmts.set(si, stmt);
         si = si + 1;
     }
 }
 
-fn substitute_stmt(stmt: &mut Stmt, original: &Program, errs: &mut Vec<str>) {
+fn substitute_stmt(stmt: & mut Stmt, original: & Program, errs: & mut Vec<str>) {
     // A match binding is a copy of the payload: substitute into the copy,
     // then rebuild the statement so the result is kept.
     match stmt {
         Stmt::Let(lname, lty, expr, lmut, lpersist, lann, lline) => {
-            substitute_expr(&mut expr, original, errs);
-            *stmt = Stmt::Let(lname, lty, expr, lmut, lpersist, lann, lline);
+            substitute_expr(& mut expr, original, errs);
+            * stmt = Stmt::Let(lname, lty, expr, lmut, lpersist, lann, lline);
         }
         Stmt::LetTuple(tnames, expr, tline) => {
-            substitute_expr(&mut expr, original, errs);
-            *stmt = Stmt::LetTuple(tnames, expr, tline);
+            substitute_expr(& mut expr, original, errs);
+            * stmt = Stmt::LetTuple(tnames, expr, tline);
         }
         Stmt::Assign(aname, aop, expr, aline) => {
-            substitute_expr(&mut expr, original, errs);
-            *stmt = Stmt::Assign(aname, aop, expr, aline);
+            substitute_expr(& mut expr, original, errs);
+            * stmt = Stmt::Assign(aname, aop, expr, aline);
         }
         Stmt::IndexAssign(iname, index, iop, expr, iline) => {
-            substitute_expr(&mut index, original, errs);
-            substitute_expr(&mut expr, original, errs);
-            *stmt = Stmt::IndexAssign(iname, index, iop, expr, iline);
+            substitute_expr(& mut index, original, errs);
+            substitute_expr(& mut expr, original, errs);
+            * stmt = Stmt::IndexAssign(iname, index, iop, expr, iline);
         }
         Stmt::DerefAssign(ptr_expr, dop, expr, dline) => {
-            substitute_expr(&mut ptr_expr, original, errs);
-            substitute_expr(&mut expr, original, errs);
-            *stmt = Stmt::DerefAssign(ptr_expr, dop, expr, dline);
+            substitute_expr(& mut ptr_expr, original, errs);
+            substitute_expr(& mut expr, original, errs);
+            * stmt = Stmt::DerefAssign(ptr_expr, dop, expr, dline);
         }
         Stmt::FieldAssign(object, ffield, fop, expr, fline) => {
-            substitute_expr(&mut object, original, errs);
-            substitute_expr(&mut expr, original, errs);
-            *stmt = Stmt::FieldAssign(object, ffield, fop, expr, fline);
+            substitute_expr(& mut object, original, errs);
+            substitute_expr(& mut expr, original, errs);
+            * stmt = Stmt::FieldAssign(object, ffield, fop, expr, fline);
         }
         Stmt::Expr(e, eline) => {
-            substitute_expr(&mut e, original, errs);
-            *stmt = Stmt::Expr(e, eline);
+            substitute_expr(& mut e, original, errs);
+            * stmt = Stmt::Expr(e, eline);
         }
         Stmt::Return(opt, rline) => {
             match opt {
                 OptBoxExpr::Some(e) => {
                     var inner: Expr = ct_box_expr_unbox(e);
-                    substitute_expr(&mut inner, original, errs);
-                    *stmt = Stmt::Return(OptBoxExpr::Some(box_expr_new(inner)), rline);
+                    substitute_expr(& mut inner, original, errs);
+                    * stmt = Stmt::Return(OptBoxExpr::Some(box_expr_new(inner)), rline);
                 }
-                OptBoxExpr::None => {}
+                OptBoxExpr::None => {
+                }
             }
         }
         Stmt::If(cond, then_block, else_block, iline2) => {
-            substitute_expr(&mut cond, original, errs);
-            substitute_stmts(&mut then_block, original, errs);
+            substitute_expr(& mut cond, original, errs);
+            substitute_stmts(& mut then_block, original, errs);
             match else_block {
-                OptStmts::Some(eb) => { substitute_stmts(&mut eb, original, errs); }
-                OptStmts::None => {}
+                OptStmts::Some(eb) => {
+                    substitute_stmts(& mut eb, original, errs);
+                }
+                OptStmts::None => {
+                }
             }
-            *stmt = Stmt::If(cond, then_block, else_block, iline2);
+            * stmt = Stmt::If(cond, then_block, else_block, iline2);
         }
         Stmt::While(cond, body, wline) => {
-            substitute_expr(&mut cond, original, errs);
-            substitute_stmts(&mut body, original, errs);
-            *stmt = Stmt::While(cond, body, wline);
+            substitute_expr(& mut cond, original, errs);
+            substitute_stmts(& mut body, original, errs);
+            * stmt = Stmt::While(cond, body, wline);
         }
         Stmt::For(fvar, iterator, body, forline) => {
-            substitute_expr(&mut iterator, original, errs);
-            substitute_stmts(&mut body, original, errs);
-            *stmt = Stmt::For(fvar, iterator, body, forline);
+            substitute_expr(& mut iterator, original, errs);
+            substitute_stmts(& mut body, original, errs);
+            * stmt = Stmt::For(fvar, iterator, body, forline);
         }
         Stmt::Match(expr, arms, mline) => {
-            substitute_expr(&mut expr, original, errs);
-            *stmt = Stmt::Match(expr, arms, mline);
+            substitute_expr(& mut expr, original, errs);
+            * stmt = Stmt::Match(expr, arms, mline);
             var ai: i64 = 0;
             while ai < arms.len() {
                 var arm: MatchArm = arms.get(ai);
-                substitute_stmts(&mut arm.body, original, errs);
+                substitute_stmts(& mut arm.body, original, errs);
                 arms.set(ai, arm);
                 ai = ai + 1;
             }
         }
-        Stmt::Defer(body, _) => { substitute_stmts(&mut body, original, errs); }
-        Stmt::Txn(body, _) => { substitute_stmts(&mut body, original, errs); }
-        Stmt::RegionBlock(_, _, _, _, _, body, _) => { substitute_stmts(&mut body, original, errs); }
-        Stmt::Sandbox(body, _) => { substitute_stmts(&mut body, original, errs); }
-        Stmt::Unsafe(body, _) => { substitute_stmts(&mut body, original, errs); }
-        Stmt::ComptimeGen(block, _) => { substitute_stmts(&mut block, original, errs); }
+        Stmt::Defer(body, _) => {
+            substitute_stmts(& mut body, original, errs);
+        }
+        Stmt::Txn(body, _) => {
+            substitute_stmts(& mut body, original, errs);
+        }
+        Stmt::RegionBlock(_, _, _, _, _, body, _) => {
+            substitute_stmts(& mut body, original, errs);
+        }
+        Stmt::Sandbox(body, _) => {
+            substitute_stmts(& mut body, original, errs);
+        }
+        Stmt::Unsafe(body, _) => {
+            substitute_stmts(& mut body, original, errs);
+        }
+        Stmt::ComptimeGen(block, _) => {
+            substitute_stmts(& mut block, original, errs);
+        }
         Stmt::Handle(body, handlers, _) => {
-            substitute_stmts(&mut body, original, errs);
+            substitute_stmts(& mut body, original, errs);
             var hi: i64 = 0;
             while hi < handlers.len() {
                 var h: EffectHandler = handlers.get(hi);
-                substitute_stmts(&mut h.body, original, errs);
+                substitute_stmts(& mut h.body, original, errs);
                 handlers.set(hi, h);
                 hi = hi + 1;
             }
         }
-        Stmt::Query(_, body, _) => { substitute_stmts(&mut body, original, errs); }
+        Stmt::Query(_, body, _) => {
+            substitute_stmts(& mut body, original, errs);
+        }
         Stmt::Parallel(branches, _) => {
             var bi: i64 = 0;
             while bi < branches.len() {
                 var branch: Vec<Stmt> = branches.get(bi);
-                substitute_stmts(&mut branch, original, errs);
+                substitute_stmts(& mut branch, original, errs);
                 branches.set(bi, branch);
                 bi = bi + 1;
             }
         }
-        Stmt::Backward(loss, _) => { substitute_expr(&mut loss, original, errs); }
-        Stmt::Resume(cont, value, _) => {
-            substitute_expr(&mut cont, original, errs);
-            substitute_expr(&mut value, original, errs);
+        Stmt::Backward(loss, _) => {
+            substitute_expr(& mut loss, original, errs);
         }
-        Stmt::SpawnScope(body, _) => { substitute_stmts(&mut body, original, errs); }
-        Stmt::CancelScope(_) => {}
-        _ => {}
+        Stmt::Resume(cont, value, _) => {
+            substitute_expr(& mut cont, original, errs);
+            substitute_expr(& mut value, original, errs);
+        }
+        Stmt::SpawnScope(body, _) => {
+            substitute_stmts(& mut body, original, errs);
+        }
+        Stmt::CancelScope(_) => {
+        }
+        _ => {
+        }
     }
 }
 
-fn substitute_expr(expr: &mut Expr, original: &Program, errs: &mut Vec<str>) {
+fn substitute_expr(expr: & mut Expr, original: & Program, errs: & mut Vec<str>) {
     match expr {
         Expr::Binary(op, left, right) => {
             var l: Expr = ct_box_expr_unbox(left);
             var r: Expr = ct_box_expr_unbox(right);
-            substitute_expr(&mut l, original, errs);
-            substitute_expr(&mut r, original, errs);
-            *expr = Expr::Binary(op, box_expr_new(l), box_expr_new(r));
+            substitute_expr(& mut l, original, errs);
+            substitute_expr(& mut r, original, errs);
+            * expr = Expr::Binary(op, box_expr_new(l), box_expr_new(r));
         }
         Expr::Unary(op, inner) => {
             var e: Expr = ct_box_expr_unbox(inner);
-            substitute_expr(&mut e, original, errs);
-            *expr = Expr::Unary(op, box_expr_new(e));
+            substitute_expr(& mut e, original, errs);
+            * expr = Expr::Unary(op, box_expr_new(e));
         }
         Expr::Call(_, args) => {
             var ai: i64 = 0;
             while ai < args.len() {
                 var a: Expr = args.get(ai);
-                substitute_expr(&mut a, original, errs);
+                substitute_expr(& mut a, original, errs);
                 args.set(ai, a);
                 ai = ai + 1;
             }
         }
         Expr::MethodCall(receiver, mname, args) => {
             var r: Expr = ct_box_expr_unbox(receiver);
-            substitute_expr(&mut r, original, errs);
+            substitute_expr(& mut r, original, errs);
             var ai: i64 = 0;
             while ai < args.len() {
                 var a: Expr = args.get(ai);
-                substitute_expr(&mut a, original, errs);
+                substitute_expr(& mut a, original, errs);
                 args.set(ai, a);
                 ai = ai + 1;
             }
-            *expr = Expr::MethodCall(box_expr_new(r), mname, args);
+            * expr = Expr::MethodCall(box_expr_new(r), mname, args);
         }
         Expr::FieldAccess(inner, field) => {
             var e: Expr = ct_box_expr_unbox(inner);
-            substitute_expr(&mut e, original, errs);
-            *expr = Expr::FieldAccess(box_expr_new(e), field);
+            substitute_expr(& mut e, original, errs);
+            * expr = Expr::FieldAccess(box_expr_new(e), field);
         }
         Expr::StructLit(_, fields, _) => {
             var fi: i64 = 0;
             while fi < fields.len() {
                 var f: FieldInit = fields.get(fi);
-                substitute_expr(&mut f.value, original, errs);
+                substitute_expr(& mut f.value, original, errs);
                 fields.set(fi, f);
                 fi = fi + 1;
             }
         }
         Expr::If(cond, then_block, else_block) => {
-            substitute_expr(&mut cond, original, errs);
-            substitute_stmts(&mut then_block, original, errs);
+            substitute_expr(& mut cond, original, errs);
+            substitute_stmts(& mut then_block, original, errs);
             match else_block {
-                OptStmts::Some(eb) => { substitute_stmts(&mut eb, original, errs); }
-                OptStmts::None => {}
+                OptStmts::Some(eb) => {
+                    substitute_stmts(& mut eb, original, errs);
+                }
+                OptStmts::None => {
+                }
             }
         }
-        Expr::Block(stmts) => { substitute_stmts(&mut stmts, original, errs); }
+        Expr::Block(stmts) => {
+            substitute_stmts(& mut stmts, original, errs);
+        }
         Expr::Index(array, index) => {
             var a: Expr = ct_box_expr_unbox(array);
             var i: Expr = ct_box_expr_unbox(index);
-            substitute_expr(&mut a, original, errs);
-            substitute_expr(&mut i, original, errs);
-            *expr = Expr::Index(box_expr_new(a), box_expr_new(i));
+            substitute_expr(& mut a, original, errs);
+            substitute_expr(& mut i, original, errs);
+            * expr = Expr::Index(box_expr_new(a), box_expr_new(i));
         }
         Expr::ArrayLit(_, elements) => {
             var ei: i64 = 0;
             while ei < elements.len() {
                 var e: Expr = elements.get(ei);
-                substitute_expr(&mut e, original, errs);
+                substitute_expr(& mut e, original, errs);
                 elements.set(ei, e);
                 ei = ei + 1;
             }
         }
         Expr::Match(inner, arms) => {
-            substitute_expr(&mut inner, original, errs);
+            substitute_expr(& mut inner, original, errs);
             var ai: i64 = 0;
             while ai < arms.len() {
                 var arm: MatchArm = arms.get(ai);
-                substitute_stmts(&mut arm.body, original, errs);
+                substitute_stmts(& mut arm.body, original, errs);
                 arms.set(ai, arm);
                 ai = ai + 1;
             }
@@ -896,64 +1190,85 @@ fn substitute_expr(expr: &mut Expr, original: &Program, errs: &mut Vec<str>) {
         Expr::Range(start, end, inclusive) => {
             var s: Expr = ct_box_expr_unbox(start);
             var e: Expr = ct_box_expr_unbox(end);
-            substitute_expr(&mut s, original, errs);
-            substitute_expr(&mut e, original, errs);
-            *expr = Expr::Range(box_expr_new(s), box_expr_new(e), inclusive);
+            substitute_expr(& mut s, original, errs);
+            substitute_expr(& mut e, original, errs);
+            * expr = Expr::Range(box_expr_new(s), box_expr_new(e), inclusive);
         }
         Expr::Ref(inner, is_mut) => {
             var e: Expr = ct_box_expr_unbox(inner);
-            substitute_expr(&mut e, original, errs);
-            *expr = Expr::Ref(box_expr_new(e), is_mut);
+            substitute_expr(& mut e, original, errs);
+            * expr = Expr::Ref(box_expr_new(e), is_mut);
         }
         Expr::Deref(inner) => {
             var e: Expr = ct_box_expr_unbox(inner);
-            substitute_expr(&mut e, original, errs);
-            *expr = Expr::Deref(box_expr_new(e));
+            substitute_expr(& mut e, original, errs);
+            * expr = Expr::Deref(box_expr_new(e));
         }
         Expr::StrConcat(left, right) => {
             var l: Expr = ct_box_expr_unbox(left);
             var r: Expr = ct_box_expr_unbox(right);
-            substitute_expr(&mut l, original, errs);
-            substitute_expr(&mut r, original, errs);
-            *expr = Expr::StrConcat(box_expr_new(l), box_expr_new(r));
+            substitute_expr(& mut l, original, errs);
+            substitute_expr(& mut r, original, errs);
+            * expr = Expr::StrConcat(box_expr_new(l), box_expr_new(r));
         }
         Expr::Cast(inner, ty) => {
             var e: Expr = ct_box_expr_unbox(inner);
-            substitute_expr(&mut e, original, errs);
-            *expr = Expr::Cast(box_expr_new(e), ty);
+            substitute_expr(& mut e, original, errs);
+            * expr = Expr::Cast(box_expr_new(e), ty);
         }
-        Expr::Comptime(inner) => { substitute_expr_comptime(expr, inner, original, errs); }
-        Expr::ComptimeBlock(stmts) => { substitute_expr_comptime_block(expr, &mut stmts, original, errs); }
-        Expr::ComptimeReflect(op, ty) => { substitute_expr_comptime_reflect(expr, op, ty, original, errs); }
-        _ => {}
+        Expr::Comptime(inner) => {
+            substitute_expr_comptime(expr, inner, original, errs);
+        }
+        Expr::ComptimeBlock(stmts) => {
+            substitute_expr_comptime_block(expr, & mut stmts, original, errs);
+        }
+        Expr::ComptimeReflect(op, ty) => {
+            substitute_expr_comptime_reflect(expr, op, ty, original, errs);
+        }
+        _ => {
+        }
     }
 }
 
-fn substitute_expr_comptime(expr: &mut Expr, inner: Box<Expr>, original: &Program, errs: &mut Vec<str>) {
+fn substitute_expr_comptime(expr: & mut Expr, inner: Box<Expr>, original: & Program, errs: & mut Vec<str>) {
     var e: Expr = ct_box_expr_unbox(inner);
-    substitute_expr(&mut e, original, errs);
+    substitute_expr(& mut e, original, errs);
     // Now evaluate the comptime expression
-    var result: ResultExpr = evaluate(&e, original);
+    var result: ResultExpr = evaluate(& e, original);
     match result {
-        ResultExpr::Ok(v) => { *expr = ct_materialize(v); }
-        ResultExpr::Err(msg) => { errs.push("comptime error: " + msg); ct_warn(msg); }
+        ResultExpr::Ok(v) => {
+            * expr = ct_materialize(v);
+        }
+        ResultExpr::Err(msg) => {
+            errs.push("comptime error: " + msg);
+            ct_warn(msg);
+        }
     }
 }
 
-fn substitute_expr_comptime_block(expr: &mut Expr, stmts: &mut Vec<Stmt>, original: &Program, errs: &mut Vec<str>) {
+fn substitute_expr_comptime_block(expr: & mut Expr, stmts: & mut Vec<Stmt>, original: & Program, errs: & mut Vec<str>) {
     substitute_stmts(stmts, original, errs);
     var result: ResultExpr = evaluate_block(stmts, original);
     match result {
-        ResultExpr::Ok(v) => { *expr = ct_materialize(v); }
-        ResultExpr::Err(msg) => { errs.push("comptime error: " + msg); ct_warn(msg); }
+        ResultExpr::Ok(v) => {
+            * expr = ct_materialize(v);
+        }
+        ResultExpr::Err(msg) => {
+            errs.push("comptime error: " + msg);
+            ct_warn(msg);
+        }
     }
 }
 
-fn substitute_expr_comptime_reflect(expr: &mut Expr, op: ReflectOp, ty: Type, original: &Program, errs: &mut Vec<str>) {
+fn substitute_expr_comptime_reflect(expr: & mut Expr, op: ReflectOp, ty: Type, original: & Program, errs: & mut Vec<str>) {
     var result: ResultExpr = evaluate_reflect(op, ty, original);
     match result {
-        ResultExpr::Ok(v) => { *expr = v; }
-        ResultExpr::Err(msg) => { errs.push("comptime error: " + msg); }
+        ResultExpr::Ok(v) => {
+            * expr = v;
+        }
+        ResultExpr::Err(msg) => {
+            errs.push("comptime error: " + msg);
+        }
     }
 }
 
@@ -963,39 +1278,45 @@ fn substitute_expr_comptime_reflect(expr: &mut Expr, op: ReflectOp, ty: Type, or
 
 // The names of this program's comptime fns
 var ct_comptime_fns: i64 = 0;
-
-fn aggressive_comptime_func(funcs: &mut Vec<Func>, idx: i64, original: &Program) {
+ fn aggressive_comptime_func(funcs: & mut Vec<Func>, idx: i64, original: & Program) {
     var func: Func = funcs.get(idx);
     var si: i64 = 0;
     while si < func.body.len() {
         var stmt: Stmt = func.body.get(si);
-        aggressive_comptime_stmt(&mut stmt, original);
+        aggressive_comptime_stmt(& mut stmt, original);
         func.body.set(si, stmt);
         si = si + 1;
     }
     funcs.set(idx, func);
 }
 
-fn aggressive_comptime_stmt(stmt: &mut Stmt, original: &Program) {
+fn aggressive_comptime_stmt(stmt: & mut Stmt, original: & Program) {
     match stmt {
-        Stmt::Let(_, _, expr, _, _, _, _) => { aggressive_comptime_expr(&mut expr, original); }
-        Stmt::Assign(_, _, expr, _) => { aggressive_comptime_expr(&mut expr, original); }
-        Stmt::Expr(e, _) => { aggressive_comptime_expr(&mut e, original); }
+        Stmt::Let(_, _, expr, _, _, _, _) => {
+            aggressive_comptime_expr(& mut expr, original);
+        }
+        Stmt::Assign(_, _, expr, _) => {
+            aggressive_comptime_expr(& mut expr, original);
+        }
+        Stmt::Expr(e, _) => {
+            aggressive_comptime_expr(& mut e, original);
+        }
         Stmt::Return(opt, _) => {
             match opt {
                 OptBoxExpr::Some(e) => {
                     var inner: Expr = ct_box_expr_unbox(e);
-                    aggressive_comptime_expr(&mut inner, original);
+                    aggressive_comptime_expr(& mut inner, original);
                 }
-                OptBoxExpr::None => {}
+                OptBoxExpr::None => {
+                }
             }
         }
         Stmt::If(cond, then_block, else_block, _) => {
-            aggressive_comptime_expr(&mut cond, original);
+            aggressive_comptime_expr(& mut cond, original);
             var si: i64 = 0;
             while si < then_block.len() {
                 var s: Stmt = then_block.get(si);
-                aggressive_comptime_stmt(&mut s, original);
+                aggressive_comptime_stmt(& mut s, original);
                 then_block.set(si, s);
                 si = si + 1;
             }
@@ -1004,12 +1325,13 @@ fn aggressive_comptime_stmt(stmt: &mut Stmt, original: &Program) {
                     var ei: i64 = 0;
                     while ei < eb.len() {
                         var s: Stmt = eb.get(ei);
-                        aggressive_comptime_stmt(&mut s, original);
+                        aggressive_comptime_stmt(& mut s, original);
                         eb.set(ei, s);
                         ei = ei + 1;
                     }
                 }
-                OptStmts::None => {}
+                OptStmts::None => {
+                }
             }
             // I-5A: If condition is a literal bool, eliminate the dead branch
             match cond {
@@ -1017,23 +1339,27 @@ fn aggressive_comptime_stmt(stmt: &mut Stmt, original: &Program) {
                     if b {
                         // Clear else block -- then block stays
                         match else_block {
-                            OptStmts::Some(_) => { *else_block = OptStmts::None; }
-                            OptStmts::None => {}
+                            OptStmts::Some(_) => {
+                                * else_block = OptStmts::None;
+                            }
+                            OptStmts::None => {
+                            }
                         }
                     } else {
                         // Clear then block -- else block stays
                         then_block.clear();
                     }
                 }
-                _ => {}
+                _ => {
+                }
             }
         }
         Stmt::For(loop_var, iterator, body, _) => {
-            aggressive_comptime_expr(&mut iterator, original);
+            aggressive_comptime_expr(& mut iterator, original);
             var si: i64 = 0;
             while si < body.len() {
                 var s: Stmt = body.get(si);
-                aggressive_comptime_stmt(&mut s, original);
+                aggressive_comptime_stmt(& mut s, original);
                 body.set(si, s);
                 si = si + 1;
             }
@@ -1048,12 +1374,18 @@ fn aggressive_comptime_stmt(stmt: &mut Stmt, original: &Program) {
                             match end_e {
                                 Expr::IntLit(e) => {
                                     var trip: i64 = 0;
-                                    if inclusive { trip = e - s + 1; } else { trip = e - s; }
+                                    if inclusive {
+                                        trip = e - s + 1;
+                                    } else {
+                                        trip = e - s;
+                                    }
                                     // Check for break/continue in body
                                     var has_bc: bool = false;
                                     var bi: i64 = 0;
                                     while bi < body.len() {
-                                        if stmt_has_break_or_continue(body.get(bi)) { has_bc = true; }
+                                        if stmt_has_break_or_continue(body.get(bi)) {
+                                            has_bc = true;
+                                        }
                                         bi = bi + 1;
                                     }
                                     if trip > 0 && trip <= 16 && body.len() <= 16 && !has_bc {
@@ -1064,7 +1396,11 @@ fn aggressive_comptime_stmt(stmt: &mut Stmt, original: &Program) {
                                         // iteration after the first saw the first's k.)
                                         var unrolled: Vec<Stmt> = Vec::new();
                                         var last: i64 = 0;
-                                        if inclusive { last = e + 1; } else { last = e; }
+                                        if inclusive {
+                                            last = e + 1;
+                                        } else {
+                                            last = e;
+                                        }
                                         var i: i64 = s;
                                         while i < last {
                                             var iteration: Vec<Stmt> = Vec::new();
@@ -1078,71 +1414,76 @@ fn aggressive_comptime_stmt(stmt: &mut Stmt, original: &Program) {
                                             i = i + 1;
                                         }
                                         // Replace the for loop with if true { unrolled }
-                                        *stmt = Stmt::If(Expr::BoolLit(true), unrolled, OptStmts::None, 0);
+                                        * stmt = Stmt::If(Expr::BoolLit(true), unrolled, OptStmts::None, 0);
                                         return;
                                     }
                                 }
-                                _ => {}
+                                _ => {
+                                }
                             }
                         }
-                        _ => {}
+                        _ => {
+                        }
                     }
                 }
-                _ => {}
+                _ => {
+                }
             }
         }
         Stmt::While(cond, body, _) => {
-            aggressive_comptime_expr(&mut cond, original);
+            aggressive_comptime_expr(& mut cond, original);
             var si: i64 = 0;
             while si < body.len() {
                 var s: Stmt = body.get(si);
-                aggressive_comptime_stmt(&mut s, original);
+                aggressive_comptime_stmt(& mut s, original);
                 body.set(si, s);
                 si = si + 1;
             }
         }
-        _ => {}
+        _ => {
+        }
     }
 }
 
-fn aggressive_comptime_expr(expr: &mut Expr, original: &Program) {
+fn aggressive_comptime_expr(expr: & mut Expr, original: & Program) {
     // First recurse into children
     match expr {
         Expr::Binary(op, left, right) => {
             var l: Expr = ct_box_expr_unbox(left);
             var r: Expr = ct_box_expr_unbox(right);
-            aggressive_comptime_expr(&mut l, original);
-            aggressive_comptime_expr(&mut r, original);
-            *expr = Expr::Binary(op, box_expr_new(l), box_expr_new(r));
+            aggressive_comptime_expr(& mut l, original);
+            aggressive_comptime_expr(& mut r, original);
+            * expr = Expr::Binary(op, box_expr_new(l), box_expr_new(r));
         }
         Expr::Unary(op, inner) => {
             var e: Expr = ct_box_expr_unbox(inner);
-            aggressive_comptime_expr(&mut e, original);
-            *expr = Expr::Unary(op, box_expr_new(e));
+            aggressive_comptime_expr(& mut e, original);
+            * expr = Expr::Unary(op, box_expr_new(e));
         }
         Expr::Call(callee, args) => {
             var ai: i64 = 0;
             while ai < args.len() {
                 var a: Expr = args.get(ai);
-                aggressive_comptime_expr(&mut a, original);
+                aggressive_comptime_expr(& mut a, original);
                 args.set(ai, a);
                 ai = ai + 1;
             }
-            *expr = Expr::Call(callee, args);
+            * expr = Expr::Call(callee, args);
         }
         Expr::MethodCall(receiver, mname, args) => {
             var r: Expr = ct_box_expr_unbox(receiver);
-            aggressive_comptime_expr(&mut r, original);
+            aggressive_comptime_expr(& mut r, original);
             var ai: i64 = 0;
             while ai < args.len() {
                 var a: Expr = args.get(ai);
-                aggressive_comptime_expr(&mut a, original);
+                aggressive_comptime_expr(& mut a, original);
                 args.set(ai, a);
                 ai = ai + 1;
             }
-            *expr = Expr::MethodCall(box_expr_new(r), mname, args);
+            * expr = Expr::MethodCall(box_expr_new(r), mname, args);
         }
-        _ => {}
+        _ => {
+        }
     }
 
     // I-5A: If this is a call to a comptime fn with all-literal args, evaluate it
@@ -1152,98 +1493,138 @@ fn aggressive_comptime_expr(expr: &mut Expr, original: &Program) {
                 var all_lit: bool = true;
                 var ai: i64 = 0;
                 while ai < args.len() {
-                    if !is_literal(args.get(ai)) { all_lit = false; }
+                    if !is_literal(args.get(ai)) {
+                        all_lit = false;
+                    }
                     ai = ai + 1;
                 }
                 if all_lit {
                     var result: ResultExpr = evaluate(expr, original);
                     match result {
-                        ResultExpr::Ok(v) => { *expr = ct_materialize(v); }
-                        ResultExpr::Err(_) => {} // Leave as-is on error
+                        ResultExpr::Ok(v) => {
+                            * expr = ct_materialize(v);
+                        }
+                        ResultExpr::Err(_) => {
+                        }
+                        // Leave as-is on error
                     }
                 }
             }
         }
-        _ => {}
+        _ => {
+        }
     }
 }
 
 fn is_literal(expr: Expr) -> bool {
     match expr {
-        Expr::IntLit(_) => { return true; }
-        Expr::FloatLit(_) => { return true; }
-        Expr::BoolLit(_) => { return true; }
-        Expr::StringLit(_) => { return true; }
-        _ => { return false; }
+        Expr::IntLit(_) => {
+            return true;
+        }
+        Expr::FloatLit(_) => {
+            return true;
+        }
+        Expr::BoolLit(_) => {
+            return true;
+        }
+        Expr::StringLit(_) => {
+            return true;
+        }
+        _ => {
+            return false;
+        }
     }
     return false;
 }
 
 fn stmt_has_break_or_continue(stmt: Stmt) -> bool {
     match stmt {
-        Stmt::Break(_, _) => { return true; }
-        Stmt::Continue(_) => { return true; }
+        Stmt::Break(_, _) => {
+            return true;
+        }
+        Stmt::Continue(_) => {
+            return true;
+        }
         Stmt::If(_, then_block, else_block, _) => {
             var i: i64 = 0;
             while i < then_block.len() {
-                if stmt_has_break_or_continue(then_block.get(i)) { return true; }
+                if stmt_has_break_or_continue(then_block.get(i)) {
+                    return true;
+                }
                 i = i + 1;
             }
             match else_block {
                 OptStmts::Some(eb) => {
                     var j: i64 = 0;
                     while j < eb.len() {
-                        if stmt_has_break_or_continue(eb.get(j)) { return true; }
+                        if stmt_has_break_or_continue(eb.get(j)) {
+                            return true;
+                        }
                         j = j + 1;
                     }
                 }
-                OptStmts::None => {}
+                OptStmts::None => {
+                }
             }
         }
         Stmt::For(_, _, body, _) => {
             var i: i64 = 0;
             while i < body.len() {
-                if stmt_has_break_or_continue(body.get(i)) { return true; }
+                if stmt_has_break_or_continue(body.get(i)) {
+                    return true;
+                }
                 i = i + 1;
             }
         }
         Stmt::While(_, body, _) => {
             var i: i64 = 0;
             while i < body.len() {
-                if stmt_has_break_or_continue(body.get(i)) { return true; }
+                if stmt_has_break_or_continue(body.get(i)) {
+                    return true;
+                }
                 i = i + 1;
             }
         }
         Stmt::Unsafe(body, _) => {
             var i: i64 = 0;
             while i < body.len() {
-                if stmt_has_break_or_continue(body.get(i)) { return true; }
+                if stmt_has_break_or_continue(body.get(i)) {
+                    return true;
+                }
                 i = i + 1;
             }
         }
-        _ => {}
+        _ => {
+        }
     }
     return false;
 }
 
 // --- Identifier replacement (for loop unrolling) -------------------------
 
-fn replace_ident_in_stmt(stmt: &mut Stmt, name: str, replacement: Expr) {
+fn replace_ident_in_stmt(stmt: & mut Stmt, name: str, replacement: Expr) {
     match stmt {
-        Stmt::Let(_, _, expr, _, _, _, _) => { replace_ident_in_expr(expr, name, replacement); }
-        Stmt::Assign(_, _, expr, _) => { replace_ident_in_expr(expr, name, replacement); }
+        Stmt::Let(_, _, expr, _, _, _, _) => {
+            replace_ident_in_expr(expr, name, replacement);
+        }
+        Stmt::Assign(_, _, expr, _) => {
+            replace_ident_in_expr(expr, name, replacement);
+        }
         Stmt::IndexAssign(_, index, _, expr, _) => {
             replace_ident_in_expr(index, name, replacement);
             replace_ident_in_expr(expr, name, replacement);
         }
-        Stmt::Expr(e, _) => { replace_ident_in_expr(e, name, replacement); }
+        Stmt::Expr(e, _) => {
+            replace_ident_in_expr(e, name, replacement);
+        }
         Stmt::Return(opt, _) => {
             match opt {
                 OptBoxExpr::Some(e) => {
                     var inner: Expr = ct_box_expr_unbox(e);
-                    replace_ident_in_expr(&mut inner, name, replacement);
+                    replace_ident_in_expr(& mut inner, name, replacement);
                 }
-                OptBoxExpr::None => {}
+                OptBoxExpr::None => {
+                }
             }
         }
         Stmt::If(cond, then_block, else_block, _) => {
@@ -1251,7 +1632,7 @@ fn replace_ident_in_stmt(stmt: &mut Stmt, name: str, replacement: Expr) {
             var si: i64 = 0;
             while si < then_block.len() {
                 var s: Stmt = then_block.get(si);
-                replace_ident_in_stmt(&mut s, name, replacement);
+                replace_ident_in_stmt(& mut s, name, replacement);
                 then_block.set(si, s);
                 si = si + 1;
             }
@@ -1260,12 +1641,13 @@ fn replace_ident_in_stmt(stmt: &mut Stmt, name: str, replacement: Expr) {
                     var ei: i64 = 0;
                     while ei < eb.len() {
                         var s: Stmt = eb.get(ei);
-                        replace_ident_in_stmt(&mut s, name, replacement);
+                        replace_ident_in_stmt(& mut s, name, replacement);
                         eb.set(ei, s);
                         ei = ei + 1;
                     }
                 }
-                OptStmts::None => {}
+                OptStmts::None => {
+                }
             }
         }
         Stmt::For(v, iterator, body, _) => {
@@ -1274,7 +1656,7 @@ fn replace_ident_in_stmt(stmt: &mut Stmt, name: str, replacement: Expr) {
                 var si: i64 = 0;
                 while si < body.len() {
                     var s: Stmt = body.get(si);
-                    replace_ident_in_stmt(&mut s, name, replacement);
+                    replace_ident_in_stmt(& mut s, name, replacement);
                     body.set(si, s);
                     si = si + 1;
                 }
@@ -1285,82 +1667,85 @@ fn replace_ident_in_stmt(stmt: &mut Stmt, name: str, replacement: Expr) {
             var si: i64 = 0;
             while si < body.len() {
                 var s: Stmt = body.get(si);
-                replace_ident_in_stmt(&mut s, name, replacement);
+                replace_ident_in_stmt(& mut s, name, replacement);
                 body.set(si, s);
                 si = si + 1;
             }
         }
-        _ => {}
+        _ => {
+        }
     }
 }
 
-fn replace_ident_in_expr(expr: &mut Expr, name: str, replacement: Expr) {
+fn replace_ident_in_expr(expr: & mut Expr, name: str, replacement: Expr) {
     match expr {
         Expr::Ident(n) => {
-            if n == name { *expr = replacement; }
+            if n == name {
+                * expr = replacement;
+            }
         }
         Expr::Binary(op, left, right) => {
             var l: Expr = ct_box_expr_unbox(left);
             var r: Expr = ct_box_expr_unbox(right);
-            replace_ident_in_expr(&mut l, name, replacement);
-            replace_ident_in_expr(&mut r, name, replacement);
-            *expr = Expr::Binary(op, box_expr_new(l), box_expr_new(r));
+            replace_ident_in_expr(& mut l, name, replacement);
+            replace_ident_in_expr(& mut r, name, replacement);
+            * expr = Expr::Binary(op, box_expr_new(l), box_expr_new(r));
         }
         Expr::Unary(op, inner) => {
             var e: Expr = ct_box_expr_unbox(inner);
-            replace_ident_in_expr(&mut e, name, replacement);
-            *expr = Expr::Unary(op, box_expr_new(e));
+            replace_ident_in_expr(& mut e, name, replacement);
+            * expr = Expr::Unary(op, box_expr_new(e));
         }
         Expr::Call(callee, args) => {
             var ai: i64 = 0;
             while ai < args.len() {
                 var a: Expr = args.get(ai);
-                replace_ident_in_expr(&mut a, name, replacement);
+                replace_ident_in_expr(& mut a, name, replacement);
                 args.set(ai, a);
                 ai = ai + 1;
             }
-            *expr = Expr::Call(callee, args);
+            * expr = Expr::Call(callee, args);
         }
         Expr::MethodCall(receiver, mname, args) => {
             var r: Expr = ct_box_expr_unbox(receiver);
-            replace_ident_in_expr(&mut r, name, replacement);
+            replace_ident_in_expr(& mut r, name, replacement);
             var ai: i64 = 0;
             while ai < args.len() {
                 var a: Expr = args.get(ai);
-                replace_ident_in_expr(&mut a, name, replacement);
+                replace_ident_in_expr(& mut a, name, replacement);
                 args.set(ai, a);
                 ai = ai + 1;
             }
-            *expr = Expr::MethodCall(box_expr_new(r), mname, args);
+            * expr = Expr::MethodCall(box_expr_new(r), mname, args);
         }
         Expr::FieldAccess(inner, field) => {
             var e: Expr = ct_box_expr_unbox(inner);
-            replace_ident_in_expr(&mut e, name, replacement);
-            *expr = Expr::FieldAccess(box_expr_new(e), field);
+            replace_ident_in_expr(& mut e, name, replacement);
+            * expr = Expr::FieldAccess(box_expr_new(e), field);
         }
         Expr::Index(array, index) => {
             var a: Expr = ct_box_expr_unbox(array);
             var i: Expr = ct_box_expr_unbox(index);
-            replace_ident_in_expr(&mut a, name, replacement);
-            replace_ident_in_expr(&mut i, name, replacement);
-            *expr = Expr::Index(box_expr_new(a), box_expr_new(i));
+            replace_ident_in_expr(& mut a, name, replacement);
+            replace_ident_in_expr(& mut i, name, replacement);
+            * expr = Expr::Index(box_expr_new(a), box_expr_new(i));
         }
         Expr::StructLit(sname, fields, base) => {
             var fi: i64 = 0;
             while fi < fields.len() {
                 var f: FieldInit = fields.get(fi);
-                replace_ident_in_expr(&mut f.value, name, replacement);
+                replace_ident_in_expr(& mut f.value, name, replacement);
                 fields.set(fi, f);
                 fi = fi + 1;
             }
-            *expr = Expr::StructLit(sname, fields, base);
+            * expr = Expr::StructLit(sname, fields, base);
         }
         Expr::If(cond, then_block, else_block) => {
             replace_ident_in_expr(cond, name, replacement);
             var si: i64 = 0;
             while si < then_block.len() {
                 var s: Stmt = then_block.get(si);
-                replace_ident_in_stmt(&mut s, name, replacement);
+                replace_ident_in_stmt(& mut s, name, replacement);
                 then_block.set(si, s);
                 si = si + 1;
             }
@@ -1369,19 +1754,20 @@ fn replace_ident_in_expr(expr: &mut Expr, name: str, replacement: Expr) {
                     var ei: i64 = 0;
                     while ei < eb.len() {
                         var s: Stmt = eb.get(ei);
-                        replace_ident_in_stmt(&mut s, name, replacement);
+                        replace_ident_in_stmt(& mut s, name, replacement);
                         eb.set(ei, s);
                         ei = ei + 1;
                     }
                 }
-                OptStmts::None => {}
+                OptStmts::None => {
+                }
             }
         }
         Expr::Block(stmts) => {
             var si: i64 = 0;
             while si < stmts.len() {
                 var s: Stmt = stmts.get(si);
-                replace_ident_in_stmt(&mut s, name, replacement);
+                replace_ident_in_stmt(& mut s, name, replacement);
                 stmts.set(si, s);
                 si = si + 1;
             }
@@ -1389,67 +1775,88 @@ fn replace_ident_in_expr(expr: &mut Expr, name: str, replacement: Expr) {
         Expr::Range(start, end, incl) => {
             var s: Expr = ct_box_expr_unbox(start);
             var e: Expr = ct_box_expr_unbox(end);
-            replace_ident_in_expr(&mut s, name, replacement);
-            replace_ident_in_expr(&mut e, name, replacement);
-            *expr = Expr::Range(box_expr_new(s), box_expr_new(e), incl);
+            replace_ident_in_expr(& mut s, name, replacement);
+            replace_ident_in_expr(& mut e, name, replacement);
+            * expr = Expr::Range(box_expr_new(s), box_expr_new(e), incl);
         }
         Expr::Ref(inner, is_mut) => {
             var e: Expr = ct_box_expr_unbox(inner);
-            replace_ident_in_expr(&mut e, name, replacement);
-            *expr = Expr::Ref(box_expr_new(e), is_mut);
+            replace_ident_in_expr(& mut e, name, replacement);
+            * expr = Expr::Ref(box_expr_new(e), is_mut);
         }
         Expr::Deref(inner) => {
             var e: Expr = ct_box_expr_unbox(inner);
-            replace_ident_in_expr(&mut e, name, replacement);
-            *expr = Expr::Deref(box_expr_new(e));
+            replace_ident_in_expr(& mut e, name, replacement);
+            * expr = Expr::Deref(box_expr_new(e));
         }
         Expr::Cast(inner, ty) => {
             var e: Expr = ct_box_expr_unbox(inner);
-            replace_ident_in_expr(&mut e, name, replacement);
-            *expr = Expr::Cast(box_expr_new(e), ty);
+            replace_ident_in_expr(& mut e, name, replacement);
+            * expr = Expr::Cast(box_expr_new(e), ty);
         }
-        _ => {}
+        _ => {
+        }
     }
 }
 
 // --- Evuation ----------------------------------------------------------
 
-fn evaluate(expr: &Expr, original: &Program) -> ResultExpr {
+fn evaluate(expr: & Expr, original: & Program) -> ResultExpr {
     match expr {
-        Expr::IntLit(n) => { return ResultExpr::Ok(Expr::IntLit(n)); }
-        Expr::FloatLit(f) => { return ResultExpr::Ok(Expr::FloatLit(f)); }
-        Expr::StringLit(s) => { return ResultExpr::Ok(Expr::StringLit(s)); }
-        Expr::BoolLit(b) => { return ResultExpr::Ok(Expr::BoolLit(b)); }
+        Expr::IntLit(n) => {
+            return ResultExpr::Ok(Expr::IntLit(n));
+        }
+        Expr::FloatLit(f) => {
+            return ResultExpr::Ok(Expr::FloatLit(f));
+        }
+        Expr::StringLit(s) => {
+            return ResultExpr::Ok(Expr::StringLit(s));
+        }
+        Expr::BoolLit(b) => {
+            return ResultExpr::Ok(Expr::BoolLit(b));
+        }
         Expr::Binary(op, left, right) => {
             var l: Expr = ct_box_expr_unbox(left);
             var r: Expr = ct_box_expr_unbox(right);
-            var lr: ResultExpr = evaluate(&l, original);
+            var lr: ResultExpr = evaluate(& l, original);
             match lr {
-                ResultExpr::Err(msg) => { return ResultExpr::Err(msg); }
+                ResultExpr::Err(msg) => {
+                    return ResultExpr::Err(msg);
+                }
                 ResultExpr::Ok(lv) => {
-                    var rr: ResultExpr = evaluate(&r, original);
+                    var rr: ResultExpr = evaluate(& r, original);
                     match rr {
-                        ResultExpr::Err(msg) => { return ResultExpr::Err(msg); }
-                        ResultExpr::Ok(rv) => { return eval_binop(op, lv, rv); }
+                        ResultExpr::Err(msg) => {
+                            return ResultExpr::Err(msg);
+                        }
+                        ResultExpr::Ok(rv) => {
+                            return eval_binop(op, lv, rv);
+                        }
                     }
                 }
             }
         }
         Expr::Unary(op, inner) => {
             var e: Expr = ct_box_expr_unbox(inner);
-            var vr: ResultExpr = evaluate(&e, original);
+            var vr: ResultExpr = evaluate(& e, original);
             match vr {
-                ResultExpr::Err(msg) => { return ResultExpr::Err(msg); }
-                ResultExpr::Ok(v) => { return eval_unaryop(op, v); }
+                ResultExpr::Err(msg) => {
+                    return ResultExpr::Err(msg);
+                }
+                ResultExpr::Ok(v) => {
+                    return eval_unaryop(op, v);
+                }
             }
         }
         Expr::Call(callee, args) => {
             // Look up comptime function
-            var func_idx: i64 = -1;
+            var func_idx: i64 = - 1;
             var fi: i64 = 0;
             while fi < original.funcs.len() {
                 var f: Func = original.funcs.get(fi);
-                if f.name == callee && f.is_comptime { func_idx = fi; }
+                if f.name == callee && f.is_comptime {
+                    func_idx = fi;
+                }
                 fi = fi + 1;
             }
             if func_idx < 0 {
@@ -1461,10 +1868,14 @@ fn evaluate(expr: &Expr, original: &Program) -> ResultExpr {
             var ai: i64 = 0;
             while ai < args.len() {
                 var a: Expr = args.get(ai);
-                var ar: ResultExpr = evaluate(&a, original);
+                var ar: ResultExpr = evaluate(& a, original);
                 match ar {
-                    ResultExpr::Err(msg) => { return ResultExpr::Err(msg); }
-                    ResultExpr::Ok(v) => { arg_values.push(v); }
+                    ResultExpr::Err(msg) => {
+                        return ResultExpr::Err(msg);
+                    }
+                    ResultExpr::Ok(v) => {
+                        arg_values.push(v);
+                    }
                 }
                 ai = ai + 1;
             }
@@ -1473,7 +1884,9 @@ fn evaluate(expr: &Expr, original: &Program) -> ResultExpr {
         Expr::If(cond, then_block, else_block) => {
             var cr: ResultExpr = evaluate(cond, original);
             match cr {
-                ResultExpr::Err(msg) => { return ResultExpr::Err(msg); }
+                ResultExpr::Err(msg) => {
+                    return ResultExpr::Err(msg);
+                }
                 ResultExpr::Ok(c) => {
                     match c {
                         Expr::BoolLit(b) => {
@@ -1481,44 +1894,60 @@ fn evaluate(expr: &Expr, original: &Program) -> ResultExpr {
                                 return evaluate_block(then_block, original);
                             } else {
                                 match else_block {
-                                    OptStmts::Some(eb) => { return evaluate_block(eb, original); }
-                                    OptStmts::None => { return ResultExpr::Ok(Expr::IntLit(0)); }
+                                    OptStmts::Some(eb) => {
+                                        return evaluate_block(eb, original);
+                                    }
+                                    OptStmts::None => {
+                                        return ResultExpr::Ok(Expr::IntLit(0));
+                                    }
                                 }
                             }
                         }
-                        _ => { return ResultExpr::Err("comptime if condition must be boolean"); }
+                        _ => {
+                            return ResultExpr::Err("comptime if condition must be boolean");
+                        }
                     }
                 }
             }
         }
-        Expr::Block(stmts) => { return evaluate_block(stmts, original); }
+        Expr::Block(stmts) => {
+            return evaluate_block(stmts, original);
+        }
         Expr::Comptime(inner) => {
             var e: Expr = ct_box_expr_unbox(inner);
-            return evaluate(&e, original);
+            return evaluate(& e, original);
         }
-        Expr::ComptimeBlock(stmts) => { return evaluate_block(stmts, original); }
-        Expr::ComptimeReflect(op, ty) => { return evaluate_reflect(op, ty, original); }
-        _ => { return ResultExpr::Ok(*expr); }
+        Expr::ComptimeBlock(stmts) => {
+            return evaluate_block(stmts, original);
+        }
+        Expr::ComptimeReflect(op, ty) => {
+            return evaluate_reflect(op, ty, original);
+        }
+        _ => {
+            return ResultExpr::Ok(* expr);
+        }
     }
     return ResultExpr::Ok(Expr::IntLit(0));
 }
 
-fn evaluate_block(stmts: Vec<Stmt>, original: &Program) -> ResultExpr {
+fn evaluate_block(stmts: Vec<Stmt>, original: & Program) -> ResultExpr {
     var env: ComptimeEnv = ComptimeEnv_new();
-    return evaluate_block_with_env(stmts, original, &env);
+    return evaluate_block_with_env(stmts, original, & env);
 }
 
-fn evaluate_block_with_env(stmts: Vec<Stmt>, original: &Program, env: &ComptimeEnv) -> ResultExpr {
+fn evaluate_block_with_env(stmts: Vec<Stmt>, original: & Program, env: & ComptimeEnv) -> ResultExpr {
     var returned: Vec<i64> = Vec::new();
     var block_env: ComptimeEnv = ComptimeEnv_clone(env);
-    return evaluate_block_rt(stmts, original, &mut block_env, &mut returned);
+    return evaluate_block_rt(stmts, original, & mut block_env, & mut returned);
 }
 
 /// Runs `stmts` in `env` itself (its Vecs are shared): assignments to
 /// outer variables persist (a loop accumulating into `out`), names the
 /// block declares are dropped at its end.
-fn evaluate_block_rt(stmts: Vec<Stmt>, original: &Program, env: &mut ComptimeEnv, returned: &mut Vec<i64>) -> ResultExpr {
-    var local_env: ComptimeEnv = ComptimeEnv { names: env.names, values: env.values };
+fn evaluate_block_rt(stmts: Vec<Stmt>, original: & Program, env: & mut ComptimeEnv, returned: & mut Vec<i64>) -> ResultExpr {
+    var local_env: ComptimeEnv = ComptimeEnv {
+        names: env.names, values: env.values
+    };
     var n_outer: i64 = local_env.names.len();
     var result: Expr = Expr::IntLit(0);
     var si: i64 = 0;
@@ -1526,40 +1955,65 @@ fn evaluate_block_rt(stmts: Vec<Stmt>, original: &Program, env: &mut ComptimeEnv
         var stmt: Stmt = stmts.get(si);
         match stmt {
             Stmt::Let(name, _, expr, _, _, _, _) => {
-                var vr: ResultExpr = evaluate_with_env(expr, &local_env, original);
+                var vr: ResultExpr = evaluate_with_env(expr, & local_env, original);
                 match vr {
-                    ResultExpr::Err(msg) => { return ResultExpr::Err(msg); }
-                    ResultExpr::Ok(v) => { ComptimeEnv_set(&mut local_env, name, v); }
+                    ResultExpr::Err(msg) => {
+                        return ResultExpr::Err(msg);
+                    }
+                    ResultExpr::Ok(v) => {
+                        ComptimeEnv_set(& mut local_env, name, v);
+                    }
                 }
             }
             Stmt::Assign(target, op, expr, _) => {
-                var vr: ResultExpr = evaluate_with_env(expr, &local_env, original);
+                var vr: ResultExpr = evaluate_with_env(expr, & local_env, original);
                 match vr {
-                    ResultExpr::Err(msg) => { return ResultExpr::Err(msg); }
+                    ResultExpr::Err(msg) => {
+                        return ResultExpr::Err(msg);
+                    }
                     ResultExpr::Ok(v) => {
-                        var current_opt: OptExpr = ComptimeEnv_get(&local_env, target);
+                        var current_opt: OptExpr = ComptimeEnv_get(& local_env, target);
                         var current: Expr = Expr::IntLit(0);
                         match current_opt {
-                            OptExpr::Some(c) => { current = c; }
-                            OptExpr::None => {}
+                            OptExpr::Some(c) => {
+                                current = c;
+                            }
+                            OptExpr::None => {
+                            }
                         }
                         var new_v: Expr = v;
                         match op {
                             AssignOp::AddAssign => {
                                 var br: ResultExpr = eval_binop(BinOp::Add, current, v);
-                                match br { ResultExpr::Ok(nv) => { new_v = nv; }, ResultExpr::Err(_) => {} }
+                                match br {
+                                    ResultExpr::Ok(nv) => {
+                                        new_v = nv;
+                                    }, ResultExpr::Err(_) => {
+                                    }
+                                }
                             }
                             AssignOp::SubAssign => {
                                 var br: ResultExpr = eval_binop(BinOp::Sub, current, v);
-                                match br { ResultExpr::Ok(nv) => { new_v = nv; }, ResultExpr::Err(_) => {} }
+                                match br {
+                                    ResultExpr::Ok(nv) => {
+                                        new_v = nv;
+                                    }, ResultExpr::Err(_) => {
+                                    }
+                                }
                             }
                             AssignOp::MulAssign => {
                                 var br: ResultExpr = eval_binop(BinOp::Mul, current, v);
-                                match br { ResultExpr::Ok(nv) => { new_v = nv; }, ResultExpr::Err(_) => {} }
+                                match br {
+                                    ResultExpr::Ok(nv) => {
+                                        new_v = nv;
+                                    }, ResultExpr::Err(_) => {
+                                    }
+                                }
                             }
-                            _ => {}
+                            _ => {
+                            }
                         }
-                        ComptimeEnv_set(&mut local_env, target, new_v);
+                        ComptimeEnv_set(& mut local_env, target, new_v);
                     }
                 }
             }
@@ -1572,18 +2026,22 @@ fn evaluate_block_rt(stmts: Vec<Stmt>, original: &Program, env: &mut ComptimeEnv
                         match ct_box_expr_unbox(pr) {
                             Expr::Ident(pv) => {
                                 if pm == "push" || pm == "set" {
-                                    var cur: OptExpr = ComptimeEnv_get(&local_env, pv);
+                                    var cur: OptExpr = ComptimeEnv_get(& local_env, pv);
                                     match cur {
                                         OptExpr::Some(cv) => {
                                             var tel: Vec<Expr> = Vec::new();
-                                            if ct_vec_elems(cv, &mut tel) {
+                                            if ct_vec_elems(cv, & mut tel) {
                                                 var vals: Vec<Expr> = Vec::new();
                                                 var pa: i64 = 0;
                                                 while pa < pargs.len() {
                                                     var ax: Expr = pargs.get(pa);
-                                                    match evaluate_with_env(&ax, &local_env, original) {
-                                                        ResultExpr::Ok(av) => { vals.push(av); }
-                                                        ResultExpr::Err(am) => { return ResultExpr::Err(am); }
+                                                    match evaluate_with_env(& ax, & local_env, original) {
+                                                        ResultExpr::Ok(av) => {
+                                                            vals.push(av);
+                                                        }
+                                                        ResultExpr::Err(am) => {
+                                                            return ResultExpr::Err(am);
+                                                        }
                                                     }
                                                     pa = pa + 1;
                                                 }
@@ -1595,31 +2053,46 @@ fn evaluate_block_rt(stmts: Vec<Stmt>, original: &Program, env: &mut ComptimeEnv
                                                 } else if pm == "set" && vals.len() == 2 {
                                                     match vals.get(0) {
                                                         Expr::IntLit(si2) => {
-                                                            if si2 < 0 || si2 >= tel.len() { return ResultExpr::Err("comptime Vec index " + int_to_str(si2) + " out of bounds"); }
+                                                            if si2 < 0 || si2 >= tel.len() {
+                                                                return ResultExpr::Err("comptime Vec index " + int_to_str(si2) + " out of bounds");
+                                                            }
                                                             tel.set(si2, vals.get(1));
                                                             et = ct_lit_type(vals.get(1));
                                                             handled = true;
                                                         }
-                                                        _ => {}
+                                                        _ => {
+                                                        }
                                                     }
                                                 }
-                                                if handled { ComptimeEnv_set(&mut local_env, pv, ct_vec_of(et, tel)); }
+                                                if handled {
+                                                    ComptimeEnv_set(& mut local_env, pv, ct_vec_of(et, tel));
+                                                }
                                             }
                                         }
-                                        OptExpr::None => {}
+                                        OptExpr::None => {
+                                        }
                                     }
                                 }
                             }
-                            _ => {}
+                            _ => {
+                            }
                         }
                     }
-                    _ => {}
+                    _ => {
+                    }
                 }
-                if handled { si = si + 1; continue; }
-                var vr: ResultExpr = evaluate_with_env(e, &local_env, original);
+                if handled {
+                    si = si + 1;
+                    continue;
+                }
+                var vr: ResultExpr = evaluate_with_env(e, & local_env, original);
                 match vr {
-                    ResultExpr::Err(msg) => { return ResultExpr::Err(msg); }
-                    ResultExpr::Ok(v) => { result = v; }
+                    ResultExpr::Err(msg) => {
+                        return ResultExpr::Err(msg);
+                    }
+                    ResultExpr::Ok(v) => {
+                        result = v;
+                    }
                 }
             }
             Stmt::Return(opt, _) => {
@@ -1627,40 +2100,59 @@ fn evaluate_block_rt(stmts: Vec<Stmt>, original: &Program, env: &mut ComptimeEnv
                 match opt {
                     OptBoxExpr::Some(e) => {
                         var inner: Expr = ct_box_expr_unbox(e);
-                        return evaluate_with_env(&inner, &local_env, original);
+                        return evaluate_with_env(& inner, & local_env, original);
                     }
-                    OptBoxExpr::None => { return ResultExpr::Ok(Expr::IntLit(0)); }
+                    OptBoxExpr::None => {
+                        return ResultExpr::Ok(Expr::IntLit(0));
+                    }
                 }
             }
             Stmt::If(cond, then_block, else_block, _) => {
-                var cr: ResultExpr = evaluate_with_env(cond, &local_env, original);
+                var cr: ResultExpr = evaluate_with_env(cond, & local_env, original);
                 match cr {
-                    ResultExpr::Err(msg) => { return ResultExpr::Err(msg); }
+                    ResultExpr::Err(msg) => {
+                        return ResultExpr::Err(msg);
+                    }
                     ResultExpr::Ok(c) => {
                         match c {
                             Expr::BoolLit(b) => {
                                 if b {
-                                    var br: ResultExpr = evaluate_block_rt(then_block, original, &mut local_env, returned);
-                                    if returned.len() > 0 { return br; }
+                                    var br: ResultExpr = evaluate_block_rt(then_block, original, & mut local_env, returned);
+                                    if returned.len() > 0 {
+                                        return br;
+                                    }
                                     match br {
-                                        ResultExpr::Ok(v) => { result = v; }
-                                        ResultExpr::Err(msg) => { return ResultExpr::Err(msg); }
+                                        ResultExpr::Ok(v) => {
+                                            result = v;
+                                        }
+                                        ResultExpr::Err(msg) => {
+                                            return ResultExpr::Err(msg);
+                                        }
                                     }
                                 } else {
                                     match else_block {
                                         OptStmts::Some(eb) => {
-                                            var br: ResultExpr = evaluate_block_rt(eb, original, &mut local_env, returned);
-                                            if returned.len() > 0 { return br; }
+                                            var br: ResultExpr = evaluate_block_rt(eb, original, & mut local_env, returned);
+                                            if returned.len() > 0 {
+                                                return br;
+                                            }
                                             match br {
-                                                ResultExpr::Ok(v) => { result = v; }
-                                                ResultExpr::Err(msg) => { return ResultExpr::Err(msg); }
+                                                ResultExpr::Ok(v) => {
+                                                    result = v;
+                                                }
+                                                ResultExpr::Err(msg) => {
+                                                    return ResultExpr::Err(msg);
+                                                }
                                             }
                                         }
-                                        OptStmts::None => {}
+                                        OptStmts::None => {
+                                        }
                                     }
                                 }
                             }
-                            _ => { return ResultExpr::Err("comptime if condition must be boolean"); }
+                            _ => {
+                                return ResultExpr::Err("comptime if condition must be boolean");
+                            }
                         }
                     }
                 }
@@ -1671,44 +2163,63 @@ fn evaluate_block_rt(stmts: Vec<Stmt>, original: &Program, env: &mut ComptimeEnv
                 var guard: i64 = 0;
                 var going: bool = true;
                 while going {
-                    var wc: ResultExpr = evaluate_with_env(wcond, &local_env, original);
+                    var wc: ResultExpr = evaluate_with_env(wcond, & local_env, original);
                     match wc {
-                        ResultExpr::Err(wm) => { return ResultExpr::Err(wm); }
+                        ResultExpr::Err(wm) => {
+                            return ResultExpr::Err(wm);
+                        }
                         ResultExpr::Ok(wv) => {
                             match wv {
-                                Expr::BoolLit(wb) => { going = wb; }
-                                _ => { return ResultExpr::Err("comptime while condition must be boolean"); }
+                                Expr::BoolLit(wb) => {
+                                    going = wb;
+                                }
+                                _ => {
+                                    return ResultExpr::Err("comptime while condition must be boolean");
+                                }
                             }
                         }
                     }
                     if going {
                         guard = guard + 1;
-                        if guard > 10000000 { return ResultExpr::Err("comptime while loop ran 10 million times"); }
-                        var wr: ResultExpr = evaluate_block_rt(wbody, original, &mut local_env, returned);
-                        if returned.len() > 0 { return wr; }
+                        if guard > 10000000 {
+                            return ResultExpr::Err("comptime while loop ran 10 million times");
+                        }
+                        var wr: ResultExpr = evaluate_block_rt(wbody, original, & mut local_env, returned);
+                        if returned.len() > 0 {
+                            return wr;
+                        }
                         match wr {
-                            ResultExpr::Ok(_) => {}
-                            ResultExpr::Err(wem) => { return ResultExpr::Err(wem); }
+                            ResultExpr::Ok(_) => {
+                            }
+                            ResultExpr::Err(wem) => {
+                                return ResultExpr::Err(wem);
+                            }
                         }
                     }
                 }
             }
             Stmt::For(loop_var, iterator, body, _) => {
-                var iter_v: ResultExpr = evaluate_with_env(iterator, &local_env, original);
+                var iter_v: ResultExpr = evaluate_with_env(iterator, & local_env, original);
                 match iter_v {
-                    ResultExpr::Err(msg) => { return ResultExpr::Err(msg); }
+                    ResultExpr::Err(msg) => {
+                        return ResultExpr::Err(msg);
+                    }
                     ResultExpr::Ok(iv) => {
                         match iv {
                             Expr::Range(start_box, end_box, _) => {
                                 var start_e: Expr = ct_box_expr_unbox(start_box);
                                 var end_e: Expr = ct_box_expr_unbox(end_box);
-                                var sr: ResultExpr = evaluate_with_env(&start_e, &local_env, original);
-                                var er: ResultExpr = evaluate_with_env(&end_e, &local_env, original);
+                                var sr: ResultExpr = evaluate_with_env(& start_e, & local_env, original);
+                                var er: ResultExpr = evaluate_with_env(& end_e, & local_env, original);
                                 match sr {
-                                    ResultExpr::Err(msg) => { return ResultExpr::Err(msg); }
+                                    ResultExpr::Err(msg) => {
+                                        return ResultExpr::Err(msg);
+                                    }
                                     ResultExpr::Ok(s) => {
                                         match er {
-                                            ResultExpr::Err(msg) => { return ResultExpr::Err(msg); }
+                                            ResultExpr::Err(msg) => {
+                                                return ResultExpr::Err(msg);
+                                            }
                                             ResultExpr::Ok(e) => {
                                                 match s {
                                                     Expr::IntLit(a) => {
@@ -1716,32 +2227,45 @@ fn evaluate_block_rt(stmts: Vec<Stmt>, original: &Program, env: &mut ComptimeEnv
                                                             Expr::IntLit(b) => {
                                                                 var i: i64 = a;
                                                                 while i < b {
-                                                                    ComptimeEnv_set(&mut local_env, loop_var, Expr::IntLit(i));
-                                                                    var br: ResultExpr = evaluate_block_rt(body, original, &mut local_env, returned);
-                                                                    if returned.len() > 0 { return br; }
+                                                                    ComptimeEnv_set(& mut local_env, loop_var, Expr::IntLit(i));
+                                                                    var br: ResultExpr = evaluate_block_rt(body, original, & mut local_env, returned);
+                                                                    if returned.len() > 0 {
+                                                                        return br;
+                                                                    }
                                                                     match br {
-                                                                        ResultExpr::Ok(v) => { result = v; }
-                                                                        ResultExpr::Err(msg) => { return ResultExpr::Err(msg); }
+                                                                        ResultExpr::Ok(v) => {
+                                                                            result = v;
+                                                                        }
+                                                                        ResultExpr::Err(msg) => {
+                                                                            return ResultExpr::Err(msg);
+                                                                        }
                                                                     }
                                                                     i = i + 1;
                                                                 }
                                                             }
-                                                            _ => { return ResultExpr::Err("comptime for range must be ints"); }
+                                                            _ => {
+                                                                return ResultExpr::Err("comptime for range must be ints");
+                                                            }
                                                         }
                                                     }
-                                                    _ => { return ResultExpr::Err("comptime for range must be ints"); }
+                                                    _ => {
+                                                        return ResultExpr::Err("comptime for range must be ints");
+                                                    }
                                                 }
                                             }
                                         }
                                     }
                                 }
                             }
-                            _ => { return ResultExpr::Err("comptime for requires a range"); }
+                            _ => {
+                                return ResultExpr::Err("comptime for requires a range");
+                            }
                         }
                     }
                 }
             }
-            _ => {}
+            _ => {
+            }
         }
         si = si + 1;
     }
@@ -1756,40 +2280,62 @@ fn evaluate_block_rt(stmts: Vec<Stmt>, original: &Program, env: &mut ComptimeEnv
     return ResultExpr::Ok(result);
 }
 
-fn evaluate_with_env(expr: &Expr, env: &ComptimeEnv, original: &Program) -> ResultExpr {
+fn evaluate_with_env(expr: & Expr, env: & ComptimeEnv, original: & Program) -> ResultExpr {
     match expr {
         Expr::Ident(name) => {
             var v: OptExpr = ComptimeEnv_get(env, name);
             match v {
-                OptExpr::Some(v) => { return ResultExpr::Ok(v); }
-                OptExpr::None => { return ResultExpr::Err("undefined variable '" + name + "' in comptime"); }
+                OptExpr::Some(v) => {
+                    return ResultExpr::Ok(v);
+                }
+                OptExpr::None => {
+                    return ResultExpr::Err("undefined variable '" + name + "' in comptime");
+                }
             }
         }
-        Expr::IntLit(n) => { return ResultExpr::Ok(Expr::IntLit(n)); }
-        Expr::FloatLit(f) => { return ResultExpr::Ok(Expr::FloatLit(f)); }
-        Expr::StringLit(s) => { return ResultExpr::Ok(Expr::StringLit(s)); }
-        Expr::BoolLit(b) => { return ResultExpr::Ok(Expr::BoolLit(b)); }
+        Expr::IntLit(n) => {
+            return ResultExpr::Ok(Expr::IntLit(n));
+        }
+        Expr::FloatLit(f) => {
+            return ResultExpr::Ok(Expr::FloatLit(f));
+        }
+        Expr::StringLit(s) => {
+            return ResultExpr::Ok(Expr::StringLit(s));
+        }
+        Expr::BoolLit(b) => {
+            return ResultExpr::Ok(Expr::BoolLit(b));
+        }
         Expr::Binary(op, left, right) => {
             var l: Expr = ct_box_expr_unbox(left);
             var r: Expr = ct_box_expr_unbox(right);
-            var lr: ResultExpr = evaluate_with_env(&l, env, original);
+            var lr: ResultExpr = evaluate_with_env(& l, env, original);
             match lr {
-                ResultExpr::Err(msg) => { return ResultExpr::Err(msg); }
+                ResultExpr::Err(msg) => {
+                    return ResultExpr::Err(msg);
+                }
                 ResultExpr::Ok(lv) => {
-                    var rr: ResultExpr = evaluate_with_env(&r, env, original);
+                    var rr: ResultExpr = evaluate_with_env(& r, env, original);
                     match rr {
-                        ResultExpr::Err(msg) => { return ResultExpr::Err(msg); }
-                        ResultExpr::Ok(rv) => { return eval_binop(op, lv, rv); }
+                        ResultExpr::Err(msg) => {
+                            return ResultExpr::Err(msg);
+                        }
+                        ResultExpr::Ok(rv) => {
+                            return eval_binop(op, lv, rv);
+                        }
                     }
                 }
             }
         }
         Expr::Unary(op, inner) => {
             var e: Expr = ct_box_expr_unbox(inner);
-            var vr: ResultExpr = evaluate_with_env(&e, env, original);
+            var vr: ResultExpr = evaluate_with_env(& e, env, original);
             match vr {
-                ResultExpr::Err(msg) => { return ResultExpr::Err(msg); }
-                ResultExpr::Ok(v) => { return eval_unaryop(op, v); }
+                ResultExpr::Err(msg) => {
+                    return ResultExpr::Err(msg);
+                }
+                ResultExpr::Ok(v) => {
+                    return eval_unaryop(op, v);
+                }
             }
         }
         Expr::MethodCall(mrecv, mname, margs) => {
@@ -1801,29 +2347,41 @@ fn evaluate_with_env(expr: &Expr, env: &ComptimeEnv, original: &Program) -> Resu
                         return ResultExpr::Ok(ct_vec_of(Type::I64, Vec::new()));
                     }
                 }
-                _ => {}
+                _ => {
+                }
             }
-            var rv: ResultExpr = evaluate_with_env(&rcv, env, original);
+            var rv: ResultExpr = evaluate_with_env(& rcv, env, original);
             match rv {
-                ResultExpr::Err(m) => { return ResultExpr::Err(m); }
+                ResultExpr::Err(m) => {
+                    return ResultExpr::Err(m);
+                }
                 ResultExpr::Ok(recv_v) => {
                     var els: Vec<Expr> = Vec::new();
-                    if ct_vec_elems(recv_v, &mut els) {
-                        if mname == "len" { return ResultExpr::Ok(Expr::IntLit(els.len())); }
-                        if mname == "is_empty" { return ResultExpr::Ok(Expr::BoolLit(els.len() == 0)); }
+                    if ct_vec_elems(recv_v, & mut els) {
+                        if mname == "len" {
+                            return ResultExpr::Ok(Expr::IntLit(els.len()));
+                        }
+                        if mname == "is_empty" {
+                            return ResultExpr::Ok(Expr::BoolLit(els.len() == 0));
+                        }
                         if mname == "get" && margs.len() == 1 {
                             var gi: Expr = margs.get(0);
-                            match evaluate_with_env(&gi, env, original) {
+                            match evaluate_with_env(& gi, env, original) {
                                 ResultExpr::Ok(iv) => {
                                     match iv {
                                         Expr::IntLit(ix) => {
-                                            if ix >= 0 && ix < els.len() { return ResultExpr::Ok(els.get(ix)); }
+                                            if ix >= 0 && ix < els.len() {
+                                                return ResultExpr::Ok(els.get(ix));
+                                            }
                                             return ResultExpr::Err("comptime Vec index " + int_to_str(ix) + " out of bounds");
                                         }
-                                        _ => {}
+                                        _ => {
+                                        }
                                     }
                                 }
-                                ResultExpr::Err(m2) => { return ResultExpr::Err(m2); }
+                                ResultExpr::Err(m2) => {
+                                    return ResultExpr::Err(m2);
+                                }
                             }
                         }
                     }
@@ -1832,12 +2390,16 @@ fn evaluate_with_env(expr: &Expr, env: &ComptimeEnv, original: &Program) -> Resu
             return ResultExpr::Err("method '" + mname + "' is not evaluated at compile time");
         }
         Expr::Call(callee, args) => {
-            if callee == "Vec_new" && args.len() == 0 { return ResultExpr::Ok(ct_vec_of(Type::I64, Vec::new())); }
-            var func_idx: i64 = -1;
+            if callee == "Vec_new" && args.len() == 0 {
+                return ResultExpr::Ok(ct_vec_of(Type::I64, Vec::new()));
+            }
+            var func_idx: i64 = - 1;
             var fi: i64 = 0;
             while fi < original.funcs.len() {
                 var f: Func = original.funcs.get(fi);
-                if f.name == callee && f.is_comptime { func_idx = fi; }
+                if f.name == callee && f.is_comptime {
+                    func_idx = fi;
+                }
                 fi = fi + 1;
             }
             if func_idx < 0 {
@@ -1848,10 +2410,14 @@ fn evaluate_with_env(expr: &Expr, env: &ComptimeEnv, original: &Program) -> Resu
             var ai: i64 = 0;
             while ai < args.len() {
                 var a: Expr = args.get(ai);
-                var ar: ResultExpr = evaluate_with_env(&a, env, original);
+                var ar: ResultExpr = evaluate_with_env(& a, env, original);
                 match ar {
-                    ResultExpr::Err(msg) => { return ResultExpr::Err(msg); }
-                    ResultExpr::Ok(v) => { arg_values.push(v); }
+                    ResultExpr::Err(msg) => {
+                        return ResultExpr::Err(msg);
+                    }
+                    ResultExpr::Ok(v) => {
+                        arg_values.push(v);
+                    }
                 }
                 ai = ai + 1;
             }
@@ -1860,7 +2426,9 @@ fn evaluate_with_env(expr: &Expr, env: &ComptimeEnv, original: &Program) -> Resu
         Expr::If(cond, then_block, else_block) => {
             var cr: ResultExpr = evaluate_with_env(cond, env, original);
             match cr {
-                ResultExpr::Err(msg) => { return ResultExpr::Err(msg); }
+                ResultExpr::Err(msg) => {
+                    return ResultExpr::Err(msg);
+                }
                 ResultExpr::Ok(c) => {
                     match c {
                         Expr::BoolLit(b) => {
@@ -1868,36 +2436,54 @@ fn evaluate_with_env(expr: &Expr, env: &ComptimeEnv, original: &Program) -> Resu
                                 return evaluate_block_with_env(then_block, original, env);
                             } else {
                                 match else_block {
-                                    OptStmts::Some(eb) => { return evaluate_block_with_env(eb, original, env); }
-                                    OptStmts::None => { return ResultExpr::Ok(Expr::IntLit(0)); }
+                                    OptStmts::Some(eb) => {
+                                        return evaluate_block_with_env(eb, original, env);
+                                    }
+                                    OptStmts::None => {
+                                        return ResultExpr::Ok(Expr::IntLit(0));
+                                    }
                                 }
                             }
                         }
-                        _ => { return ResultExpr::Err("comptime if condition must be boolean"); }
+                        _ => {
+                            return ResultExpr::Err("comptime if condition must be boolean");
+                        }
                     }
                 }
             }
         }
-        Expr::Block(stmts) => { return evaluate_block_with_env(stmts, original, env); }
+        Expr::Block(stmts) => {
+            return evaluate_block_with_env(stmts, original, env);
+        }
         Expr::StrConcat(left, right) => {
             var l: Expr = ct_box_expr_unbox(left);
             var r: Expr = ct_box_expr_unbox(right);
-            var lr: ResultExpr = evaluate_with_env(&l, env, original);
+            var lr: ResultExpr = evaluate_with_env(& l, env, original);
             match lr {
-                ResultExpr::Err(msg) => { return ResultExpr::Err(msg); }
+                ResultExpr::Err(msg) => {
+                    return ResultExpr::Err(msg);
+                }
                 ResultExpr::Ok(lv) => {
-                    var rr: ResultExpr = evaluate_with_env(&r, env, original);
+                    var rr: ResultExpr = evaluate_with_env(& r, env, original);
                     match rr {
-                        ResultExpr::Err(msg) => { return ResultExpr::Err(msg); }
+                        ResultExpr::Err(msg) => {
+                            return ResultExpr::Err(msg);
+                        }
                         ResultExpr::Ok(rv) => {
                             match lv {
                                 Expr::StringLit(a) => {
                                     match rv {
-                                        Expr::StringLit(b) => { return ResultExpr::Ok(Expr::StringLit(a + b)); }
-                                        _ => { return ResultExpr::Err("comptime str_concat requires strings"); }
+                                        Expr::StringLit(b) => {
+                                            return ResultExpr::Ok(Expr::StringLit(a + b));
+                                        }
+                                        _ => {
+                                            return ResultExpr::Err("comptime str_concat requires strings");
+                                        }
                                     }
                                 }
-                                _ => { return ResultExpr::Err("comptime str_concat requires strings"); }
+                                _ => {
+                                    return ResultExpr::Err("comptime str_concat requires strings");
+                                }
                             }
                         }
                     }
@@ -1908,8 +2494,8 @@ fn evaluate_with_env(expr: &Expr, env: &ComptimeEnv, original: &Program) -> Resu
             // Array indexing at comptime (field_names[i] etc.).
             var ae: Expr = ct_box_expr_unbox(iarr);
             var ie: Expr = ct_box_expr_unbox(iidx);
-            var ar: ResultExpr = evaluate_with_env(&ae, env, original);
-            var ir: ResultExpr = evaluate_with_env(&ie, env, original);
+            var ar: ResultExpr = evaluate_with_env(& ae, env, original);
+            var ir: ResultExpr = evaluate_with_env(& ie, env, original);
             match ar {
                 ResultExpr::Ok(av) => {
                     match ir {
@@ -1918,20 +2504,28 @@ fn evaluate_with_env(expr: &Expr, env: &ComptimeEnv, original: &Program) -> Resu
                                 Expr::ArrayLit(_, elements) => {
                                     match iv {
                                         Expr::IntLit(ix) => {
-                                            if ix >= 0 && ix < elements.len() { return ResultExpr::Ok(elements.get(ix)); }
+                                            if ix >= 0 && ix < elements.len() {
+                                                return ResultExpr::Ok(elements.get(ix));
+                                            }
                                             return ResultExpr::Err("comptime index " + int_to_str(ix) + " out of bounds");
                                         }
-                                        _ => {}
+                                        _ => {
+                                        }
                                     }
                                 }
-                                _ => {}
+                                _ => {
+                                }
                             }
                             return ResultExpr::Err("comptime indexing requires array and int");
                         }
-                        ResultExpr::Err(m) => { return ResultExpr::Err(m); }
+                        ResultExpr::Err(m) => {
+                            return ResultExpr::Err(m);
+                        }
                     }
                 }
-                ResultExpr::Err(m) => { return ResultExpr::Err(m); }
+                ResultExpr::Err(m) => {
+                    return ResultExpr::Err(m);
+                }
             }
         }
         Expr::FString(parts) => {
@@ -1940,22 +2534,38 @@ fn evaluate_with_env(expr: &Expr, env: &ComptimeEnv, original: &Program) -> Resu
             while pi < parts.len() {
                 var part: FStringPart = parts.get(pi);
                 match part {
-                    FStringPart::Literal(s) => { result = result + s; }
+                    FStringPart::Literal(s) => {
+                        result = result + s;
+                    }
                     FStringPart::Expr(e) => {
-                        var vr: ResultExpr = evaluate_with_env(&e, env, original);
+                        var vr: ResultExpr = evaluate_with_env(& e, env, original);
                         match vr {
                             ResultExpr::Ok(v) => {
                                 match v {
-                                    Expr::IntLit(n) => { result = result + int_to_str(n); }
-                                    Expr::FloatLit(f) => { result = result + float_to_str(f); }
-                                    Expr::StringLit(s) => { result = result + s; }
-                                    Expr::BoolLit(b) => {
-                                        if b { result = result + "true"; } else { result = result + "false"; }
+                                    Expr::IntLit(n) => {
+                                        result = result + int_to_str(n);
                                     }
-                                    _ => { result = result + "?"; }
+                                    Expr::FloatLit(f) => {
+                                        result = result + float_to_str(f);
+                                    }
+                                    Expr::StringLit(s) => {
+                                        result = result + s;
+                                    }
+                                    Expr::BoolLit(b) => {
+                                        if b {
+                                            result = result + "true";
+                                        } else {
+                                            result = result + "false";
+                                        }
+                                    }
+                                    _ => {
+                                        result = result + "?";
+                                    }
                                 }
                             }
-                            ResultExpr::Err(msg) => { return ResultExpr::Err(msg); }
+                            ResultExpr::Err(msg) => {
+                                return ResultExpr::Err(msg);
+                            }
                         }
                     }
                 }
@@ -1963,19 +2573,21 @@ fn evaluate_with_env(expr: &Expr, env: &ComptimeEnv, original: &Program) -> Resu
             }
             return ResultExpr::Ok(Expr::StringLit(result));
         }
-        _ => { return evaluate(expr, original); }
+        _ => {
+            return evaluate(expr, original);
+        }
     }
     return ResultExpr::Ok(Expr::IntLit(0));
 }
 
-fn call_comptime_func(func: Func, args: Vec<Expr>, original: &Program) -> ResultExpr {
+fn call_comptime_func(func: Func, args: Vec<Expr>, original: & Program) -> ResultExpr {
     if args.len() != func.params.len() {
         return ResultExpr::Err("comptime function '" + func.name + "' expects " + int_to_str(func.params.len()) + " args, got " + int_to_str(args.len()));
     }
     var env: ComptimeEnv = ComptimeEnv_new();
     var i: i64 = 0;
     while i < args.len() {
-        ComptimeEnv_set(&mut env, func.params.get(i).name, args.get(i));
+        ComptimeEnv_set(& mut env, func.params.get(i).name, args.get(i));
         i = i + 1;
     }
     // The body runs in the block evaluator, with all its statements (let,
@@ -1983,21 +2595,31 @@ fn call_comptime_func(func: Func, args: Vec<Expr>, original: &Program) -> Result
     // smaller interpreter of its own (no while, no `t.push`), so a table
     // built in a loop was left to run when the program did.
     var returned: Vec<i64> = Vec::new();
-    return evaluate_block_rt(func.body, original, &mut env, &mut returned);
+    return evaluate_block_rt(func.body, original, & mut env, & mut returned);
 }
 
 /// New value of `target` after `target op= v` (src/comptime.rs).
-fn ce_assign(env: &ComptimeEnv, target: str, op: AssignOp, v: Expr) -> ResultExpr {
+fn ce_assign(env: & ComptimeEnv, target: str, op: AssignOp, v: Expr) -> ResultExpr {
     var current: Expr = Expr::IntLit(0);
     match ComptimeEnv_get(env, target) {
-        OptExpr::Some(c) => { current = c; }
-        OptExpr::None => {}
+        OptExpr::Some(c) => {
+            current = c;
+        }
+        OptExpr::None => {
+        }
     }
     match op {
-        AssignOp::AddAssign => { return eval_binop(BinOp::Add, current, v); }
-        AssignOp::SubAssign => { return eval_binop(BinOp::Sub, current, v); }
-        AssignOp::MulAssign => { return eval_binop(BinOp::Mul, current, v); }
-        _ => {}
+        AssignOp::AddAssign => {
+            return eval_binop(BinOp::Add, current, v);
+        }
+        AssignOp::SubAssign => {
+            return eval_binop(BinOp::Sub, current, v);
+        }
+        AssignOp::MulAssign => {
+            return eval_binop(BinOp::Mul, current, v);
+        }
+        _ => {
+        }
     }
     return ResultExpr::Ok(v);
 }
@@ -2010,83 +2632,169 @@ fn eval_binop(op: BinOp, l: Expr, r: Expr) -> ResultExpr {
             match r {
                 Expr::IntLit(b) => {
                     match op {
-                        BinOp::Add => { return ResultExpr::Ok(Expr::IntLit(a + b)); }
-                        BinOp::Sub => { return ResultExpr::Ok(Expr::IntLit(a - b)); }
-                        BinOp::Mul => { return ResultExpr::Ok(Expr::IntLit(a * b)); }
+                        BinOp::Add => {
+                            return ResultExpr::Ok(Expr::IntLit(a + b));
+                        }
+                        BinOp::Sub => {
+                            return ResultExpr::Ok(Expr::IntLit(a - b));
+                        }
+                        BinOp::Mul => {
+                            return ResultExpr::Ok(Expr::IntLit(a * b));
+                        }
                         BinOp::Div => {
-                            if b == 0 { return ResultExpr::Err("division by zero in comptime"); }
+                            if b == 0 {
+                                return ResultExpr::Err("division by zero in comptime");
+                            }
                             return ResultExpr::Ok(Expr::IntLit(a / b));
                         }
                         BinOp::Mod => {
-                            if b == 0 { return ResultExpr::Err("modulo by zero in comptime"); }
+                            if b == 0 {
+                                return ResultExpr::Err("modulo by zero in comptime");
+                            }
                             return ResultExpr::Ok(Expr::IntLit(a % b));
                         }
-                        BinOp::Eq => { return ResultExpr::Ok(Expr::BoolLit(a == b)); }
-                        BinOp::Neq => { return ResultExpr::Ok(Expr::BoolLit(a != b)); }
-                        BinOp::Lt => { return ResultExpr::Ok(Expr::BoolLit(a < b)); }
-                        BinOp::LtEq => { return ResultExpr::Ok(Expr::BoolLit(a <= b)); }
-                        BinOp::Gt => { return ResultExpr::Ok(Expr::BoolLit(a > b)); }
-                        BinOp::GtEq => { return ResultExpr::Ok(Expr::BoolLit(a >= b)); }
-                        BinOp::And => { return ResultExpr::Ok(Expr::BoolLit(a != 0 && b != 0)); }
-                        BinOp::Or => { return ResultExpr::Ok(Expr::BoolLit(a != 0 || b != 0)); }
-                        BinOp::BitAnd => { return ResultExpr::Ok(Expr::IntLit(a & b)); }
-                        BinOp::BitOr => { return ResultExpr::Ok(Expr::IntLit(a | b)); }
-                        BinOp::BitXor => { return ResultExpr::Ok(Expr::IntLit(a ^ b)); }
-                        BinOp::Shl => { return ResultExpr::Ok(Expr::IntLit(a << b)); }
-                        BinOp::Shr => { return ResultExpr::Ok(Expr::IntLit(a >> b)); }
+                        BinOp::Eq => {
+                            return ResultExpr::Ok(Expr::BoolLit(a == b));
+                        }
+                        BinOp::Neq => {
+                            return ResultExpr::Ok(Expr::BoolLit(a != b));
+                        }
+                        BinOp::Lt => {
+                            return ResultExpr::Ok(Expr::BoolLit(a < b));
+                        }
+                        BinOp::LtEq => {
+                            return ResultExpr::Ok(Expr::BoolLit(a <= b));
+                        }
+                        BinOp::Gt => {
+                            return ResultExpr::Ok(Expr::BoolLit(a > b));
+                        }
+                        BinOp::GtEq => {
+                            return ResultExpr::Ok(Expr::BoolLit(a >= b));
+                        }
+                        BinOp::And => {
+                            return ResultExpr::Ok(Expr::BoolLit(a != 0 && b != 0));
+                        }
+                        BinOp::Or => {
+                            return ResultExpr::Ok(Expr::BoolLit(a != 0 || b != 0));
+                        }
+                        BinOp::BitAnd => {
+                            return ResultExpr::Ok(Expr::IntLit(a & b));
+                        }
+                        BinOp::BitOr => {
+                            return ResultExpr::Ok(Expr::IntLit(a | b));
+                        }
+                        BinOp::BitXor => {
+                            return ResultExpr::Ok(Expr::IntLit(a ^ b));
+                        }
+                        BinOp::Shl => {
+                            return ResultExpr::Ok(Expr::IntLit(a << b));
+                        }
+                        BinOp::Shr => {
+                            return ResultExpr::Ok(Expr::IntLit(a >> b));
+                        }
                     }
                 }
-                _ => { return ResultExpr::Err("cannot evaluate binop: type mismatch"); }
+                _ => {
+                    return ResultExpr::Err("cannot evaluate binop: type mismatch");
+                }
             }
         }
         Expr::FloatLit(a) => {
             match r {
                 Expr::FloatLit(b) => {
                     match op {
-                        BinOp::Add => { return ResultExpr::Ok(Expr::FloatLit(a + b)); }
-                        BinOp::Sub => { return ResultExpr::Ok(Expr::FloatLit(a - b)); }
-                        BinOp::Mul => { return ResultExpr::Ok(Expr::FloatLit(a * b)); }
-                        BinOp::Div => { return ResultExpr::Ok(Expr::FloatLit(a / b)); }
-                        BinOp::Eq => { return ResultExpr::Ok(Expr::BoolLit(a == b)); }
-                        BinOp::Neq => { return ResultExpr::Ok(Expr::BoolLit(a != b)); }
-                        BinOp::Lt => { return ResultExpr::Ok(Expr::BoolLit(a < b)); }
-                        BinOp::LtEq => { return ResultExpr::Ok(Expr::BoolLit(a <= b)); }
-                        BinOp::Gt => { return ResultExpr::Ok(Expr::BoolLit(a > b)); }
-                        BinOp::GtEq => { return ResultExpr::Ok(Expr::BoolLit(a >= b)); }
-                        _ => { return ResultExpr::Err("unsupported float binop"); }
+                        BinOp::Add => {
+                            return ResultExpr::Ok(Expr::FloatLit(a + b));
+                        }
+                        BinOp::Sub => {
+                            return ResultExpr::Ok(Expr::FloatLit(a - b));
+                        }
+                        BinOp::Mul => {
+                            return ResultExpr::Ok(Expr::FloatLit(a * b));
+                        }
+                        BinOp::Div => {
+                            return ResultExpr::Ok(Expr::FloatLit(a / b));
+                        }
+                        BinOp::Eq => {
+                            return ResultExpr::Ok(Expr::BoolLit(a == b));
+                        }
+                        BinOp::Neq => {
+                            return ResultExpr::Ok(Expr::BoolLit(a != b));
+                        }
+                        BinOp::Lt => {
+                            return ResultExpr::Ok(Expr::BoolLit(a < b));
+                        }
+                        BinOp::LtEq => {
+                            return ResultExpr::Ok(Expr::BoolLit(a <= b));
+                        }
+                        BinOp::Gt => {
+                            return ResultExpr::Ok(Expr::BoolLit(a > b));
+                        }
+                        BinOp::GtEq => {
+                            return ResultExpr::Ok(Expr::BoolLit(a >= b));
+                        }
+                        _ => {
+                            return ResultExpr::Err("unsupported float binop");
+                        }
                     }
                 }
-                _ => { return ResultExpr::Err("cannot evaluate binop: type mismatch"); }
+                _ => {
+                    return ResultExpr::Err("cannot evaluate binop: type mismatch");
+                }
             }
         }
         Expr::StringLit(a) => {
             match r {
                 Expr::StringLit(b) => {
                     match op {
-                        BinOp::Add => { return ResultExpr::Ok(Expr::StringLit(a + b)); }
-                        BinOp::Eq => { return ResultExpr::Ok(Expr::BoolLit(a == b)); }
-                        BinOp::Neq => { return ResultExpr::Ok(Expr::BoolLit(a != b)); }
-                        _ => { return ResultExpr::Err("unsupported string binop"); }
+                        BinOp::Add => {
+                            return ResultExpr::Ok(Expr::StringLit(a + b));
+                        }
+                        BinOp::Eq => {
+                            return ResultExpr::Ok(Expr::BoolLit(a == b));
+                        }
+                        BinOp::Neq => {
+                            return ResultExpr::Ok(Expr::BoolLit(a != b));
+                        }
+                        _ => {
+                            return ResultExpr::Err("unsupported string binop");
+                        }
                     }
                 }
-                _ => { return ResultExpr::Err("cannot evaluate binop: type mismatch"); }
+                _ => {
+                    return ResultExpr::Err("cannot evaluate binop: type mismatch");
+                }
             }
         }
         Expr::BoolLit(a) => {
             match r {
                 Expr::BoolLit(b) => {
                     match op {
-                        BinOp::Eq => { return ResultExpr::Ok(Expr::BoolLit(a == b)); }
-                        BinOp::Neq => { return ResultExpr::Ok(Expr::BoolLit(a != b)); }
-                        BinOp::And => { return ResultExpr::Ok(Expr::BoolLit(a && b)); }
-                        BinOp::Or => { return ResultExpr::Ok(Expr::BoolLit(a || b)); }
-                        _ => { return ResultExpr::Err("unsupported bool binop"); }
+                        BinOp::Eq => {
+                            return ResultExpr::Ok(Expr::BoolLit(a == b));
+                        }
+                        BinOp::Neq => {
+                            return ResultExpr::Ok(Expr::BoolLit(a != b));
+                        }
+                        BinOp::And => {
+                            return ResultExpr::Ok(Expr::BoolLit(a && b));
+                        }
+                        BinOp::Or => {
+                            return ResultExpr::Ok(Expr::BoolLit(a || b));
+                        }
+                        _ => {
+                            return ResultExpr::Err("unsupported bool binop");
+                        }
                     }
                 }
-                _ => { return ResultExpr::Err("cannot evaluate binop: type mismatch"); }
+                _ => {
+                    return ResultExpr::Err("cannot evaluate binop: type mismatch");
+                }
             }
         }
-        _ => { return ResultExpr::Err("cannot evaluate binop on non-literal"); }
+        _ => {
+            return ResultExpr::Err("cannot evaluate binop on non-literal");
+        }
     }
     return ResultExpr::Err("unreachable");
 }
@@ -2095,25 +2803,41 @@ fn eval_unaryop(op: UnaryOp, v: Expr) -> ResultExpr {
     match op {
         UnaryOp::Neg => {
             match v {
-                Expr::IntLit(n) => { return ResultExpr::Ok(Expr::IntLit(-n)); }
-                Expr::FloatLit(f) => { return ResultExpr::Ok(Expr::FloatLit(-f)); }
-                _ => { return ResultExpr::Err("cannot negate non-number"); }
+                Expr::IntLit(n) => {
+                    return ResultExpr::Ok(Expr::IntLit(- n));
+                }
+                Expr::FloatLit(f) => {
+                    return ResultExpr::Ok(Expr::FloatLit(- f));
+                }
+                _ => {
+                    return ResultExpr::Err("cannot negate non-number");
+                }
             }
         }
         UnaryOp::Not => {
             match v {
-                Expr::BoolLit(b) => { return ResultExpr::Ok(Expr::BoolLit(!b)); }
+                Expr::BoolLit(b) => {
+                    return ResultExpr::Ok(Expr::BoolLit(!b));
+                }
                 Expr::IntLit(n) => {
-                    if n == 0 { return ResultExpr::Ok(Expr::IntLit(1)); }
+                    if n == 0 {
+                        return ResultExpr::Ok(Expr::IntLit(1));
+                    }
                     return ResultExpr::Ok(Expr::IntLit(0));
                 }
-                _ => { return ResultExpr::Err("cannot not non-bool/int"); }
+                _ => {
+                    return ResultExpr::Err("cannot not non-bool/int");
+                }
             }
         }
         UnaryOp::BitNot => {
             match v {
-                Expr::IntLit(n) => { return ResultExpr::Ok(Expr::IntLit(-1 ^ n)); }
-                _ => { return ResultExpr::Err("cannot bitnot non-int"); }
+                Expr::IntLit(n) => {
+                    return ResultExpr::Ok(Expr::IntLit(- 1 ^ n));
+                }
+                _ => {
+                    return ResultExpr::Err("cannot bitnot non-int");
+                }
             }
         }
     }
@@ -2122,10 +2846,12 @@ fn eval_unaryop(op: UnaryOp, v: Expr) -> ResultExpr {
 
 // --- Reflection ----------------------------------------------------------
 
-fn ce_find_struct(original: &Program, name: str) -> i64 {
+fn ce_find_struct(original: & Program, name: str) -> i64 {
     var i: i64 = 0;
     while i < original.structs.len() {
-        if original.structs.get(i).name == name { return i; }
+        if original.structs.get(i).name == name {
+            return i;
+        }
         i = i + 1;
     }
     return 0 - 1;
@@ -2136,10 +2862,14 @@ fn ce_has_annotation(anns: Vec<Annotation>, name: str, arg: str) -> bool {
     while i < anns.len() {
         var a: Annotation = anns.get(i);
         if a.name == name {
-            if arg == "" { return true; }
+            if arg == "" {
+                return true;
+            }
             var j: i64 = 0;
             while j < a.args.len() {
-                if a.args.get(j) == arg { return true; }
+                if a.args.get(j) == arg {
+                    return true;
+                }
                 j = j + 1;
             }
         }
@@ -2151,7 +2881,7 @@ fn ce_has_annotation(anns: Vec<Annotation>, name: str, arg: str) -> bool {
 /// Bytes a field of type `ty` takes with the default struct layout (see
 /// the lowerer): one 8-byte slot, except an inline struct (its whole
 /// layout) and an enum with payloads ((1 + largest payload) slots).
-fn ce_slot_size(ty: Type, original: &Program, depth: i64) -> i64 {
+fn ce_slot_size(ty: Type, original: & Program, depth: i64) -> i64 {
     match ty {
         Type::Named(n) => {
             var si: i64 = ce_find_struct(original, n);
@@ -2166,18 +2896,26 @@ fn ce_slot_size(ty: Type, original: &Program, depth: i64) -> i64 {
                     var vi: i64 = 0;
                     while vi < e.variants.len() {
                         match e.variants.get(vi).data {
-                            OptParams::Some(d) => { if d.len() > payload { payload = d.len(); } }
-                            OptParams::None => {}
+                            OptParams::Some(d) => {
+                                if d.len() > payload {
+                                    payload = d.len();
+                                }
+                            }
+                            OptParams::None => {
+                            }
                         }
                         vi = vi + 1;
                     }
-                    if payload > 0 { return (1 + payload) * 8; }
+                    if payload > 0 {
+                        return (1 + payload) * 8;
+                    }
                     return 8;
                 }
                 ei = ei + 1;
             }
         }
-        _ => {}
+        _ => {
+        }
     }
     return 8;
 }
@@ -2185,41 +2923,68 @@ fn ce_slot_size(ty: Type, original: &Program, depth: i64) -> i64 {
 /// With `field` empty: the struct's size. Otherwise the offset of `field`
 /// (-1 if absent). @repr(C) and @packed use natural sizes, the default
 /// layout 8-byte slots, as the lowerer does.
-fn ce_struct_layout(s: StructDef, original: &Program, depth: i64, field: str) -> i64 {
+fn ce_struct_layout(s: StructDef, original: & Program, depth: i64, field: str) -> i64 {
     var c_layout: bool = ce_has_annotation(s.annotations, "repr", "C");
     var packed: bool = ce_has_annotation(s.annotations, "packed", "");
     var natural: bool = c_layout || packed;
     var offset: i64 = 0;
     var max_align: i64 = 8;
-    if natural { max_align = 1; }
+    if natural {
+        max_align = 1;
+    }
     var i: i64 = 0;
     while i < s.fields.len() {
         var f: Param = s.fields.get(i);
         var size: i64 = 8;
         if natural {
             match f.ty {
-                Type::I8 => { size = 1; }
-                Type::U8 => { size = 1; }
-                Type::Bool => { size = 1; }
-                Type::I16 => { size = 2; }
-                Type::U16 => { size = 2; }
-                Type::I32 => { size = 4; }
-                Type::U32 => { size = 4; }
-                Type::F32 => { size = 4; }
-                _ => {}
+                Type::I8 => {
+                    size = 1;
+                }
+                Type::U8 => {
+                    size = 1;
+                }
+                Type::Bool => {
+                    size = 1;
+                }
+                Type::I16 => {
+                    size = 2;
+                }
+                Type::U16 => {
+                    size = 2;
+                }
+                Type::I32 => {
+                    size = 4;
+                }
+                Type::U32 => {
+                    size = 4;
+                }
+                Type::F32 => {
+                    size = 4;
+                }
+                _ => {
+                }
             }
             var align: i64 = size;
-            if packed { align = 1; }
+            if packed {
+                align = 1;
+            }
             offset = (offset + align - 1) / align * align;
-            if align > max_align { max_align = align; }
+            if align > max_align {
+                max_align = align;
+            }
         } else {
             size = ce_slot_size(f.ty, original, depth);
         }
-        if field != "" && f.name == field { return offset; }
+        if field != "" && f.name == field {
+            return offset;
+        }
         offset = offset + size;
         i = i + 1;
     }
-    if field != "" { return 0 - 1; }
+    if field != "" {
+        return 0 - 1;
+    }
     return (offset + max_align - 1) / max_align * max_align;
 }
 
@@ -2236,46 +3001,58 @@ fn ce_str_array(items: Vec<str>) -> Expr {
 fn ce_find_func(funcs: Vec<Func>, name: str) -> i64 {
     var i: i64 = 0;
     while i < funcs.len() {
-        if funcs.get(i).name == name { return i; }
+        if funcs.get(i).name == name {
+            return i;
+        }
         i = i + 1;
     }
     return 0 - 1;
 }
 
 /// Effects declared on function (or method) `name`; Err if there is none.
-fn ce_function_effects(original: &Program, name: str) -> ResultExpr {
+fn ce_function_effects(original: & Program, name: str) -> ResultExpr {
     var fi: i64 = ce_find_func(original.funcs, name);
-    if fi >= 0 { return ResultExpr::Ok(ce_str_array(original.funcs.get(fi).declared_effects)); }
+    if fi >= 0 {
+        return ResultExpr::Ok(ce_str_array(original.funcs.get(fi).declared_effects));
+    }
     var i: i64 = 0;
     while i < original.impls.len() {
         var ms: Vec<Func> = original.impls.get(i).methods;
         var mi: i64 = ce_find_func(ms, name);
-        if mi >= 0 { return ResultExpr::Ok(ce_str_array(ms.get(mi).declared_effects)); }
+        if mi >= 0 {
+            return ResultExpr::Ok(ce_str_array(ms.get(mi).declared_effects));
+        }
         i = i + 1;
     }
     i = 0;
     while i < original.trait_impls.len() {
         var ms2: Vec<Func> = original.trait_impls.get(i).methods;
         var mi2: i64 = ce_find_func(ms2, name);
-        if mi2 >= 0 { return ResultExpr::Ok(ce_str_array(ms2.get(mi2).declared_effects)); }
+        if mi2 >= 0 {
+            return ResultExpr::Ok(ce_str_array(ms2.get(mi2).declared_effects));
+        }
         i = i + 1;
     }
     return ResultExpr::Err("function_effects: no function '" + name + "'");
 }
 
 /// The traits implemented by the type that defines method `name`.
-fn ce_function_capabilities(original: &Program, name: str) -> ResultExpr {
+fn ce_function_capabilities(original: & Program, name: str) -> ResultExpr {
     var owner: str = "";
     var i: i64 = 0;
     while i < original.trait_impls.len() && owner == "" {
         var ti: TraitImpl = original.trait_impls.get(i);
-        if ce_find_func(ti.methods, name) >= 0 { owner = ti.type_name; }
+        if ce_find_func(ti.methods, name) >= 0 {
+            owner = ti.type_name;
+        }
         i = i + 1;
     }
     i = 0;
     while i < original.impls.len() && owner == "" {
         var im: ImplDef = original.impls.get(i);
-        if ce_find_func(im.methods, name) >= 0 { owner = im.struct_name; }
+        if ce_find_func(im.methods, name) >= 0 {
+            owner = im.struct_name;
+        }
         i = i + 1;
     }
     var traits: Vec<str> = Vec::new();
@@ -2292,45 +3069,87 @@ fn ce_function_capabilities(original: &Program, name: str) -> ResultExpr {
             var seen: bool = false;
             var k: i64 = 0;
             while k < traits.len() {
-                if traits.get(k) == t2.trait_name { seen = true; }
+                if traits.get(k) == t2.trait_name {
+                    seen = true;
+                }
                 k = k + 1;
             }
-            if !seen { traits.push(t2.trait_name); }
+            if !seen {
+                traits.push(t2.trait_name);
+            }
         }
         i = i + 1;
     }
     return ResultExpr::Ok(ce_str_array(traits));
 }
 
-fn evaluate_reflect(op: ReflectOp, ty: Type, original: &Program) -> ResultExpr {
+fn evaluate_reflect(op: ReflectOp, ty: Type, original: & Program) -> ResultExpr {
     var type_name: str = "";
     match ty {
-        Type::Named(n) => { type_name = n; }
-        Type::I8 => { type_name = "i8"; }
-        Type::I16 => { type_name = "i16"; }
-        Type::I32 => { type_name = "i32"; }
-        Type::I64 => { type_name = "i64"; }
-        Type::I128 => { type_name = "i128"; }
-        Type::U8 => { type_name = "u8"; }
-        Type::U16 => { type_name = "u16"; }
-        Type::U32 => { type_name = "u32"; }
-        Type::U64 => { type_name = "u64"; }
-        Type::U128 => { type_name = "u128"; }
-        Type::F32 => { type_name = "f32"; }
-        Type::F64 => { type_name = "f64"; }
-        Type::Bool => { type_name = "bool"; }
-        Type::Str => { type_name = "str"; }
-        Type::Void => { type_name = "void"; }
-        _ => { return ResultExpr::Err("reflect: unsupported type"); }
+        Type::Named(n) => {
+            type_name = n;
+        }
+        Type::I8 => {
+            type_name = "i8";
+        }
+        Type::I16 => {
+            type_name = "i16";
+        }
+        Type::I32 => {
+            type_name = "i32";
+        }
+        Type::I64 => {
+            type_name = "i64";
+        }
+        Type::I128 => {
+            type_name = "i128";
+        }
+        Type::U8 => {
+            type_name = "u8";
+        }
+        Type::U16 => {
+            type_name = "u16";
+        }
+        Type::U32 => {
+            type_name = "u32";
+        }
+        Type::U64 => {
+            type_name = "u64";
+        }
+        Type::U128 => {
+            type_name = "u128";
+        }
+        Type::F32 => {
+            type_name = "f32";
+        }
+        Type::F64 => {
+            type_name = "f64";
+        }
+        Type::Bool => {
+            type_name = "bool";
+        }
+        Type::Str => {
+            type_name = "str";
+        }
+        Type::Void => {
+            type_name = "void";
+        }
+        _ => {
+            return ResultExpr::Err("reflect: unsupported type");
+        }
     }
 
     match op {
-        ReflectOp::TypeName => { return ResultExpr::Ok(Expr::StringLit(type_name)); }
+        ReflectOp::TypeName => {
+            return ResultExpr::Ok(Expr::StringLit(type_name));
+        }
         ReflectOp::IsStruct => {
             var found: bool = false;
             var si: i64 = 0;
             while si < original.structs.len() {
-                if original.structs.get(si).name == type_name { found = true; }
+                if original.structs.get(si).name == type_name {
+                    found = true;
+                }
                 si = si + 1;
             }
             return ResultExpr::Ok(Expr::BoolLit(found));
@@ -2339,7 +3158,9 @@ fn evaluate_reflect(op: ReflectOp, ty: Type, original: &Program) -> ResultExpr {
             var found: bool = false;
             var ei: i64 = 0;
             while ei < original.enums.len() {
-                if original.enums.get(ei).name == type_name { found = true; }
+                if original.enums.get(ei).name == type_name {
+                    found = true;
+                }
                 ei = ei + 1;
             }
             return ResultExpr::Ok(Expr::BoolLit(found));
@@ -2408,23 +3229,33 @@ fn evaluate_reflect(op: ReflectOp, ty: Type, original: &Program) -> ResultExpr {
         }
         ReflectOp::StructSize => {
             var ssi: i64 = ce_find_struct(original, type_name);
-            if ssi < 0 { return ResultExpr::Err("struct_size: '" + type_name + "' is not a struct"); }
+            if ssi < 0 {
+                return ResultExpr::Err("struct_size: '" + type_name + "' is not a struct");
+            }
             return ResultExpr::Ok(Expr::IntLit(ce_struct_layout(original.structs.get(ssi), original, 0, "")));
         }
         ReflectOp::FieldOffset => {
             var dot: i64 = str_find(type_name, ".");
-            if dot < 0 { return ResultExpr::Err("field_offset: expected Owner.member, got '" + type_name + "'"); }
+            if dot < 0 {
+                return ResultExpr::Err("field_offset: expected Owner.member, got '" + type_name + "'");
+            }
             var owner: str = str_slice(type_name, 0, dot);
             var field: str = str_slice(type_name, dot + 1, str_len(type_name));
             var osi: i64 = ce_find_struct(original, owner);
-            if osi < 0 { return ResultExpr::Err("field_offset: '" + owner + "' is not a struct"); }
+            if osi < 0 {
+                return ResultExpr::Err("field_offset: '" + owner + "' is not a struct");
+            }
             var off: i64 = ce_struct_layout(original.structs.get(osi), original, 0, field);
-            if off < 0 { return ResultExpr::Err("field_offset: struct '" + owner + "' has no field '" + field + "'"); }
+            if off < 0 {
+                return ResultExpr::Err("field_offset: struct '" + owner + "' has no field '" + field + "'");
+            }
             return ResultExpr::Ok(Expr::IntLit(off));
         }
         ReflectOp::EnumDiscriminant => {
             var dot2: i64 = str_find(type_name, ".");
-            if dot2 < 0 { return ResultExpr::Err("enum_discriminant: expected Owner.member, got '" + type_name + "'"); }
+            if dot2 < 0 {
+                return ResultExpr::Err("enum_discriminant: expected Owner.member, got '" + type_name + "'");
+            }
             var eowner: str = str_slice(type_name, 0, dot2);
             var variant: str = str_slice(type_name, dot2 + 1, str_len(type_name));
             var dei: i64 = 0;
@@ -2433,7 +3264,9 @@ fn evaluate_reflect(op: ReflectOp, ty: Type, original: &Program) -> ResultExpr {
                 if de.name == eowner {
                     var dvi: i64 = 0;
                     while dvi < de.variants.len() {
-                        if de.variants.get(dvi).name == variant { return ResultExpr::Ok(Expr::IntLit(dvi)); }
+                        if de.variants.get(dvi).name == variant {
+                            return ResultExpr::Ok(Expr::IntLit(dvi));
+                        }
                         dvi = dvi + 1;
                     }
                     return ResultExpr::Err("enum_discriminant: enum '" + eowner + "' has no variant '" + variant + "'");
@@ -2442,8 +3275,12 @@ fn evaluate_reflect(op: ReflectOp, ty: Type, original: &Program) -> ResultExpr {
             }
             return ResultExpr::Err("enum_discriminant: '" + eowner + "' is not an enum");
         }
-        ReflectOp::FunctionEffects => { return ce_function_effects(original, type_name); }
-        ReflectOp::FunctionCapabilities => { return ce_function_capabilities(original, type_name); }
+        ReflectOp::FunctionEffects => {
+            return ce_function_effects(original, type_name);
+        }
+        ReflectOp::FunctionCapabilities => {
+            return ce_function_capabilities(original, type_name);
+        }
     }
     return ResultExpr::Err("unreachable");
 }

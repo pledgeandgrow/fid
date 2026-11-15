@@ -7,51 +7,7 @@
 // Usage: fid <command> <file.fd> [options]
 
 module compiler::main;
-
-use core;
-use vec;
-use string;
-use compiler::ast;
-use compiler::token;
-use compiler::lexer;
-use compiler::parser;
-use compiler::ir;
-use compiler::pgo;
-use compiler::pir;
-use compiler::opt;
-use compiler::compiler;
-use compiler::inc;
-use compiler::pe;
-use compiler::pe_ir;
-use compiler::pe_ir_stubs;
-use compiler::fmt;
-use compiler::lower;
-use compiler::scribe;
-use compiler::veil;
-use compiler::tensor;
-use compiler::gpu;
-use compiler::wasm;
-use compiler::lsp;
-use compiler::ark;
-use compiler::codegen_x64;
-use compiler::codegen_arm64;
-use compiler::codegen_riscv;
-use compiler::peephole;
-use compiler::elf64;
-use compiler::coff;
-use compiler::macho;
-use compiler::cparser;
-use compiler::iropt;
-use compiler::nat_ir;
-use compiler::rules;
-use compiler::checks;
-use compiler::irverify;
-use compiler::egraph;
-use compiler::typechecker;
-use compiler::json;
-use compiler::csplit;
-use compiler::reach;
-
+ use core; use vec; use string; use compiler::ast; use compiler::token; use compiler::lexer; use compiler::parser; use compiler::ir; use compiler::pgo; use compiler::pir; use compiler::opt; use compiler::compiler; use compiler::inc; use compiler::pe; use compiler::pe_ir; use compiler::pe_ir_stubs; use compiler::fmt; use compiler::lower; use compiler::scribe; use compiler::veil; use compiler::tensor; use compiler::gpu; use compiler::wasm; use compiler::lsp; use compiler::ark; use compiler::codegen_x64; use compiler::codegen_arm64; use compiler::codegen_riscv; use compiler::peephole; use compiler::elf64; use compiler::coff; use compiler::macho; use compiler::cparser; use compiler::iropt; use compiler::nat_ir; use compiler::rules; use compiler::checks; use compiler::irverify; use compiler::egraph; use compiler::typechecker; use compiler::json; use compiler::csplit; use compiler::reach;
 // --- Global flag state ---------------------------------------------------
 // Parsed from --borrowck= and --timeout flags before command dispatch.
 // Fides does not support module-level mutable vars, so these are passed
@@ -94,18 +50,28 @@ pub fn main() -> i64 {
         var garg: str = p_argv(gi);
         // --debug: a debug build, where @cfg(debug) holds (the command
         // reads the flag too, for its own options)
-        if garg == "--debug" { g_cfg_debug = true; }
+        if garg == "--debug" {
+            g_cfg_debug = true;
+        }
         // --profile-use <file>: a profile from `fid run --profile` (OP30)
-        if garg == "--profile-use" && gi + 1 < n { g_pgo_use_path = p_argv(gi + 1); }
+        if garg == "--profile-use" && gi + 1 < n {
+            g_pgo_use_path = p_argv(gi + 1);
+        }
         // --borrowck=off|warn|on
         if str_starts_with(garg, "--borrowck=") {
             var bval: str = str_substring_from(garg, 11);
             match borrowck_mode_parse(bval) {
                 OptBorrowckMode::Some(mode) => {
                     match mode {
-                        BorrowckMode::Off => { g_borrowck = "off"; }
-                        BorrowckMode::Warn => { g_borrowck = "warn"; }
-                        BorrowckMode::On => { g_borrowck = "on"; }
+                        BorrowckMode::Off => {
+                            g_borrowck = "off";
+                        }
+                        BorrowckMode::Warn => {
+                            g_borrowck = "warn";
+                        }
+                        BorrowckMode::On => {
+                            g_borrowck = "on";
+                        }
                     }
                 }
                 OptBorrowckMode::None => {
@@ -120,14 +86,18 @@ pub fn main() -> i64 {
         if str_starts_with(garg, "--timeout=") {
             var tval: str = str_substring_from(garg, 10);
             var tsecs: i64 = c_str_parse_i64(tval);
-            if tsecs > 0 { g_timeout = tsecs; }
+            if tsecs > 0 {
+                g_timeout = tsecs;
+            }
         }
         // --timeout N (value is next arg)
         if garg == "--timeout" {
             if gi + 1 < n {
                 var tnext: str = p_argv(gi + 1);
                 var tsecs2: i64 = c_str_parse_i64(tnext);
-                if tsecs2 > 0 { g_timeout = tsecs2; }
+                if tsecs2 > 0 {
+                    g_timeout = tsecs2;
+                }
             }
         }
         gi = gi + 1;
@@ -151,55 +121,143 @@ pub fn main() -> i64 {
 
     var command: str = p_argv(start);
 
-    if command == "compile" { return cmd_compile(n, start, g_borrowck, g_timeout); }
-    if command == "ccompile" { return cmd_ccompile(n, start, g_borrowck, g_timeout); }
-    if command == "build" { return cmd_build(n, start, g_borrowck, g_timeout); }
-    if command == "emit" { return cmd_build(n, start, g_borrowck, g_timeout); }
-    if command == "build-x86" { return cmd_build_x86(n, start); }
-    if command == "run" { return cmd_run(n, start, g_borrowck, g_timeout); }
-    if command == "tokens" { return cmd_tokens(n, start); }
-    if command == "dump-tokens" { return cmd_tokens(n, start); }
-    if command == "ast" { return cmd_ast(n, start); }
-    if command == "dump-ast" { return cmd_ast(n, start); }
-    if command == "dump-ast-raw" { return cmd_ast(n, start); }
-    if command == "dump-ast-flat" { return cmd_ast(n, start); }
-    if command == "ir" { return cmd_ir(n, start); }
-    if command == "dump-ir" { return cmd_ir(n, start); }
-    if command == "dump-c" { return cmd_dump_c(n, start); }
-    if command == "split-c" { return cmd_split_c(n, start); }
-    if command == "pir" { return cmd_pir(n, start); }
-    if command == "dump-pir" { return cmd_pir(n, start); }
-    if command == "opt" { return cmd_opt(n, start); }
-    if command == "fmt" { return cmd_fmt(n, start); }
-    if command == "version" { return cmd_version(); }
-    if command == "test" { return cmd_test(n, start); }
-    if command == "bench" { return cmd_bench(n, start); }
-    if command == "profile" { return cmd_profile(n, start); }
-    if command == "lint" { return cmd_lint(n, start); }
-    if command == "explain" { return cmd_explain(n, start); }
+    if command == "compile" {
+        return cmd_compile(n, start, g_borrowck, g_timeout);
+    }
+    if command == "ccompile" {
+        return cmd_ccompile(n, start, g_borrowck, g_timeout);
+    }
+    if command == "build" {
+        return cmd_build(n, start, g_borrowck, g_timeout);
+    }
+    if command == "emit" {
+        return cmd_build(n, start, g_borrowck, g_timeout);
+    }
+    if command == "build-x86" {
+        return cmd_build_x86(n, start);
+    }
+    if command == "run" {
+        return cmd_run(n, start, g_borrowck, g_timeout);
+    }
+    if command == "tokens" {
+        return cmd_tokens(n, start);
+    }
+    if command == "dump-tokens" {
+        return cmd_tokens(n, start);
+    }
+    if command == "ast" {
+        return cmd_ast(n, start);
+    }
+    if command == "dump-ast" {
+        return cmd_ast(n, start);
+    }
+    if command == "dump-ast-raw" {
+        return cmd_ast(n, start);
+    }
+    if command == "dump-ast-flat" {
+        return cmd_ast(n, start);
+    }
+    if command == "ir" {
+        return cmd_ir(n, start);
+    }
+    if command == "dump-ir" {
+        return cmd_ir(n, start);
+    }
+    if command == "dump-c" {
+        return cmd_dump_c(n, start);
+    }
+    if command == "split-c" {
+        return cmd_split_c(n, start);
+    }
+    if command == "pir" {
+        return cmd_pir(n, start);
+    }
+    if command == "dump-pir" {
+        return cmd_pir(n, start);
+    }
+    if command == "opt" {
+        return cmd_opt(n, start);
+    }
+    if command == "fmt" {
+        return cmd_fmt(n, start);
+    }
+    if command == "version" {
+        return cmd_version();
+    }
+    if command == "test" {
+        return cmd_test(n, start);
+    }
+    if command == "bench" {
+        return cmd_bench(n, start);
+    }
+    if command == "profile" {
+        return cmd_profile(n, start);
+    }
+    if command == "lint" {
+        return cmd_lint(n, start);
+    }
+    if command == "explain" {
+        return cmd_explain(n, start);
+    }
     if command == "test-rules" {
         // fid test-rules [--smt <dir>]: the rules on values; with --smt, an
         // SMT-LIB proof obligation per rule and width as well
-        if start + 3 <= n && p_argv(start + 1) == "--smt" { return rules_selftest() + rules_smt(p_argv(start + 2)); }
+        if start + 3 <= n && p_argv(start + 1) == "--smt" {
+            return rules_selftest() + rules_smt(p_argv(start + 2));
+        }
         return rules_selftest();
     }
-    if command == "check" { return cmd_check(n, start); }
-    if command == "doc" { return cmd_scribe(n, start); }
-    if command == "wasm" { return cmd_wasm(n, start, g_borrowck); }
-    if command == "watch" { return cmd_bench(n, start); }
-    if command == "lsp" { return lsp_run(); }
-    if command == "scribe" { return cmd_scribe(n, start); }
-    if command == "veil" { return cmd_veil(n, start); }
-    if command == "ark" { return ark_main(); }
-    if command == "repl" { return cmd_repl(); }
-    if command == "codegen" { return cmd_codegen(n, start); }
-    if command == "gpu" { return cmd_gpu(n, start); }
-    if command == "verify" { return cmd_verify(n, start); }
-    if command == "audit" { return cmd_audit(n, start); }
-    if command == "qualify" { return cmd_qualify(n, start); }
-    if command == "sourcemap" { return cmd_sourcemap(n, start); }
-    if command == "parse-header" { return cmd_parse_header(n, start); }
-    if command == "notebook" { return cmd_notebook(n, start); }
+    if command == "check" {
+        return cmd_check(n, start);
+    }
+    if command == "doc" {
+        return cmd_scribe(n, start);
+    }
+    if command == "wasm" {
+        return cmd_wasm(n, start, g_borrowck);
+    }
+    if command == "watch" {
+        return cmd_bench(n, start);
+    }
+    if command == "lsp" {
+        return lsp_run();
+    }
+    if command == "scribe" {
+        return cmd_scribe(n, start);
+    }
+    if command == "veil" {
+        return cmd_veil(n, start);
+    }
+    if command == "ark" {
+        return ark_main();
+    }
+    if command == "repl" {
+        return cmd_repl();
+    }
+    if command == "codegen" {
+        return cmd_codegen(n, start);
+    }
+    if command == "gpu" {
+        return cmd_gpu(n, start);
+    }
+    if command == "verify" {
+        return cmd_verify(n, start);
+    }
+    if command == "audit" {
+        return cmd_audit(n, start);
+    }
+    if command == "qualify" {
+        return cmd_qualify(n, start);
+    }
+    if command == "sourcemap" {
+        return cmd_sourcemap(n, start);
+    }
+    if command == "parse-header" {
+        return cmd_parse_header(n, start);
+    }
+    if command == "notebook" {
+        return cmd_notebook(n, start);
+    }
 
     print("Unknown command: ");
     print(command);
@@ -211,8 +269,12 @@ pub fn main() -> i64 {
 // --- Helper: substring from index -----------------------------------------
 fn str_substring_from(s: str, start: i64) -> str {
     var slen: i64 = str_len(s);
-    if start >= slen { return ""; }
-    if start < 0 { start = 0; }
+    if start >= slen {
+        return "";
+    }
+    if start < 0 {
+        start = 0;
+    }
     return str_slice(s, start, slen);
 }
 
@@ -220,7 +282,9 @@ fn str_substring_from(s: str, start: i64) -> str {
 fn has_flag(n: i64, start: i64, flag: str) -> bool {
     var i: i64 = start + 2;
     while i < n {
-        if p_argv(i) == flag { return true; }
+        if p_argv(i) == flag {
+            return true;
+        }
         i = i + 1;
     }
     return false;
@@ -290,19 +354,35 @@ fn ensure_exe_extension(s: str) -> str {
 /// The target's OS: "linux", "macos", "windows", "wasi" (WebAssembly), or
 /// "" when not known.
 fn cross_target_os(target: str) -> str {
-    if str_contains(target, "wasi") || str_starts_with(target, "wasm") { return "wasi"; }
-    if str_contains(target, "linux") { return "linux"; }
-    if str_contains(target, "macos") || str_contains(target, "darwin") || str_contains(target, "apple") { return "macos"; }
-    if str_contains(target, "windows") || str_contains(target, "mingw") { return "windows"; }
+    if str_contains(target, "wasi") || str_starts_with(target, "wasm") {
+        return "wasi";
+    }
+    if str_contains(target, "linux") {
+        return "linux";
+    }
+    if str_contains(target, "macos") || str_contains(target, "darwin") || str_contains(target, "apple") {
+        return "macos";
+    }
+    if str_contains(target, "windows") || str_contains(target, "mingw") {
+        return "windows";
+    }
     return "";
 }
 
 /// The target's architecture: "x86_64", "aarch64", "riscv64", "wasm32", or "".
 fn cross_target_arch(target: str) -> str {
-    if str_starts_with(target, "wasm") || target == "wasi" { return "wasm32"; }
-    if str_starts_with(target, "aarch64") || str_starts_with(target, "arm64") { return "aarch64"; }
-    if str_starts_with(target, "riscv64") || str_starts_with(target, "riscv") { return "riscv64"; }
-    if str_starts_with(target, "x86_64") || str_starts_with(target, "x86-64") || str_starts_with(target, "x64") { return "x86_64"; }
+    if str_starts_with(target, "wasm") || target == "wasi" {
+        return "wasm32";
+    }
+    if str_starts_with(target, "aarch64") || str_starts_with(target, "arm64") {
+        return "aarch64";
+    }
+    if str_starts_with(target, "riscv64") || str_starts_with(target, "riscv") {
+        return "riscv64";
+    }
+    if str_starts_with(target, "x86_64") || str_starts_with(target, "x86-64") || str_starts_with(target, "x64") {
+        return "x86_64";
+    }
     return "";
 }
 
@@ -312,10 +392,18 @@ fn cross_target_arch(target: str) -> str {
 fn cross_zig_triple(target: str) -> str {
     var os: str = cross_target_os(target);
     var arch: str = cross_target_arch(target);
-    if os == "" || arch == "" { return ""; }
-    if os == "linux" { return arch + "-linux-musl"; }
-    if os == "macos" { return arch + "-macos"; }
-    if os == "wasi" { return "wasm32-wasi"; }
+    if os == "" || arch == "" {
+        return "";
+    }
+    if os == "linux" {
+        return arch + "-linux-musl";
+    }
+    if os == "macos" {
+        return arch + "-macos";
+    }
+    if os == "wasi" {
+        return "wasm32-wasi";
+    }
     return arch + "-windows-gnu";
 }
 
@@ -324,8 +412,12 @@ fn cross_zig_triple(target: str) -> str {
 /// without /proc was taken for Windows, so `fid` on a Mac named executables
 /// .exe and linked ws2_32).
 fn host_os() -> str {
-    if p_getenv("OS") == "Windows_NT" { return "windows"; }
-    if c_file_exists("/proc/self/exe") { return "linux"; }
+    if p_getenv("OS") == "Windows_NT" {
+        return "windows";
+    }
+    if c_file_exists("/proc/self/exe") {
+        return "linux";
+    }
     return "macos";
 }
 
@@ -338,7 +430,9 @@ fn is_posix_host() -> bool {
 /// Panic traces unwind the stack: zig cc links no unwinder for C on Linux
 /// (macOS has _Unwind_Backtrace in libSystem).
 fn zig_unwind(cc: str) -> str {
-    if host_os() == "linux" && str_contains(cc, "zig") { return " -lunwind"; }
+    if host_os() == "linux" && str_contains(cc, "zig") {
+        return " -lunwind";
+    }
     return "";
 }
 
@@ -356,7 +450,9 @@ fn print_errors(errs: Vec<str>) {
     var ei: i64 = 0;
     while ei < errs.len() {
         // enrich_errors has already put "error: " (or "error[E0nn]: ") on some
-        if !str_starts_with(errs.get(ei), "error") { p_eprint_str("error: "); }
+        if !str_starts_with(errs.get(ei), "error") {
+            p_eprint_str("error: ");
+        }
         p_eprint_str(errs.get(ei));
         p_eprint_str("\n");
         ei = ei + 1;
@@ -471,7 +567,7 @@ fn cmd_ir(n: i64, start: i64) -> i64 {
     var result: ResultIrModule = lower_to_ir_module(source);
     match result {
         ResultIrModule::Ok(ir_mod) => {
-            print(IrModule_to_str(&ir_mod));
+            print(IrModule_to_str(& ir_mod));
             print("\n");
             return 0;
         }
@@ -541,7 +637,9 @@ fn cmd_pir(n: i64, start: i64) -> i64 {
     var want_opt: bool = false;
     var ai: i64 = start + 2;
     while ai < n {
-        if p_argv(ai) == "--opt" { want_opt = true; }
+        if p_argv(ai) == "--opt" {
+            want_opt = true;
+        }
         ai = ai + 1;
     }
 
@@ -558,43 +656,47 @@ fn cmd_pir(n: i64, start: i64) -> i64 {
             var level: PirLevel = PirLevel::L2;
             var opt_level: OptPirLevel = PirLevel_parse(level_arg);
             match opt_level {
-                OptPirLevel::Some(l) => { level = l; }
-                OptPirLevel::None => { level = PirLevel::L2; }
+                OptPirLevel::Some(l) => {
+                    level = l;
+                }
+                OptPirLevel::None => {
+                    level = PirLevel::L2;
+                }
             }
             match level {
                 PirLevel::L1 => {
-                    var l1: L1Module = lower_ir_to_l1(&ir_mod);
-                    print(format_l1(&l1));
+                    var l1: L1Module = lower_ir_to_l1(& ir_mod);
+                    print(format_l1(& l1));
                 }
                 PirLevel::L2 => {
-                    var l1: L1Module = lower_ir_to_l1(&ir_mod);
-                    var l2: L2Module = lower_l1_to_l2(&l1);
+                    var l1: L1Module = lower_ir_to_l1(& ir_mod);
+                    var l2: L2Module = lower_l1_to_l2(& l1);
                     if want_opt {
-                        var stats: OptStats = optimize_l2(&mut l2);
+                        var stats: OptStats = optimize_l2(& mut l2);
                         p_eprint_str(";; optimization stats: ");
                         p_eprint_str(int_to_str(stats.iterations));
                         p_eprint_str(" iterations\n");
                     }
-                    print(format_l2(&l2));
+                    print(format_l2(& l2));
                 }
                 PirLevel::L3 => {
-                    var l1: L1Module = lower_ir_to_l1(&ir_mod);
-                    var l2: L2Module = lower_l1_to_l2(&l1);
-                    var l3: L3Module = lower_l2_to_l3(&l2, &ir_mod);
-                    print(format_l3(&l3));
+                    var l1: L1Module = lower_ir_to_l1(& ir_mod);
+                    var l2: L2Module = lower_l1_to_l2(& l1);
+                    var l3: L3Module = lower_l2_to_l3(& l2, & ir_mod);
+                    print(format_l3(& l3));
                 }
                 PirLevel::All => {
-                    var l1: L1Module = lower_ir_to_l1(&ir_mod);
-                    var l2: L2Module = lower_l1_to_l2(&l1);
+                    var l1: L1Module = lower_ir_to_l1(& ir_mod);
+                    var l2: L2Module = lower_l1_to_l2(& l1);
                     if want_opt {
-                        var stats: OptStats = optimize_l2(&mut l2);
+                        var stats: OptStats = optimize_l2(& mut l2);
                     }
-                    var l3: L3Module = lower_l2_to_l3(&l2, &ir_mod);
-                    print(format_l1(&l1));
+                    var l3: L3Module = lower_l2_to_l3(& l2, & ir_mod);
+                    print(format_l1(& l1));
                     print("\n");
-                    print(format_l2(&l2));
+                    print(format_l2(& l2));
                     print("\n");
-                    print(format_l3(&l3));
+                    print(format_l3(& l3));
                 }
             }
             return 0;
@@ -626,10 +728,10 @@ fn cmd_opt(n: i64, start: i64) -> i64 {
     var result: ResultIrModule = lower_to_ir_module(source);
     match result {
         ResultIrModule::Ok(ir_mod) => {
-            var l1: L1Module = lower_ir_to_l1(&ir_mod);
-            var l2: L2Module = lower_l1_to_l2(&l1);
-            var stats: OptStats = optimize_l2(&mut l2);
-            print(format_l2(&l2));
+            var l1: L1Module = lower_ir_to_l1(& ir_mod);
+            var l2: L2Module = lower_l1_to_l2(& l1);
+            var stats: OptStats = optimize_l2(& mut l2);
+            print(format_l2(& l2));
             p_eprint_str(";; optimization stats: ");
             p_eprint_str(int_to_str(stats.iterations));
             p_eprint_str(" iterations\n");
@@ -653,7 +755,9 @@ fn cmd_fmt(n: i64, start: i64) -> i64 {
     var check_mode: bool = false;
     var ai: i64 = start + 2;
     while ai < n {
-        if p_argv(ai) == "--check" { check_mode = true; }
+        if p_argv(ai) == "--check" {
+            check_mode = true;
+        }
         ai = ai + 1;
     }
     var source: str = c_file_read(input);
@@ -712,8 +816,12 @@ fn cmd_run(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
     // --leaks / --checked-alloc: the interpreter has no allocator to watch, so
     // build through C with the debug allocator and run that
     var mem_flags: str = "";
-    if has_flag(n, start, "--leaks") { mem_flags = " --leaks"; }
-    if has_flag(n, start, "--checked-alloc") { mem_flags = mem_flags + " --checked-alloc"; }
+    if has_flag(n, start, "--leaks") {
+        mem_flags = " --leaks";
+    }
+    if has_flag(n, start, "--checked-alloc") {
+        mem_flags = mem_flags + " --checked-alloc";
+    }
     if str_len(mem_flags) > 0 {
         var mexe: str = "_fides_memcheck_tmp.exe";
         var mrun: str = ".\\_fides_memcheck_tmp.exe";
@@ -748,9 +856,17 @@ fn cmd_run(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
         p_eprint_str(input);
         p_eprint_str("\n");
         p_eprint_str("[run] release: ");
-        if release { p_eprint_str("yes"); } else { p_eprint_str("no"); }
+        if release {
+            p_eprint_str("yes");
+        } else {
+            p_eprint_str("no");
+        }
         p_eprint_str(", trace: ");
-        if trace { p_eprint_str("yes"); } else { p_eprint_str("no"); }
+        if trace {
+            p_eprint_str("yes");
+        } else {
+            p_eprint_str("no");
+        }
         p_eprint_str("\n");
         p_eprint_str("[run] max-recursion: ");
         p_eprint_str(int_to_str(max_recursion));
@@ -789,13 +905,18 @@ fn cmd_run(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
     // --profile <file>: count the calls of every function and write them
     // (`fid emit ... --profile-use <file>` then uses them, OP30)
     var prof_out: str = get_flag_value(n, start, "--profile", "");
-    if prof_out != "" { g_pgo_record = true; }
+    if prof_out != "" {
+        g_pgo_record = true;
+    }
     var run_rc: i64 = interpret_source_with_path(source, input, max_recursion, max_steps, max_memory_bytes, verbose, g_borrowck);
     if prof_out != "" {
-        if pgo_write(prof_out) { p_eprint_str("profile written: " + prof_out + "
-"); }
-        else { p_eprint_str("error: cannot write profile " + prof_out + "
-"); }
+        if pgo_write(prof_out) {
+            p_eprint_str("profile written: " + prof_out + "
+");
+        } else {
+            p_eprint_str("error: cannot write profile " + prof_out + "
+");
+        }
     }
     return run_rc;
 }
@@ -813,7 +934,9 @@ fn test_fns(source: str, prefix: str) -> Vec<str> {
     var i: i64 = 0;
     while i < lines.len() {
         var t: str = str_trim(lines.get(i));
-        if str_starts_with(t, "pub ") { t = str_slice(t, 4, str_len(t)); }
+        if str_starts_with(t, "pub ") {
+            t = str_slice(t, 4, str_len(t));
+        }
         if str_starts_with(t, "fn " + prefix) {
             var open: i64 = str_find(t, "(");
             if open > 3 && str_find(t, "()") == open {
@@ -833,7 +956,9 @@ fn test_fns_fuzz(source: str) -> Vec<str> {
     var i: i64 = 0;
     while i < lines.len() {
         var t: str = str_trim(lines.get(i));
-        if str_starts_with(t, "pub ") { t = str_slice(t, 4, str_len(t)); }
+        if str_starts_with(t, "pub ") {
+            t = str_slice(t, 4, str_len(t));
+        }
         if str_starts_with(t, "fn fuzz_") {
             var open: i64 = str_find(t, "(");
             if open > 3 && str_find(t, "()") != open {
@@ -863,7 +988,9 @@ fn cmd_test_file(n: i64, start: i64) -> i64 {
     var update_snaps: bool = has_flag(n, start, "--update");
     var coverage: bool = has_flag(n, start, "--coverage");
     var fuzzes: Vec<str> = Vec::new();
-    if fuzz_mode { fuzzes = test_fns_fuzz(source); }
+    if fuzz_mode {
+        fuzzes = test_fns_fuzz(source);
+    }
     if str_find(source, "fn main(") >= 0 {
         p_eprint_str("fid test: " + input + " has a main; a test file holds only fn test_*() and fn bench_*()\n");
         return 1;
@@ -875,21 +1002,7 @@ fn cmd_test_file(n: i64, start: i64) -> i64 {
     // The harness: the file and a main that runs the function its argument
     // names, as many times as the second argument says. A fuzz function
     // gets `reps` deterministic inputs from _fuzz_input's seeds.
-    var harness: str = source + "\n\nfn _fuzz_input(seed: i64) -> Vec<u8> {\n"
-        + "    var d: Vec<u8> = Vec::new();\n"
-        + "    var s: i64 = (seed * 2654435761 + 1) % 2147483648;\n"
-        + "    var n: i64 = 64 + (seed % 960);\n"
-        + "    var i: i64 = 0;\n"
-        + "    while i < n {\n"
-        + "        s = (s * 1103515245 + 12345) % 2147483648;\n"
-        + "        d.push((s >> 16) & 255);\n"
-        + "        i = i + 1;\n"
-        + "    }\n"
-        + "    return d;\n"
-        + "}\n\nfn main() -> i64 {\n    var which: str = \"all\";\n"
-        + "    match arg_at(1) { Option::Some(a) => { which = a; } Option::None => {} }\n"
-        + "    var reps: i64 = 1;\n"
-        + "    match arg_at(2) { Option::Some(a) => { reps = str_parse_int(a); } Option::None => {} }\n";
+    var harness: str = source + "\n\nfn _fuzz_input(seed: i64) -> Vec<u8> {\n" + "    var d: Vec<u8> = Vec::new();\n" + "    var s: i64 = (seed * 2654435761 + 1) % 2147483648;\n" + "    var n: i64 = 64 + (seed % 960);\n" + "    var i: i64 = 0;\n" + "    while i < n {\n" + "        s = (s * 1103515245 + 12345) % 2147483648;\n" + "        d.push((s >> 16) & 255);\n" + "        i = i + 1;\n" + "    }\n" + "    return d;\n" + "}\n\nfn main() -> i64 {\n    var which: str = \"all\";\n" + "    match arg_at(1) { Option::Some(a) => { which = a; } Option::None => {} }\n" + "    var reps: i64 = 1;\n" + "    match arg_at(2) { Option::Some(a) => { reps = str_parse_int(a); } Option::None => {} }\n";
     var i: i64 = 0;
     while i < tests.len() {
         harness = harness + "    if which == \"all\" || which == \"" + tests.get(i) + "\" { " + tests.get(i) + "(); }\n";
@@ -897,25 +1010,22 @@ fn cmd_test_file(n: i64, start: i64) -> i64 {
     }
     i = 0;
     while i < fuzzes.len() {
-        harness = harness + "    if which == \"" + fuzzes.get(i) + "\" {\n"
-            + "        var r2: i64 = 0;\n"
-            + "        while r2 < reps { " + fuzzes.get(i) + "(_fuzz_input(r2 + 1)); r2 = r2 + 1; }\n"
-            + "    }\n";
+        harness = harness + "    if which == \"" + fuzzes.get(i) + "\" {\n" + "        var r2: i64 = 0;\n" + "        while r2 < reps { " + fuzzes.get(i) + "(_fuzz_input(r2 + 1)); r2 = r2 + 1; }\n" + "    }\n";
         i = i + 1;
     }
     i = 0;
     while i < benches.len() {
         val b: str = benches.get(i);
-        harness = harness + "    if which == \"" + b + "\" {\n        val t0: i64 = p_clock_now_us();\n"
-            + "        var r: i64 = 0;\n        while r < reps { " + b + "(); r = r + 1; }\n"
-            + "        println(p_clock_now_us() - t0);\n    }\n";
+        harness = harness + "    if which == \"" + b + "\" {\n        val t0: i64 = p_clock_now_us();\n" + "        var r: i64 = 0;\n        while r < reps { " + b + "(); r = r + 1; }\n" + "        println(p_clock_now_us() - t0);\n    }\n";
         i = i + 1;
     }
     harness = harness + "    return 0;\n}\n";
     // Next to the file, so its own imports resolve the same way
     var dir: str = "";
     var slash: i64 = str_rfind(str_replace(input, "\\", "/"), "/");
-    if slash >= 0 { dir = str_slice(input, 0, slash + 1); }
+    if slash >= 0 {
+        dir = str_slice(input, 0, slash + 1);
+    }
     var main_fd: str = dir + "_fides_test_main.fd";
     p_file_write(main_fd, harness);
     var exe: str = "_fides_test_run.exe";
@@ -934,10 +1044,12 @@ fn cmd_test_file(n: i64, start: i64) -> i64 {
     // --update: the snapshots of expect_snapshot are rewritten
     var run_cmd: str = run;
     if update_snaps {
-        if is_posix_host() { run_cmd = "FIDES_UPDATE=1 " + run; }
-        else { run_cmd = "set FIDES_UPDATE=1 && " + run; }
-    }
-    while i < tests.len() {
+        if is_posix_host() {
+            run_cmd = "FIDES_UPDATE=1 " + run;
+        } else {
+            run_cmd = "set FIDES_UPDATE=1 && " + run;
+        }
+    } while i < tests.len() {
         if p_system(run_cmd + " " + tests.get(i) + " 1") == 0 {
             print("ok    " + tests.get(i) + "\n");
         } else {
@@ -970,8 +1082,7 @@ fn cmd_test_file(n: i64, start: i64) -> i64 {
             } else {
                 us = str_parse_int(str_trim(c_file_read("_fides_bench_out.txt")));
                 if us >= 200000 || reps >= 1073741824 {
-                    print(benches.get(i) + "  " + int_to_str(reps) + " runs  "
-                        + int_to_str(us * 1000 / reps) + " ns/op\n");
+                    print(benches.get(i) + "  " + int_to_str(reps) + " runs  " + int_to_str(us * 1000 / reps) + " ns/op\n");
                     ok = false;
                 } else if us < 1000 {
                     reps = reps * 100;
@@ -990,7 +1101,9 @@ fn cmd_test_file(n: i64, start: i64) -> i64 {
     p_file_delete(main_fd);
     p_file_delete("_fides_bench_out.txt");
     print(int_to_str(tests.len() - failed) + " passed, " + int_to_str(failed) + " failed\n");
-    if failed > 0 { return 1; }
+    if failed > 0 {
+        return 1;
+    }
     return 0;
 }
 
@@ -1025,7 +1138,9 @@ fn cmd_test(n: i64, start: i64) -> i64 {
     var files: Vec<str> = Vec::new();
     var li: i64 = 0;
     while li < listed.len() {
-        if str_len(listed.get(li)) > 0 { files.push(listed.get(li)); }
+        if str_len(listed.get(li)) > 0 {
+            files.push(listed.get(li));
+        }
         li = li + 1;
     }
     if files.len() == 0 {
@@ -1167,7 +1282,9 @@ fn cmd_test(n: i64, start: i64) -> i64 {
     }
 
     var batch_label: str = "normal";
-    if fail_only { batch_label = "expected-fail"; }
+    if fail_only {
+        batch_label = "expected-fail";
+    }
     p_eprint_str("[test] Running ");
     p_eprint_str(int_to_str(test_files.len()));
     p_eprint_str(" ");
@@ -1218,10 +1335,16 @@ fn cmd_test(n: i64, start: i64) -> i64 {
                 var c_file: str = "_fides_test_tmp.c";
                 p_file_write(c_file, c_code);
                 var exe_name: str = "_fides_test_tmp.exe";
-                if is_posix_host() { exe_name = "_fides_test_tmp"; }
+                if is_posix_host() {
+                    exe_name = "_fides_test_tmp";
+                }
                 var cc: str = env_or_empty("CC");
                 if str_len(cc) == 0 {
-                    if is_posix_host() { cc = "gcc"; } else { cc = "tcc"; }
+                    if is_posix_host() {
+                        cc = "gcc";
+                    } else {
+                        cc = "tcc";
+                    }
                 }
                 var cc_cmd: str = "";
                 if is_posix_host() {
@@ -1275,18 +1398,28 @@ fn cmd_test(n: i64, start: i64) -> i64 {
                 p_eprint_str("  [PASS] ");
                 p_eprint_str(fname);
                 p_eprint_str(" (C");
-                if pe_ok { p_eprint_str("+PE"); }
+                if pe_ok {
+                    p_eprint_str("+PE");
+                }
                 p_eprint_str(")\n");
                 c_pass = c_pass + 1;
-                if pe_ok { pe_pass = pe_pass + 1; }
+                if pe_ok {
+                    pe_pass = pe_pass + 1;
+                }
             } else {
                 p_eprint_str("  [FAIL] ");
                 p_eprint_str(fname);
                 p_eprint_str(" (C");
-                if pe_ok { p_eprint_str(", PE ok"); } else { p_eprint_str("+PE"); }
+                if pe_ok {
+                    p_eprint_str(", PE ok");
+                } else {
+                    p_eprint_str("+PE");
+                }
                 p_eprint_str(")\n");
                 c_fail = c_fail + 1;
-                if !pe_ok { pe_fail = pe_fail + 1; }
+                if !pe_ok {
+                    pe_fail = pe_fail + 1;
+                }
             }
         }
         fi = fi + 1;
@@ -1314,7 +1447,9 @@ fn cmd_test(n: i64, start: i64) -> i64 {
     p_eprint_str(" failed\n");
     // TODO: Add interpreter backend results when ported.
 
-    if c_fail > 0 { return 1; }
+    if c_fail > 0 {
+        return 1;
+    }
     return 0;
 }
 
@@ -1322,7 +1457,9 @@ fn cmd_test(n: i64, start: i64) -> i64 {
 fn str_vec_contains_str(vec: Vec<str>, s: str) -> bool {
     var i: i64 = 0;
     while i < vec.len() {
-        if vec.get(i) == s { return true; }
+        if vec.get(i) == s {
+            return true;
+        }
         i = i + 1;
     }
     return false;
@@ -1347,7 +1484,9 @@ fn cmd_bench(n: i64, start: i64) -> i64 {
         }
         ai = ai + 1;
     }
-    if count <= 0 { count = 10; }
+    if count <= 0 {
+        count = 10;
+    }
 
     var source: str = c_file_read(input);
     if str_len(source) == 0 {
@@ -1364,7 +1503,9 @@ fn cmd_bench(n: i64, start: i64) -> i64 {
             var c_file: str = "_fides_bench_tmp.c";
             p_file_write(c_file, c_code);
             var exe_name: str = "_fides_bench_tmp.exe";
-            if is_posix_host() { exe_name = "_fides_bench_tmp"; }
+            if is_posix_host() {
+                exe_name = "_fides_bench_tmp";
+            }
             var bench_cmd: str = "";
             if is_posix_host() {
                 bench_cmd = "gcc -O2 -w -o " + exe_name + " " + c_file + " -lm";
@@ -1458,8 +1599,12 @@ fn cmd_profile(n: i64, start: i64) -> i64 {
             var stack: str = str_slice(line, 0, sp);
             var semi: i64 = str_rfind(stack, ";");
             var leaf: str = stack;
-            if semi >= 0 { leaf = str_slice(stack, semi + 1, str_len(stack)); }
-            if HashMap_get(counts, leaf) == 0 { names.push(leaf); }
+            if semi >= 0 {
+                leaf = str_slice(stack, semi + 1, str_len(stack));
+            }
+            if HashMap_get(counts, leaf) == 0 {
+                names.push(leaf);
+            }
             HashMap_insert(counts, leaf, HashMap_get(counts, leaf) + 1);
             total = total + 1;
         }
@@ -1469,15 +1614,19 @@ fn cmd_profile(n: i64, start: i64) -> i64 {
     print("  self %   samples  function\n");
     var shown: i64 = 0;
     while shown < 20 && shown < names.len() {
-        var best: i64 = -1;
+        var best: i64 = - 1;
         var bi: i64 = 0;
         while bi < names.len() {
             if HashMap_get(counts, names.get(bi)) > 0 {
-                if best < 0 || HashMap_get(counts, names.get(bi)) > HashMap_get(counts, names.get(best)) { best = bi; }
+                if best < 0 || HashMap_get(counts, names.get(bi)) > HashMap_get(counts, names.get(best)) {
+                    best = bi;
+                }
             }
             bi = bi + 1;
         }
-        if best < 0 { break; }
+        if best < 0 {
+            break;
+        }
         var c: i64 = HashMap_get(counts, names.get(best));
         print("  " + int_to_str(c * 100 / total) + "%  " + int_to_str(c) + "  " + names.get(best) + "\n");
         HashMap_insert(counts, names.get(best), 0 - 1);
@@ -1497,7 +1646,9 @@ fn cmd_repl() -> i64 {
         p_eprint_str("> ");
         var line: str = p_read_line();
         var trimmed: str = str_trim(line);
-        if str_len(trimmed) == 0 { continue; }
+        if str_len(trimmed) == 0 {
+            continue;
+        }
         if trimmed == ":quit" || trimmed == ":q" || trimmed == ":exit" {
             running = false;
             continue;
@@ -1517,7 +1668,9 @@ fn cmd_repl() -> i64 {
             ResultStr::Ok(c_code) => {
                 p_file_write("_fides_repl_tmp.c", c_code);
                 var exe_name: str = "_fides_repl_tmp.exe";
-                if is_posix_host() { exe_name = "_fides_repl_tmp"; }
+                if is_posix_host() {
+                    exe_name = "_fides_repl_tmp";
+                }
                 var build_cmd: str = "";
                 if is_posix_host() {
                     build_cmd = "gcc -O2 -w -o " + exe_name + " _fides_repl_tmp.c -lm";
@@ -1558,7 +1711,9 @@ fn cmd_notebook(n: i64, start: i64) -> i64 {
     var ai: i64 = start + 2;
     while ai < n {
         if p_argv(ai) == "-o" {
-            if ai + 1 < n { output = p_argv(ai + 1); }
+            if ai + 1 < n {
+                output = p_argv(ai + 1);
+            }
         }
         ai = ai + 1;
     }
@@ -1611,7 +1766,9 @@ fn cmd_notebook(n: i64, start: i64) -> i64 {
 /// fid check: type, borrow and effect checks with no code generation.
 fn cmd_check(n: i64, start: i64) -> i64 {
     var t_start: i64 = p_clock_now_ms();
-    if has_flag(n, start, "--time") { set_time_on(); }
+    if has_flag(n, start, "--time") {
+        set_time_on();
+    }
     if start + 2 > n {
         p_eprint_str("Usage: fid check <file.fd>\n");
         return 1;
@@ -1647,7 +1804,9 @@ fn cmd_lint(n: i64, start: i64) -> i64 {
     var perf: bool = false;
     var ai: i64 = start + 2;
     while ai < n {
-        if p_argv(ai) == "--perf" { perf = true; }
+        if p_argv(ai) == "--perf" {
+            perf = true;
+        }
         ai = ai + 1;
     }
     var source: str = c_file_read(input);
@@ -1701,8 +1860,11 @@ fn cmd_explain(n: i64, start: i64) -> i64 {
     var ai: i64 = start + 2;
     while ai < n {
         var a: str = p_argv(ai);
-        if a == "--alloc" { alloc_mode = true; }
-        else if str_len(a) > 0 { filt = a; }
+        if a == "--alloc" {
+            alloc_mode = true;
+        } else if str_len(a) > 0 {
+            filt = a;
+        }
         ai = ai + 1;
     }
     var source: str = c_file_read(input);
@@ -1720,8 +1882,11 @@ fn cmd_explain(n: i64, start: i64) -> i64 {
         }
         ResultIrModule::Ok(m) => {
             var lines: Vec<str> = Vec::new();
-            if alloc_mode { lines = explain_allocs(m, filt); }
-            else { lines = explain_checks(m, filt); }
+            if alloc_mode {
+                lines = explain_allocs(m, filt);
+            } else {
+                lines = explain_checks(m, filt);
+            }
             var i: i64 = 0;
             while i < lines.len() {
                 print(lines.get(i));
@@ -1789,7 +1954,9 @@ fn cmd_wasm(n: i64, start: i64, g_borrowck: str) -> i64 {
     var result: ResultBytes = ResultBytes::Err(Vec::new());
     var wprog: ResultProgram = build_program_with_path_borrowck(source, OptStr::Some(input), g_borrowck);
     match wprog {
-        ResultProgram::Err(werrs) => { result = ResultBytes::Err(werrs); }
+        ResultProgram::Err(werrs) => {
+            result = ResultBytes::Err(werrs);
+        }
         ResultProgram::Ok(wprogram) => {
             g_lower_keep = lw_keep_set(wprogram);
             var wmod: IrModule = lower(wprogram);
@@ -1840,7 +2007,9 @@ fn cmd_wasm(n: i64, start: i64, g_borrowck: str) -> i64 {
 fn build_c_units(c_code: str, cc: str, gcc_opt: str, is_tcc: bool, output: str, libs: str, no_cache: bool) -> i64 {
     var units: Vec<CUnit> = split_c_units(c_code);
     var stem: str = output;
-    if str_ends_with(output, ".exe") { stem = str_slice(output, 0, str_len(output) - 4); }
+    if str_ends_with(output, ".exe") {
+        stem = str_slice(output, 0, str_len(output) - 4);
+    }
     var tu_dir: str = stem + ".fides-tu";
     p_mkdir(tu_dir);
     var flags: str = " -Wno-int-conversion";
@@ -1867,7 +2036,9 @@ fn build_c_units(c_code: str, cc: str, gcc_opt: str, is_tcc: bool, output: str, 
                 print("C compilation failed: " + c_path + "\n");
                 return 1;
             }
-            if str_len(art) > 0 { inc_artifact_put(art, o_path); }
+            if str_len(art) > 0 {
+                inc_artifact_put(art, o_path);
+            }
         }
         objs = objs + " " + o_path;
         i = i + 1;
@@ -1881,10 +2052,14 @@ fn build_c_units(c_code: str, cc: str, gcc_opt: str, is_tcc: bool, output: str, 
     if !is_tcc {
         link = link + " -pie";
         // The -z options are ELF-only
-        if p_getenv("OS") != "Windows_NT" { link = link + " -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack"; }
+        if p_getenv("OS") != "Windows_NT" {
+            link = link + " -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack";
+        }
     }
     var system_libs: str = " -lm" + zig_unwind(cc);
-    if !is_posix_host() { system_libs = system_libs + " -lws2_32"; }
+    if !is_posix_host() {
+        system_libs = system_libs + " -lws2_32";
+    }
     if p_system(link + objs + system_libs + libs) != 0 {
         print("link failed\n");
         return 1;
@@ -1916,13 +2091,15 @@ fn patch_pe_stack(exe_path: str) {
         p_eprint_str("[main] WARNING: PE stack patching failed: not a PE file.\n");
         return;
     }
-    pe_put_u64(&mut bytes, stack_off, 268435456);     // 256MB reserve
-    pe_put_u64(&mut bytes, stack_off + 8, 16777216);  // 16MB commit
+    pe_put_u64(& mut bytes, stack_off, 268435456);
+    // 256MB reserve
+    pe_put_u64(& mut bytes, stack_off + 8, 16777216);
+    // 16MB commit
     p_file_write_vec(exe_path, bytes);
     p_eprint_str("[main] PE stack patched to 256MB.\n");
 }
 
-fn pe_put_u64(bytes: &mut Vec<i64>, off: i64, value: i64) {
+fn pe_put_u64(bytes: & mut Vec<i64>, off: i64, value: i64) {
     var i: i64 = 0;
     while i < 8 {
         bytes.set(off + i, (value >> (i * 8)) & 0xFF);
@@ -1948,7 +2125,9 @@ fn plink_libs(c_code: str) -> str {
     while at >= 0 {
         rest = str_slice(rest, at + str_len(marker), str_len(rest));
         var end: i64 = str_find(rest, "\n");
-        if end < 0 { end = str_len(rest); }
+        if end < 0 {
+            end = str_len(rest);
+        }
         var lib: str = str_trim(str_slice(rest, 0, end));
         if str_len(lib) > 0 && lib != "ws2_32" && !str_contains(out, " -l" + lib + " ") {
             out = out + " -l" + lib + " ";
@@ -1983,8 +2162,12 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
     if tgt_os == "" {
         tgt_os = host_os();
     }
-    if tgt_os == "windows" { output = ensure_exe_extension(output); }
-    if tgt_os == "wasi" && !str_ends_with(output, ".wasm") { output = output + ".wasm"; }
+    if tgt_os == "windows" {
+        output = ensure_exe_extension(output);
+    }
+    if tgt_os == "wasi" && !str_ends_with(output, ".wasm") {
+        output = output + ".wasm";
+    }
     // @cfg decides by the target (compiler.fd apply_cfg_filter)
     if str_len(target) > 0 {
         g_cfg_os = tgt_os;
@@ -2023,7 +2206,9 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
     var stamp_path: str = output + ".fides-stamp";
     var build_key: i64 = inc_build_key("ccompile", n, start);
     var stamp: IncStamp = inc_stamp_read(stamp_path);
-    if no_cache { stamp.ok = false; }
+    if no_cache {
+        stamp.ok = false;
+    }
     if inc_up_to_date(stamp, build_key, output) {
         print(output + " is up to date\n");
         return 0;
@@ -2031,10 +2216,18 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
     inc_deps_reset();
 
     var unit_build: bool = has_flag(n, start, "--inc");
-    if unit_build { set_c_unit_marks(true); }
-    if has_flag(n, start, "--profile") { set_c_profile(true); }
-    if has_flag(n, start, "--leaks") { set_c_leaks(true); }
-    if has_flag(n, start, "--checked-alloc") { set_c_checked_alloc(true); }
+    if unit_build {
+        set_c_unit_marks(true);
+    }
+    if has_flag(n, start, "--profile") {
+        set_c_profile(true);
+    }
+    if has_flag(n, start, "--leaks") {
+        set_c_leaks(true);
+    }
+    if has_flag(n, start, "--checked-alloc") {
+        set_c_checked_alloc(true);
+    }
     var result: ResultStr = ccompile_source_with_path(source, input, g_borrowck);
     match result {
         ResultStr::Ok(c_code) => {
@@ -2185,8 +2378,7 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                 p_eprint_str("[main] Detected OpenGL usage, adding link flags\n");
             }
             if str_starts_with(source, "use net;") || str_contains(source, "\nuse net;") {
-                if tgt_os != "windows" {
-                    // sockets are in libc on Linux, no extra lib needed
+                if tgt_os != "windows" {  // sockets are in libc on Linux, no extra lib needed
                 } else {
                     extra_libs = extra_libs + " -lws2_32";
                 }
@@ -2202,9 +2394,15 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
             // C: 26 min at -O2, 40 s at -O0), so one gets -O0.
             var cc_opt: str = get_flag_value(n, start, "--cc-opt", "");
             // --debug: no C optimization (fast to build, easy to debug); --release: -O2
-            if str_len(cc_opt) == 0 && has_flag(n, start, "--debug") { cc_opt = "0"; }
-            if str_len(cc_opt) == 0 && has_flag(n, start, "--release") { cc_opt = "2"; }
-            if str_len(cc_opt) == 0 { cc_opt = env_or_empty("FIDES_CC_OPT"); }
+            if str_len(cc_opt) == 0 && has_flag(n, start, "--debug") {
+                cc_opt = "0";
+            }
+            if str_len(cc_opt) == 0 && has_flag(n, start, "--release") {
+                cc_opt = "2";
+            }
+            if str_len(cc_opt) == 0 {
+                cc_opt = env_or_empty("FIDES_CC_OPT");
+            }
             if str_len(cc_opt) == 0 {
                 if str_len(c_code) > 16777216 {
                     print("Large program (" + int_to_str(str_len(c_code) / 1048576) + " MB of C): compiling with -O0 (use --cc-opt 2 for -O2)\n");
@@ -2219,8 +2417,12 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
             }
             var gcc_opt: str = "-O" + cc_opt;
             var cl_opt: str = "/O2";
-            if cc_opt == "0" { cl_opt = "/Od"; }
-            if cc_opt == "1" || cc_opt == "s" { cl_opt = "/O1"; }
+            if cc_opt == "0" {
+                cl_opt = "/Od";
+            }
+            if cc_opt == "1" || cc_opt == "s" {
+                cl_opt = "/O1";
+            }
 
             // --inc: one translation unit per module, each compiled to a
             // cached object, then linked.
@@ -2230,8 +2432,12 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                     return 1;
                 }
                 var rc: i64 = build_c_units(c_code, cc, gcc_opt, is_tcc, output, extra_libs, no_cache);
-                if rc != 0 { return rc; }
-                if !is_posix_host() { patch_pe_stack(output); }
+                if rc != 0 {
+                    return rc;
+                }
+                if !is_posix_host() {
+                    patch_pe_stack(output);
+                }
                 inc_stamp_commit(stamp_path, build_key, c_hash, input, output);
                 print("Built native executable: " + output + "\n");
                 return 0;
@@ -2269,7 +2475,9 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                     // A Linux cross build is a static executable (musl): it
                     // runs anywhere, also under qemu-user
                     var link_mode: str = " -pie";
-                    if zig_cross && tgt_os == "linux" { link_mode = " -static"; }
+                    if zig_cross && tgt_os == "linux" {
+                        link_mode = " -static";
+                    }
                     var hardening: str = " -fstack-protector-strong -fPIE";
                     // WebAssembly: no stack protector or PIE; WASI's libc
                     // emulates mmap, signal(), clocks and getpid on request
@@ -2281,7 +2489,9 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                     // FIDES_CFLAGS: extra C compiler flags, e.g. the
                     // sanitizers of scripts/sanitize.sh (release M8)
                     var user_cflags: str = env_or_empty("FIDES_CFLAGS");
-                    if str_len(user_cflags) > 0 { cc_flags = " " + user_cflags + cc_flags; }
+                    if str_len(user_cflags) > 0 {
+                        cc_flags = " " + user_cflags + cc_flags;
+                    }
                     // zig cc turns on its UB sanitizer at -O0; the generated
                     // C type-puns by design (string headers read in front of
                     // unaligned literals), so it would trap on correct
@@ -2290,10 +2500,14 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                         cc_flags = " -fno-sanitize=undefined" + cc_flags;
                     }
                     // The -z options are ELF-only
-                    if tgt_os == "linux" { cc_flags = cc_flags + " -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack"; }
+                    if tgt_os == "linux" {
+                        cc_flags = cc_flags + " -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack";
+                    }
                     if tgt_os == "linux" {
                         var unwind: str = zig_unwind(cc);
-                        if zig_cross { unwind = " -lunwind"; }
+                        if zig_cross {
+                            unwind = " -lunwind";
+                        }
                         cc_cmd = cc + cc_flags + " -lm -lpthread" + unwind + extra_libs;
                     } else if tgt_os == "macos" {
                         cc_cmd = cc + cc_flags + " -lm -lpthread" + extra_libs;
@@ -2320,7 +2534,9 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
             if tgt_os == "windows" && !is_posix_host() {
                 patch_pe_stack(output);
             }
-            if str_len(art_path) > 0 { inc_artifact_put(art_path, output); }
+            if str_len(art_path) > 0 {
+                inc_artifact_put(art_path, output);
+            }
             inc_stamp_commit(stamp_path, build_key, c_hash, input, output);
 
             print("Built native executable: ");
@@ -2402,14 +2618,19 @@ fn cmd_codegen(n: i64, start: i64) -> i64 {
     }
     var mod_result: ResultIrModule = lower_to_ir_module_with_path(source, input, "on");
     match mod_result {
-        ResultIrModule::Err(errors) => { print_errors(errors); return 1; }
+        ResultIrModule::Err(errors) => {
+            print_errors(errors);
+            return 1;
+        }
         ResultIrModule::Ok(ir_mod) => {
-            var l1: L1Module = lower_ir_to_l1(&ir_mod);
-            var l2: L2Module = lower_l1_to_l2(&l1);
-            var l3: L3Module = lower_l2_to_l3(&l2, &ir_mod);
+            var l1: L1Module = lower_ir_to_l1(& ir_mod);
+            var l2: L2Module = lower_l1_to_l2(& l1);
+            var l3: L3Module = lower_l2_to_l3(& l2, & ir_mod);
             if target == "x86-64" || target == "x64" {
                 var asm: str = generate_asm(l3);
-                if do_peephole { asm = peephole_optimize(asm); }
+                if do_peephole {
+                    asm = peephole_optimize(asm);
+                }
                 if str_len(elf_out) > 0 {
                     match emit_object_file(0, asm) {
                         ResultVec::Ok(bytes) => {
@@ -2417,7 +2638,10 @@ fn cmd_codegen(n: i64, start: i64) -> i64 {
                             p_eprint_str("Wrote " + int_to_str(bytes.len()) + " bytes to " + elf_out + "\n");
                             return 0;
                         }
-                        ResultVec::Err(e) => { p_eprint_str("ELF emission error: " + e + "\n"); return 1; }
+                        ResultVec::Err(e) => {
+                            p_eprint_str("ELF emission error: " + e + "\n");
+                            return 1;
+                        }
                     }
                 }
                 if str_len(coff_out) > 0 {
@@ -2427,7 +2651,10 @@ fn cmd_codegen(n: i64, start: i64) -> i64 {
                             p_eprint_str("Wrote " + int_to_str(bytes2.len()) + " bytes to " + coff_out + "\n");
                             return 0;
                         }
-                        ResultVec::Err(e2) => { p_eprint_str("COFF emission error: " + e2 + "\n"); return 1; }
+                        ResultVec::Err(e2) => {
+                            p_eprint_str("COFF emission error: " + e2 + "\n");
+                            return 1;
+                        }
                     }
                 }
                 if str_len(macho_out) > 0 {
@@ -2437,7 +2664,10 @@ fn cmd_codegen(n: i64, start: i64) -> i64 {
                             p_eprint_str("Wrote " + int_to_str(bytes3.len()) + " bytes to " + macho_out + "\n");
                             return 0;
                         }
-                        ResultVec::Err(e3) => { p_eprint_str("Mach-O emission error: " + e3 + "\n"); return 1; }
+                        ResultVec::Err(e3) => {
+                            p_eprint_str("Mach-O emission error: " + e3 + "\n");
+                            return 1;
+                        }
                     }
                 }
                 print(asm);
@@ -2452,7 +2682,10 @@ fn cmd_codegen(n: i64, start: i64) -> i64 {
                             p_eprint_str("Wrote " + int_to_str(barm.len()) + " bytes to " + elf_out + " (ELF64 AArch64)\n");
                             return 0;
                         }
-                        ResultVec::Err(earm) => { p_eprint_str("ELF emission error: " + earm + "\n"); return 1; }
+                        ResultVec::Err(earm) => {
+                            p_eprint_str("ELF emission error: " + earm + "\n");
+                            return 1;
+                        }
                     }
                 }
                 print(asm_arm);
@@ -2467,7 +2700,10 @@ fn cmd_codegen(n: i64, start: i64) -> i64 {
                             p_eprint_str("Wrote " + int_to_str(brv.len()) + " bytes to " + elf_out + " (ELF64 RISC-V)\n");
                             return 0;
                         }
-                        ResultVec::Err(erv) => { p_eprint_str("ELF emission error: " + erv + "\n"); return 1; }
+                        ResultVec::Err(erv) => {
+                            p_eprint_str("ELF emission error: " + erv + "\n");
+                            return 1;
+                        }
                     }
                 }
                 print(asm_rv);
@@ -2503,11 +2739,14 @@ fn cmd_gpu(n: i64, start: i64) -> i64 {
     }
     var mod_result: ResultIrModule = lower_to_ir_module_with_path(source, input, "on");
     match mod_result {
-        ResultIrModule::Err(errors) => { print_errors(errors); return 1; }
+        ResultIrModule::Err(errors) => {
+            print_errors(errors);
+            return 1;
+        }
         ResultIrModule::Ok(ir_mod) => {
-            var l1: L1Module = lower_ir_to_l1(&ir_mod);
-            var l2: L2Module = lower_l1_to_l2(&l1);
-            var l3: L3Module = lower_l2_to_l3(&l2, &ir_mod);
+            var l1: L1Module = lower_ir_to_l1(& ir_mod);
+            var l2: L2Module = lower_l1_to_l2(& l1);
+            var l3: L3Module = lower_l2_to_l3(& l2, & ir_mod);
             if target == "spirv" {
                 if text_mode {
                     var text: str = generate_spirv_text(l3);
@@ -2590,14 +2829,20 @@ fn qualify_rules() -> Vec<str> {
 
 fn qualify_json_list(csv: str, dir: str) -> str {
     var out: str = "[";
-    if str_len(csv) == 0 { return "[]"; }
+    if str_len(csv) == 0 {
+        return "[]";
+    }
     val items: Vec<str> = str_split(csv, ",");
     var i: i64 = 0;
     while i < items.len() {
         val t: str = items.get(i);
-        if i > 0 { out = out + ", "; }
+        if i > 0 {
+            out = out + ", ";
+        }
         var present: str = "false";
-        if c_file_exists(c_path_join(dir, t + ".fd")) { present = "true"; }
+        if c_file_exists(c_path_join(dir, t + ".fd")) {
+            present = "true";
+        }
         out = out + "{\"test\": \"" + t + "\", \"present\": " + present + "}";
         i = i + 1;
     }
@@ -2613,7 +2858,9 @@ fn cmd_qualify(n: i64, start: i64) -> i64 {
     var out_path: str = "";
     var ai: i64 = start + 2;
     while ai + 1 < n {
-        if p_argv(ai) == "-o" { out_path = p_argv(ai + 1); }
+        if p_argv(ai) == "-o" {
+            out_path = p_argv(ai + 1);
+        }
         ai = ai + 1;
     }
     val source: str = c_file_read(input);
@@ -2638,7 +2885,9 @@ fn cmd_qualify(n: i64, start: i64) -> i64 {
                     var anns: str = "";
                     var k: i64 = 0;
                     while k < f.annotations.len() {
-                        if k > 0 { anns = anns + ", "; }
+                        if k > 0 {
+                            anns = anns + ", ";
+                        }
                         anns = anns + "\"@" + f.annotations.get(k).name + "\"";
                         k = k + 1;
                     }
@@ -2646,11 +2895,15 @@ fn cmd_qualify(n: i64, start: i64) -> i64 {
                         var ps: str = "";
                         k = 0;
                         while k < prims.len() {
-                            if k > 0 { ps = ps + ", "; }
+                            if k > 0 {
+                                ps = ps + ", ";
+                            }
                             ps = ps + "\"" + prims.get(k) + "\"";
                             k = k + 1;
                         }
-                        if annotated_count > 0 { annotated = annotated + ",\n"; }
+                        if annotated_count > 0 {
+                            annotated = annotated + ",\n";
+                        }
                         annotated = annotated + "    {\"function\": \"" + f.name + "\", \"annotations\": [" + anns + "], \"rules\": [" + ps + "]}";
                         annotated_count = annotated_count + 1;
                     }
@@ -2673,7 +2926,9 @@ fn cmd_qualify(n: i64, start: i64) -> i64 {
     j = j + "  \"errors\": [";
     var ei: i64 = 0;
     while ei < errors.len() {
-        if ei > 0 { j = j + ", "; }
+        if ei > 0 {
+            j = j + ", ";
+        }
         j = j + "\"" + json_escape_string(errors.get(ei)) + "\"";
         ei = ei + 1;
     }
@@ -2687,8 +2942,12 @@ fn cmd_qualify(n: i64, start: i64) -> i64 {
         val parts: Vec<str> = str_split(rules.get(ri), "|");
         val neg: str = qualify_json_list(parts.get(3), test_dir);
         val pos: str = qualify_json_list(parts.get(4), test_dir);
-        if str_contains(neg, "\"present\": false") || str_len(parts.get(3)) == 0 { missing = missing + 1; }
-        if ri > 0 { j = j + ",\n"; }
+        if str_contains(neg, "\"present\": false") || str_len(parts.get(3)) == 0 {
+            missing = missing + 1;
+        }
+        if ri > 0 {
+            j = j + ",\n";
+        }
         j = j + "    {\"id\": \"" + parts.get(0) + "\", \"rule\": \"" + parts.get(1) + "\", \"requirement\": \"" + json_escape_string(parts.get(2)) + "\", \"negativeTests\": " + neg + ", \"positiveTests\": " + pos + "}";
         ri = ri + 1;
     }
@@ -2703,7 +2962,9 @@ fn cmd_qualify(n: i64, start: i64) -> i64 {
     } else {
         print(j);
     }
-    if checks == "passed" { return 0; }
+    if checks == "passed" {
+        return 0;
+    }
     return 1;
 }
 
@@ -2724,13 +2985,21 @@ fn program_func_is_user(name: str, source: str) -> bool {
 fn audit_module_file(spec: str, from_file: str) -> str {
     var m: str = spec;
     val brace: i64 = str_find(m, "::{");
-    if brace >= 0 { m = str_slice(m, 0, brace); }
+    if brace >= 0 {
+        m = str_slice(m, 0, brace);
+    }
     val rel: str = str_replace(m, "::", "/") + ".fd";
     val local: str = c_path_join(c_path_dirname(from_file), rel);
-    if c_file_exists(local) { return local; }
-    if c_file_exists(rel) { return rel; }
+    if c_file_exists(local) {
+        return local;
+    }
+    if c_file_exists(rel) {
+        return rel;
+    }
     val in_std: str = c_path_join(stdlib_dir(), c_platform_module(str_replace(m, "::", "/")) + ".fd");
-    if c_file_exists(in_std) { return in_std; }
+    if c_file_exists(in_std) {
+        return in_std;
+    }
     return "";
 }
 
@@ -2738,12 +3007,16 @@ fn audit_module_file(spec: str, from_file: str) -> str {
 fn audit_justification(lines: Vec<str>, at: i64) -> str {
     val here: str = lines.get(at);
     val h: i64 = str_find(here, "SAFETY:");
-    if h >= 0 { return str_trim(str_slice(here, h + 7, str_len(here))); }
+    if h >= 0 {
+        return str_trim(str_slice(here, h + 7, str_len(here)));
+    }
     var k: i64 = at - 1;
     while k >= 0 && str_starts_with(str_trim(lines.get(k)), "//") {
         val c: str = lines.get(k);
         val s: i64 = str_find(c, "SAFETY:");
-        if s >= 0 { return str_trim(str_slice(c, s + 7, str_len(c))); }
+        if s >= 0 {
+            return str_trim(str_slice(c, s + 7, str_len(c)));
+        }
         k = k - 1;
     }
     return "";
@@ -2759,8 +3032,12 @@ fn cmd_audit(n: i64, start: i64) -> i64 {
     var strict: bool = false;
     var ai: i64 = start + 2;
     while ai < n {
-        if p_argv(ai) == "--stdlib" { show_std = true; }
-        if p_argv(ai) == "--strict" { strict = true; }
+        if p_argv(ai) == "--stdlib" {
+            show_std = true;
+        }
+        if p_argv(ai) == "--strict" {
+            strict = true;
+        }
         ai = ai + 1;
     }
     if str_len(c_file_read(input)) == 0 {
@@ -2771,7 +3048,9 @@ fn cmd_audit(n: i64, start: i64) -> i64 {
     var files: Vec<str> = Vec::new();
     files.push(input);
     val core_file: str = c_path_join(std_dir, "core.fd");
-    if c_file_exists(core_file) { files.push(core_file); }
+    if c_file_exists(core_file) {
+        files.push(core_file);
+    }
     var mine: i64 = 0;
     var mine_bare: i64 = 0;
     var std_summary: Vec<str> = Vec::new();
@@ -2787,32 +3066,50 @@ fn cmd_audit(n: i64, start: i64) -> i64 {
         while li < lines.len() {
             var code: str = lines.get(li);
             val cm: i64 = str_find(code, "//");
-            if cm >= 0 { code = str_slice(code, 0, cm); }
+            if cm >= 0 {
+                code = str_slice(code, 0, cm);
+            }
             val t: str = str_trim(code);
             if str_starts_with(t, "use ") {
                 val spec: str = str_trim(str_replace(str_slice(t, 4, str_len(t)), ";", ""));
                 val dep: str = audit_module_file(spec, file);
-                if str_len(dep) > 0 && !str_vec_contains(files, dep) { files.push(dep); }
+                if str_len(dep) > 0 && !str_vec_contains(files, dep) {
+                    files.push(dep);
+                }
             }
             val fnat: i64 = str_find(t, "fn ");
             if fnat >= 0 && (fnat == 0 || str_starts_with(t, "pub ") || str_starts_with(t, "@")) {
                 var rest: str = str_slice(t, fnat + 3, str_len(t));
                 val paren: i64 = str_find(rest, "(");
-                if paren > 0 { func = str_trim(str_slice(rest, 0, paren)); }
+                if paren > 0 {
+                    func = str_trim(str_slice(rest, 0, paren));
+                }
             }
             var kind: str = "";
-            if str_contains(t, "unsafe {") || t == "unsafe" { kind = "unsafe block"; }
-            if str_starts_with(t, "@unsafe") { kind = "@unsafe function"; }
-            if str_contains(t, "extern \"C\"") { kind = "extern \"C\""; }
+            if str_contains(t, "unsafe {") || t == "unsafe" {
+                kind = "unsafe block";
+            }
+            if str_starts_with(t, "@unsafe") {
+                kind = "@unsafe function";
+            }
+            if str_contains(t, "extern \"C\"") {
+                kind = "extern \"C\"";
+            }
             if str_len(kind) > 0 {
                 val why: str = audit_justification(lines, li);
                 count = count + 1;
-                if str_len(why) == 0 { bare = bare + 1; }
+                if str_len(why) == 0 {
+                    bare = bare + 1;
+                }
                 if !is_std || show_std {
                     var where_fn: str = "";
-                    if str_len(func) > 0 { where_fn = " in " + func; }
+                    if str_len(func) > 0 {
+                        where_fn = " in " + func;
+                    }
                     var say: str = "no SAFETY: comment";
-                    if str_len(why) > 0 { say = "SAFETY: " + why; }
+                    if str_len(why) > 0 {
+                        say = "SAFETY: " + why;
+                    }
                     print(file + ":" + int_to_str(li + 1) + ": " + kind + where_fn + " - " + say + "\n");
                 }
             }
@@ -2820,8 +3117,7 @@ fn cmd_audit(n: i64, start: i64) -> i64 {
         }
         if is_std {
             if count > 0 && !show_std {
-                std_summary.push(str_slice(file, str_len(std_dir) + 1, str_len(file)) + " " + int_to_str(count)
-                    + " (" + int_to_str(bare) + " without SAFETY:)");
+                std_summary.push(str_slice(file, str_len(std_dir) + 1, str_len(file)) + " " + int_to_str(count) + " (" + int_to_str(bare) + " without SAFETY:)");
             }
         } else {
             mine = mine + count;
@@ -2833,14 +3129,18 @@ fn cmd_audit(n: i64, start: i64) -> i64 {
         print("stdlib (--stdlib lists them): ");
         var si: i64 = 0;
         while si < std_summary.len() {
-            if si > 0 { print(", "); }
+            if si > 0 {
+                print(", ");
+            }
             print(std_summary.get(si));
             si = si + 1;
         }
         print("\n");
     }
     print(int_to_str(mine) + " unsafe site(s) outside the stdlib, " + int_to_str(mine_bare) + " without a SAFETY: comment\n");
-    if strict && mine_bare > 0 { return 1; }
+    if strict && mine_bare > 0 {
+        return 1;
+    }
     return 0;
 }
 
@@ -2859,9 +3159,12 @@ fn cmd_verify(n: i64, start: i64) -> i64 {
     }
     var mod_result: ResultIrModule = lower_to_ir_module_with_path(source, input, "on");
     match mod_result {
-        ResultIrModule::Err(errors) => { print_errors(errors); return 1; }
+        ResultIrModule::Err(errors) => {
+            print_errors(errors);
+            return 1;
+        }
         ResultIrModule::Ok(ir_mod) => {
-            var result: VerificationResult = IrModule_verify(&ir_mod);
+            var result: VerificationResult = IrModule_verify(& ir_mod);
             var wi: i64 = 0;
             while wi < result.warnings.len() {
                 p_eprint_str("warning: " + result.warnings.get(wi) + "\n");
@@ -2872,7 +3175,7 @@ fn cmd_verify(n: i64, start: i64) -> i64 {
                 p_eprint_str("error: " + result.errors.get(ei) + "\n");
                 ei = ei + 1;
             }
-            if VerificationResult_is_valid(&result) {
+            if VerificationResult_is_valid(& result) {
                 print("IR verification passed (" + int_to_str(result.warnings.len()) + " warnings)\n");
                 return 0;
             }
@@ -2900,13 +3203,16 @@ fn cmd_sourcemap(n: i64, start: i64) -> i64 {
     }
     var mod_result: ResultIrModule = lower_to_ir_module_with_path(source, input, "on");
     match mod_result {
-        ResultIrModule::Err(errors) => { print_errors(errors); return 1; }
+        ResultIrModule::Err(errors) => {
+            print_errors(errors);
+            return 1;
+        }
         ResultIrModule::Ok(ir_mod) => {
-            var sm: SourceMap = IrModule_source_map(&ir_mod);
+            var sm: SourceMap = IrModule_source_map(& ir_mod);
             if sm.entries.len() == 0 {
                 print("Source map is empty (no source line info available).\n");
             } else {
-                print(SourceMap_to_str(&sm));
+                print(SourceMap_to_str(& sm));
             }
             return 0;
         }
@@ -2931,10 +3237,16 @@ fn cmd_parse_header(n: i64, start: i64) -> i64 {
     var base: str = input;
     var slash: i64 = str_rfind_char(input, 47);
     var bslash: i64 = str_rfind_char(input, 92);
-    if bslash > slash { slash = bslash; }
-    if slash >= 0 { base = str_slice(input, slash + 1, str_len(input)); }
+    if bslash > slash {
+        slash = bslash;
+    }
+    if slash >= 0 {
+        base = str_slice(input, slash + 1, str_len(input));
+    }
     var stem: str = base;
-    if str_ends_with(stem, ".h") { stem = str_slice(stem, 0, str_len(stem) - 2); }
+    if str_ends_with(stem, ".h") {
+        stem = str_slice(stem, 0, str_len(stem) - 2);
+    }
     // --link <lib>: the library of the extern block (default: the header's name)
     var link: str = get_flag_value(n, start, "--link", stem);
     // With -o x.fd the bindings are module x (usable with `use x;`)
@@ -2943,9 +3255,15 @@ fn cmd_parse_header(n: i64, start: i64) -> i64 {
         module_name = output;
         var os: i64 = str_rfind_char(module_name, 47);
         var ob: i64 = str_rfind_char(module_name, 92);
-        if ob > os { os = ob; }
-        if os >= 0 { module_name = str_slice(module_name, os + 1, str_len(module_name)); }
-        if str_ends_with(module_name, ".fd") { module_name = str_slice(module_name, 0, str_len(module_name) - 3); }
+        if ob > os {
+            os = ob;
+        }
+        if os >= 0 {
+            module_name = str_slice(module_name, os + 1, str_len(module_name));
+        }
+        if str_ends_with(module_name, ".fd") {
+            module_name = str_slice(module_name, 0, str_len(module_name) - 3);
+        }
     }
     var bindings: str = cparse_header_file(input, link, module_name);
     if str_len(output) > 0 {
@@ -2966,21 +3284,29 @@ fn lw_keep_set(program: Program) -> i64 {
     match g_stdlib_cache {
         OptProgram::Some(cp) => {
             var i: i64 = 0;
-            while i < cp.funcs.len() { core_names.push(cp.funcs.get(i).name); i = i + 1; }
+            while i < cp.funcs.len() {
+                core_names.push(cp.funcs.get(i).name);
+                i = i + 1;
+            }
             i = 0;
             while i < cp.impls.len() {
                 var im: ImplDef = cp.impls.get(i);
                 var j: i64 = 0;
-                while j < im.methods.len() { core_names.push(im.struct_name + "_" + im.methods.get(j).name); j = j + 1; }
+                while j < im.methods.len() {
+                    core_names.push(im.struct_name + "_" + im.methods.get(j).name);
+                    j = j + 1;
+                }
                 i = i + 1;
             }
         }
-        OptProgram::None => { return 0; }
+        OptProgram::None => {
+            return 0;
+        }
     }
     return reach_keep_set(program, core_names);
 }
 
-fn nat_verified(m: &IrModule, stage: str) -> bool {
+fn nat_verified(m: & IrModule, stage: str) -> bool {
     var errs: Vec<str> = ir_verify(m, stage);
     var i: i64 = 0;
     while i < errs.len() {
@@ -2992,7 +3318,9 @@ fn nat_verified(m: &IrModule, stage: str) -> bool {
 
 fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
     var t_start: i64 = p_clock_now_ms();
-    if has_flag(n, start, "--time") { set_time_on(); }
+    if has_flag(n, start, "--time") {
+        set_time_on();
+    }
     if start + 2 > n {
         print("Usage: fid build <file.fd> [-o output] [--target <triple>] [--no-opt] [--lto] [--caps <list>]\n");
         return 1;
@@ -3009,7 +3337,9 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
     // --debug (SP13): fastest correct build — no mid-end at all
     // (iropt, rules and the e-graph all skipped), default codegen.
     var debug_mode: bool = has_flag(n, start, "--debug");
-    if debug_mode { do_opt = false; }
+    if debug_mode {
+        do_opt = false;
+    }
     // --lto: enable link-time optimization
     var do_lto: bool = has_flag(n, start, "--lto");
     // --native: use native backend (ELF64/PE) instead of C codegen
@@ -3017,7 +3347,9 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
     // --bare: bare-metal mode (skip stdlib, flat binary)
     var bare_mode: bool = has_flag(n, start, "--bare");
     // --checked-alloc: native blocks on pages of their own (release M7)
-    if has_flag(n, start, "--checked-alloc") { g_pe_checked_alloc = true; }
+    if has_flag(n, start, "--checked-alloc") {
+        g_pe_checked_alloc = true;
+    }
     // --boot: multiboot2 boot mode (skip stdlib, generate boot binary)
     var boot_mode: bool = has_flag(n, start, "--boot");
     // Release G1/G4: `--boot` is the bootable bare image (Multiboot 1 and 2,
@@ -3048,7 +3380,9 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
         var ci: i64 = 0;
         while ci < cap_parts.len() {
             var cap_name: str = str_trim(cap_parts.get(ci));
-            if str_len(cap_name) > 0 { granted_caps.push(cap_name); }
+            if str_len(cap_name) > 0 {
+                granted_caps.push(cap_name);
+            }
             ci = ci + 1;
         }
     }
@@ -3067,9 +3401,17 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
     p_eprint_str("[build] Target: ");
     p_eprint_str(target);
     p_eprint_str(", opt: ");
-    if do_opt { p_eprint_str("on"); } else { p_eprint_str("off"); }
+    if do_opt {
+        p_eprint_str("on");
+    } else {
+        p_eprint_str("off");
+    }
     p_eprint_str(", lto: ");
-    if do_lto { p_eprint_str("on"); } else { p_eprint_str("off"); }
+    if do_lto {
+        p_eprint_str("on");
+    } else {
+        p_eprint_str("off");
+    }
     p_eprint_str("\n");
     if str_len(caps) > 0 {
         p_eprint_str("[build] Caps: ");
@@ -3107,9 +3449,9 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                 var t_lw: i64 = p_clock_now_ms();
                 var ir_mod: IrModule = lower(program);
                 p_eprint_str("[prof] lower: " + int_to_str(p_clock_now_ms() - t_lw) + "ms\n");
-                var l1: L1Module = lower_ir_to_l1(&ir_mod);
-                var l2: L2Module = lower_l1_to_l2(&l1);
-                var l3: L3Module = lower_l2_to_l3(&l2, &ir_mod);
+                var l1: L1Module = lower_ir_to_l1(& ir_mod);
+                var l2: L2Module = lower_l1_to_l2(& l1);
+                var l3: L3Module = lower_l2_to_l3(& l2, & ir_mod);
                 p_eprint_str("[build] Generating boot binary...\n");
                 var bin: Vec = generate_boot_binary(ir_mod, l3);
                 p_file_write_vec(output, bin);
@@ -3189,7 +3531,9 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                     var hai: i64 = 0;
                     while hai < hf.annotations.len() {
                         var an: str = hf.annotations.get(hai).name;
-                        if an == "panic_handler" || an == "@panic_handler" { handler = hf.name; }
+                        if an == "panic_handler" || an == "@panic_handler" {
+                            handler = hf.name;
+                        }
                         hai = hai + 1;
                     }
                     hfi = hfi + 1;
@@ -3201,7 +3545,9 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                 p_eprint_str("[build] Generating flat binary (pe_ir)...\n");
                 var bin: Vec = Vec::new();
                 match pe_ir_generate_flat(ir_mod, handler) {
-                    ResultBytes::Ok(b) => { bin = b; }
+                    ResultBytes::Ok(b) => {
+                        bin = b;
+                    }
                     ResultBytes::Err(errs) => {
                         print("Compilation errors:\n");
                         var bei: i64 = 0;
@@ -3235,38 +3581,56 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
     // static ELF. `--target aarch64-linux` / `riscv64-linux`; `--native`
     // with `--target arm64|riscv64` (the old PIR path) comes here too.
     var nat_arch: i64 = 0;
-    if str_contains(target, "linux") || str_contains(target, "macos") || use_native { nat_arch = nat_target_arch(target); }
+    if str_contains(target, "linux") || str_contains(target, "macos") || use_native {
+        nat_arch = nat_target_arch(target);
+    }
     // `--nat`: Windows x64 through the same layer (a PE; the Linux runtime
     // over kernel32, stdlib/linux_runtime/win.fd). pe_ir stays the default.
-    var nat_win: bool = has_flag(n, start, "--nat")
-        && (target == "" || str_contains(target, "windows") || (!is_posix_host() && !str_contains(target, "linux")));
-    if nat_win { nat_arch = nat_target_arch("x86_64"); }
+    var nat_win: bool = has_flag(n, start, "--nat") && (target == "" || str_contains(target, "windows") || (!is_posix_host() && !str_contains(target, "linux")));
+    if nat_win {
+        nat_arch = nat_target_arch("x86_64");
+    }
     // `--target aarch64-macos|x86_64-macos` (F7): a Mach-O; the Linux
     // runtime over libSystem (stdlib/linux_runtime/darwin.fd).
     var nat_mac: bool = str_contains(target, "macos");
     if nat_arch != 0 && !bare_mode && !boot_mode {
         var nat_out: str = find_output_arg(n, start, "a.out");
-        if nat_win { nat_out = ensure_exe_extension(find_output_arg(n, start, "a.exe")); }
+        if nat_win {
+            nat_out = ensure_exe_extension(find_output_arg(n, start, "a.exe"));
+        }
         // --cpu <name> (TG10): the microarchitecture of the target, safe
         // default per target (nat_cpu_default); --stats (RA17): per-function
         // spill/reload/move counts on stderr.
         var cpu_arg: str = get_flag_value(n, start, "--cpu", "");
         if str_len(cpu_arg) > 0 {
             var cpu_err: str = nat_cpu_check(nat_arch, cpu_arg);
-            if str_len(cpu_err) > 0 { print(cpu_err + "\n"); return 1; }
+            if str_len(cpu_err) > 0 {
+                print(cpu_err + "\n");
+                return 1;
+            }
             g_nat_cpu = cpu_arg;
         }
-        if has_flag(n, start, "--stats") { g_nat_stats = true; }
+        if has_flag(n, start, "--stats") {
+            g_nat_stats = true;
+        }
         set_native_runtime("linux_runtime");
         g_native_rt_win = nat_win;
         g_native_rt_mac = nat_mac;
         // @cfg sees the target, not the host
         g_cfg_os = "linux";
-        if nat_win { g_cfg_os = "windows"; }
-        if nat_mac { g_cfg_os = "macos"; }
-        if str_contains(target, "riscv") { g_cfg_arch = "riscv64"; }
-        else if nat_arch == nat_target_arch("x86_64") { g_cfg_arch = "x86_64"; }
-        else { g_cfg_arch = "aarch64"; }
+        if nat_win {
+            g_cfg_os = "windows";
+        }
+        if nat_mac {
+            g_cfg_os = "macos";
+        }
+        if str_contains(target, "riscv") {
+            g_cfg_arch = "riscv64";
+        } else if nat_arch == nat_target_arch("x86_64") {
+            g_cfg_arch = "x86_64";
+        } else {
+            g_cfg_arch = "aarch64";
+        }
         var nat_prog: ResultProgram = build_program_with_path_borrowck(source, OptStr::Some(input), g_borrowck);
         t_run = time_mark("front end", t_run);
         match nat_prog {
@@ -3288,11 +3652,15 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                     ParseResultProgram::Ok(nl_prog) => {
                         var nl_names: Vec<str> = Vec::new();
                         var nli: i64 = 0;
-                        while nli < nl_prog.funcs.len() { nl_names.push(nl_prog.funcs.get(nli).name); nli = nli + 1; }
+                        while nli < nl_prog.funcs.len() {
+                            nl_names.push(nl_prog.funcs.get(nli).name);
+                            nli = nli + 1;
+                        }
                         g_nat_lines_names = str_join(nl_names, ",");
                         g_nat_lines_file = input;
                     }
-                    ParseResultProgram::Err(_) => {}
+                    ParseResultProgram::Err(_) => {
+                    }
                 }
                 t_run = time_mark("line-table reparse", t_run);
                 p_eprint_str("[build] Lowering to IR...\n");
@@ -3305,30 +3673,42 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                 // after each stage with FID_VERIFY=1
                 var nat_verify: bool = str_len(env_or_empty("FID_VERIFY")) > 0;
                 var nat_t0: i64 = p_clock_now_ms();
-                if nat_verify && !nat_verified(&nat_mod, "after lowering") { return 1; }
-                var nat_rr: Vec<i64> = Vec::new();
-                nat_rr.push(0); nat_rr.push(0);
-                var nat_eg: Vec<i64> = Vec::new();
-                nat_eg.push(0); nat_eg.push(0);
-                if !debug_mode {
-                    iropt_native(&mut nat_mod);
-                    t_run = time_mark("iropt", t_run);
-                    if nat_verify && !nat_verified(&nat_mod, "after iropt") { return 1; }
-                    nat_rr = rules_run(&mut nat_mod);
-                    t_run = time_mark("rules", t_run);
-                    if nat_verify && !nat_verified(&nat_mod, "after rules") { return 1; }
-                    nat_eg = egraph_run(&mut nat_mod);
-                    t_run = time_mark("egraph", t_run);
-                    if nat_verify && !nat_verified(&nat_mod, "after the e-graph") { return 1; }
+                if nat_verify && !nat_verified(& nat_mod, "after lowering") {
+                    return 1;
                 }
-                p_eprint_str("[prof] native mid-end: " + int_to_str(p_clock_now_ms() - nat_t0) + "ms, "
-                    + int_to_str(nat_rr.get(0)) + " rewritten by rules, " + int_to_str(nat_rr.get(1)) + " pure calls merged, "
-                    + int_to_str(nat_eg.get(0)) + " loads forwarded, " + int_to_str(nat_eg.get(1)) + " rewritten by the e-graph\n");
+                var nat_rr: Vec<i64> = Vec::new();
+                nat_rr.push(0);
+                nat_rr.push(0);
+                var nat_eg: Vec<i64> = Vec::new();
+                nat_eg.push(0);
+                nat_eg.push(0);
+                if !debug_mode {
+                    iropt_native(& mut nat_mod);
+                    t_run = time_mark("iropt", t_run);
+                    if nat_verify && !nat_verified(& nat_mod, "after iropt") {
+                        return 1;
+                    }
+                    nat_rr = rules_run(& mut nat_mod);
+                    t_run = time_mark("rules", t_run);
+                    if nat_verify && !nat_verified(& nat_mod, "after rules") {
+                        return 1;
+                    }
+                    nat_eg = egraph_run(& mut nat_mod);
+                    t_run = time_mark("egraph", t_run);
+                    if nat_verify && !nat_verified(& nat_mod, "after the e-graph") {
+                        return 1;
+                    }
+                }
+                p_eprint_str("[prof] native mid-end: " + int_to_str(p_clock_now_ms() - nat_t0) + "ms, " + int_to_str(nat_rr.get(0)) + " rewritten by rules, " + int_to_str(nat_rr.get(1)) + " pure calls merged, " + int_to_str(nat_eg.get(0)) + " loads forwarded, " + int_to_str(nat_eg.get(1)) + " rewritten by the e-graph\n");
                 p_eprint_str("[build] Native Linux code generation...\n");
                 var nat_res: ResultBytes = ResultBytes::Err(Vec::new());
-                if nat_win { nat_res = nat_generate_pe(nat_mod); }
-                else if nat_mac { nat_res = nat_generate_macho(nat_mod, nat_arch); }
-                else { nat_res = nat_generate_elf(nat_mod, nat_arch); }
+                if nat_win {
+                    nat_res = nat_generate_pe(nat_mod);
+                } else if nat_mac {
+                    nat_res = nat_generate_macho(nat_mod, nat_arch);
+                } else {
+                    nat_res = nat_generate_elf(nat_mod, nat_arch);
+                }
                 t_run = time_mark("native code", t_run);
                 match nat_res {
                     ResultBytes::Err(gerrs) => {
@@ -3342,7 +3722,9 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                     }
                     ResultBytes::Ok(nat_bytes) => {
                         p_file_write_vec(nat_out, nat_bytes);
-                        if is_posix_host() { p_system("chmod +x '" + nat_out + "' 2>/dev/null"); }
+                        if is_posix_host() {
+                            p_system("chmod +x '" + nat_out + "' 2>/dev/null");
+                        }
                         t_run = time_mark("write", t_run);
                         time_mark("total", t_start);
                         time_report();
@@ -3357,9 +3739,10 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
     // Windows default: emit a PE .exe directly via the pe_ir backend
     // (native, no C compiler). The pe_runtime sources must be merged into
     // the program, so the flag is set before build_program below.
-    var windows_pe: bool = !is_posix_host() && !bare_mode && !boot_mode && !use_native
-        && target != "arm64" && target != "aarch64" && target != "riscv64";
-    if windows_pe { set_pe_runtime_merge(true); }
+    var windows_pe: bool = !is_posix_host() && !bare_mode && !boot_mode && !use_native && target != "arm64" && target != "aarch64" && target != "riscv64";
+    if windows_pe {
+        set_pe_runtime_merge(true);
+    }
 
     // Incremental build: skip all work when no input changed.
     var stamp_path: str = output + ".fides-stamp";
@@ -3367,8 +3750,7 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
     if windows_pe {
         build_key = inc_build_key("emit", n, start);
         var stamp: IncStamp = inc_stamp_read(stamp_path);
-        if !has_flag(n, start, "--no-cache") && str_len(env_or_empty("FIDES_NO_CACHE")) == 0
-            && inc_up_to_date(stamp, build_key, output) {
+        if !has_flag(n, start, "--no-cache") && str_len(env_or_empty("FIDES_NO_CACHE")) == 0 && inc_up_to_date(stamp, build_key, output) {
             time_mark("total", t_start);
             time_report();
             print(output + " is up to date\n");
@@ -3395,7 +3777,9 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
             p_eprint_str("[build] Lowering to IR...\n");
             var t_lw: i64 = p_clock_now_ms();
             // pe_ir lowers only what the program can reach (compiler/reach.fd)
-            if windows_pe { g_lower_keep = lw_keep_set(program); }
+            if windows_pe {
+                g_lower_keep = lw_keep_set(program);
+            }
             var ir_mod: IrModule = lower(program);
             g_lower_keep = 0;
             t_run = time_mark("lower", t_run);
@@ -3406,11 +3790,17 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                 // Inlining and folding before machine code (release D5, D6)
                 var t_io: i64 = p_clock_now_ms();
                 var pe_verify: bool = str_len(env_or_empty("FID_VERIFY")) > 0;
-                if pe_verify && !nat_verified(&ir_mod, "after lowering") { return 1; }
-                if do_opt { iropt_native(&mut ir_mod); }
+                if pe_verify && !nat_verified(& ir_mod, "after lowering") {
+                    return 1;
+                }
+                if do_opt {
+                    iropt_native(& mut ir_mod);
+                }
                 t_run = time_mark("iropt", t_run);
                 p_eprint_str("[prof] iropt: " + int_to_str(p_clock_now_ms() - t_io) + "ms\n");
-                if pe_verify && !nat_verified(&ir_mod, "after iropt") { return 1; }
+                if pe_verify && !nat_verified(& ir_mod, "after iropt") {
+                    return 1;
+                }
                 p_eprint_str("[build] Emitting PE via pe_ir backend...\n");
                 var t_pe: i64 = p_clock_now_ms();
                 var pe_res: ResultBytes = pe_ir_generate_pe(ir_mod);
@@ -3473,7 +3863,7 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
             if is_posix_host() {
                 p_eprint_str("[build] Using C codegen (Linux)...\n");
                 var cgen: CCodeGen = CCodeGen_new();
-                var c_source: str = CCodeGen_generate(&mut cgen, ir_mod);
+                var c_source: str = CCodeGen_generate(& mut cgen, ir_mod);
                 var c_file: str = output + ".c";
                 p_file_write(c_file, c_source);
                 // Try gcc first, then clang
@@ -3556,7 +3946,6 @@ fn print_usage() {
     p_eprint_str("  fid sourcemap <file.fd>             Show IR-to-source mapping\n");
     p_eprint_str("  fid parse-header <file.h> [-o <fd>] [--link <lib>] FFI bindings from a C header\n");
 }
-
 
 // --- cmd_parse_header ----------------------------------------------------
 // Parse a C header file and emit Fides FFI bindings to stdout.

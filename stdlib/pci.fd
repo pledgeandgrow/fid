@@ -4,10 +4,8 @@
 // list. Actual port/ECAM reads are platform code (CF8/CFC or the MCFG
 // window from acpi.fd).
 module pci;
-
-use vec;
-
-pub fn pci_u16(c: Vec<i64>, o: i64) -> i64 {
+ use vec;
+ pub fn pci_u16(c: Vec<i64>, o: i64) -> i64 {
     return c.get(o) + c.get(o + 1) * 256;
 }
 pub fn pci_u32(c: Vec<i64>, o: i64) -> i64 {
@@ -15,16 +13,36 @@ pub fn pci_u32(c: Vec<i64>, o: i64) -> i64 {
 }
 
 // Standard header fields.
-pub fn pci_vendor(c: Vec<i64>) -> i64 { return pci_u16(c, 0); }
-pub fn pci_device(c: Vec<i64>) -> i64 { return pci_u16(c, 2); }
-pub fn pci_command(c: Vec<i64>) -> i64 { return pci_u16(c, 4); }
-pub fn pci_status(c: Vec<i64>) -> i64 { return pci_u16(c, 6); }
-pub fn pci_revision(c: Vec<i64>) -> i64 { return c.get(8); }
-pub fn pci_progif(c: Vec<i64>) -> i64 { return c.get(9); }
-pub fn pci_subclass(c: Vec<i64>) -> i64 { return c.get(10); }
-pub fn pci_class(c: Vec<i64>) -> i64 { return c.get(11); }
-pub fn pci_header_type(c: Vec<i64>) -> i64 { return c.get(14) & 0x7F; }
-pub fn pci_multifunction(c: Vec<i64>) -> bool { return (c.get(14) & 0x80) != 0; }
+pub fn pci_vendor(c: Vec<i64>) -> i64 {
+    return pci_u16(c, 0);
+}
+pub fn pci_device(c: Vec<i64>) -> i64 {
+    return pci_u16(c, 2);
+}
+pub fn pci_command(c: Vec<i64>) -> i64 {
+    return pci_u16(c, 4);
+}
+pub fn pci_status(c: Vec<i64>) -> i64 {
+    return pci_u16(c, 6);
+}
+pub fn pci_revision(c: Vec<i64>) -> i64 {
+    return c.get(8);
+}
+pub fn pci_progif(c: Vec<i64>) -> i64 {
+    return c.get(9);
+}
+pub fn pci_subclass(c: Vec<i64>) -> i64 {
+    return c.get(10);
+}
+pub fn pci_class(c: Vec<i64>) -> i64 {
+    return c.get(11);
+}
+pub fn pci_header_type(c: Vec<i64>) -> i64 {
+    return c.get(14) & 0x7F;
+}
+pub fn pci_multifunction(c: Vec<i64>) -> bool {
+    return (c.get(14) & 0x80) != 0;
+}
 
 /// True when the config space is a present device (not all-ones).
 pub fn pci_present(c: Vec<i64>) -> bool {
@@ -37,21 +55,27 @@ pub fn pci_present(c: Vec<i64>) -> bool {
 
 pub struct PciBar {
     pub present: bool,
-    pub is_io: bool,       // I/O-space BAR (bit 0 = 1)
-    pub is64: bool,        // 64-bit memory BAR (bits 2:1 = 10)
+    pub is_io: bool,
+    // I/O-space BAR (bit 0 = 1)
+    pub is64: bool,
+    // 64-bit memory BAR (bits 2:1 = 10)
     pub prefetch: bool,
-    pub addr: i64,         // base address, flags masked off (low 32 bits)
-    pub hi: i64,           // raw next dword for 64-bit BARs
+    pub addr: i64,
+    // base address, flags masked off (low 32 bits)
+    pub hi: i64,  // raw next dword for 64-bit BARs
 }
 
 /// Decode BAR k of a type-0 header. For 64-bit BARs the caller must skip
 /// the following BAR index — hi carries its dword.
 pub fn pci_bar(c: Vec<i64>, k: i64) -> PciBar {
-    var b: PciBar = PciBar{present: false, is_io: false, is64: false,
-        prefetch: false, addr: 0, hi: 0};
+    var b: PciBar = PciBar {
+        present: false, is_io: false, is64: false, prefetch: false, addr: 0, hi: 0
+    };
     var o: i64 = 16 + k * 4;
     var v: i64 = pci_u32(c, o);
-    if v == 0 { return b; }
+    if v == 0 {
+        return b;
+    }
     b.present = true;
     if (v & 1) != 0 {
         b.is_io = true;
@@ -61,7 +85,9 @@ pub fn pci_bar(c: Vec<i64>, k: i64) -> PciBar {
         b.is64 = kind == 2;
         b.prefetch = (v & 8) != 0;
         b.addr = v & 0xFFFFFFF0;
-        if b.is64 { b.hi = pci_u32(c, o + 4); }
+        if b.is64 {
+            b.hi = pci_u32(c, o + 4);
+        }
     }
     return b;
 }
@@ -69,13 +95,19 @@ pub fn pci_bar(c: Vec<i64>, k: i64) -> PciBar {
 /// Probed size of memory BAR k: caller writes all-ones to the BAR, reads
 /// it back as `sized`, then restores. Returns mask-derived size, 0 when
 /// the BAR reports no size. (Driver-side helper for after the probe.)
-@wrapping
-pub fn pci_bar_size(sized: i64, is_io: bool) -> i64 {
+@wrapping pub fn pci_bar_size(sized: i64, is_io: bool) -> i64 {
     var mask: i64 = 0;
-    if is_io { mask = 0xFFFFFFFC; } else { mask = 0xFFFFFFF0; }
+    if is_io {
+        mask = 0xFFFFFFFC;
+    } else {
+        mask = 0xFFFFFFF0;
+    }
     var m: i64 = sized & mask;
-    if m == 0 { return 0; }
-    return 4294967296 - m;                  // two's complement, 32-bit
+    if m == 0 {
+        return 0;
+    }
+    return 4294967296 - m;
+    // two's complement, 32-bit
 }
 
 // --- capabilities -----------------------------------------------------------
@@ -86,7 +118,9 @@ pub fn pci_bar_size(sized: i64, is_io: bool) -> i64 {
 /// encoded id*256+offset.
 pub fn pci_caps(c: Vec<i64>) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
-    if (pci_status(c) & 0x10) == 0 { return out; }
+    if (pci_status(c) & 0x10) == 0 {
+        return out;
+    }
     var p: i64 = c.get(0x34) & 0xFC;
     var tries: i64 = 0;
     while p != 0 && tries < 48 {
@@ -104,10 +138,12 @@ pub fn pci_cap_offset(c: Vec<i64>, want: i64) -> i64 {
     var i: i64 = 0;
     while i < caps.len() {
         var e: i64 = caps.get(i);
-        if e / 256 == want { return e % 256; }
+        if e / 256 == want {
+            return e % 256;
+        }
         i = i + 1;
     }
-    return -1;
+    return - 1;
 }
 
 // --- legacy CF8/CFC address (port I/O done by the OS) ------------------------

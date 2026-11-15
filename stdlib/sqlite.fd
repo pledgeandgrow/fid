@@ -23,9 +23,7 @@
 // system.
 
 module sqlite;
-
-use json;
-
+ use json;
 // ─── FFI declarations: bind to the SQLite3 C library ───
 //
 // We declare the subset of the SQLite C API needed for basic database
@@ -38,28 +36,16 @@ use json;
 extern "C" link "sqlite3" {
     // Opening / closing a database connection
     // sqlite3_open(filename, &ppDb) -> int (SQLITE_OK=0 on success)
-    fn sqlite3_open as p_sqlite3_open(filename: str, ppDb: *i64) -> i64;
+    fn sqlite3_open as p_sqlite3_open(filename: str, ppDb: * i64) -> i64;
     fn sqlite3_close as p_sqlite3_close(db: i64) -> i64;
 
     // One-shot exec: execute SQL without results
     // sqlite3_exec(db, sql, callback, arg, &errmsg) -> int
-    fn sqlite3_exec as p_sqlite3_exec(
-        db: i64,
-        sql: str,
-        callback: i64,
-        arg: i64,
-        errmsg: *i64
-    ) -> i64;
+    fn sqlite3_exec as p_sqlite3_exec(db: i64, sql: str, callback: i64, arg: i64, errmsg: * i64) -> i64;
 
     // Prepared statements
     // sqlite3_prepare_v2(db, sql, nByte, &ppStmt, &tail) -> int
-    fn sqlite3_prepare_v2 as p_sqlite3_prepare_v2(
-        db: i64,
-        sql: str,
-        nByte: i64,
-        ppStmt: *i64,
-        tail: *i64
-    ) -> i64;
+    fn sqlite3_prepare_v2 as p_sqlite3_prepare_v2(db: i64, sql: str, nByte: i64, ppStmt: * i64, tail: * i64) -> i64;
     fn sqlite3_step as p_sqlite3_step(stmt: i64) -> i64;
     fn sqlite3_bind_text as p_sqlite3_bind_text(stmt: i64, index: i64, text: str, size: i64, destructor: i64) -> i64;
     fn sqlite3_finalize as p_sqlite3_finalize(stmt: i64) -> i64;
@@ -96,15 +82,7 @@ extern "C" link "sqlite3" {
 //
 // These mirror the SQLITE_* return code constants from sqlite3.h.
 
-const SQLITE_OK: i64 = 0;
-const SQLITE_ROW: i64 = 100;
-const SQLITE_DONE: i64 = 101;
-const SQLITE_INTEGER: i64 = 1;
-const SQLITE_FLOAT: i64 = 2;
-const SQLITE_TEXT: i64 = 3;
-const SQLITE_BLOB: i64 = 4;
-const SQLITE_NULL: i64 = 5;
-
+const SQLITE_OK: i64 = 0; const SQLITE_ROW: i64 = 100; const SQLITE_DONE: i64 = 101; const SQLITE_INTEGER: i64 = 1; const SQLITE_FLOAT: i64 = 2; const SQLITE_TEXT: i64 = 3; const SQLITE_BLOB: i64 = 4; const SQLITE_NULL: i64 = 5;
 // ─── SQLite connection struct ───
 
 /// A connection to a SQLite database file.
@@ -119,7 +97,7 @@ impl SQLite {
     /// Returns a SQLite connection on success.
     pub fn open(path: str) -> SQLite {
         var handle: i64 = 0;
-        var rc = p_sqlite3_open(path, &handle);
+        var rc = p_sqlite3_open(path, & handle);
         if rc != SQLITE_OK {
             // If open failed, the handle may still be valid for getting
             // the error message. If handle is 0, use a generic error.
@@ -130,7 +108,9 @@ impl SQLite {
             }
             p_panic(msg);
         }
-        return SQLite { handle: handle };
+        return SQLite {
+            handle: handle
+        };
     }
 
     /// Open an in-memory SQLite database (use ":memory:" as path).
@@ -150,7 +130,7 @@ impl SQLite {
     /// Execute a SELECT query and return results as a JSON array string.
     /// Each row is a JSON object with column names as keys.
     /// Example: [{"id":1,"name":"Alice"},{"id":2,"name":"Bob"}]
-    pub fn query(self: SQLite, sql: str) -> str {
+    pub fn query (self: SQLite, sql: str) -> str {
         var none: Vec<str> = Vec::new();
         return self.query_params(sql, none);
     }
@@ -162,7 +142,7 @@ impl SQLite {
         // Out-parameters are word slots: `&s` of a str is the (borrowed)
         // string itself, so SQLite would write its pointer over the text
         var tail: i64 = 0;
-        var rc = p_sqlite3_prepare_v2(self.handle, sql, -1, &stmt, &tail);
+        var rc = p_sqlite3_prepare_v2(self.handle, sql, - 1, & stmt, & tail);
         if rc != SQLITE_OK {
             var msg = p_sqlite3_errmsg(self.handle);
             p_panic(msg);
@@ -170,7 +150,7 @@ impl SQLite {
         var bound: i64 = 0;
         while bound < params.len() {
             // -1: SQLITE_TRANSIENT, SQLite takes its own copy
-            if p_sqlite3_bind_text(stmt, bound + 1, params.get(bound), -1, -1) != SQLITE_OK {
+            if p_sqlite3_bind_text(stmt, bound + 1, params.get(bound), - 1, - 1) != SQLITE_OK {
                 p_panic(p_sqlite3_errmsg(self.handle));
             }
             bound = bound + 1;
@@ -231,7 +211,7 @@ impl SQLite {
     /// Returns the number of rows affected.
     pub fn exec(self: SQLite, sql: str) -> i64 {
         var errmsg: i64 = 0;
-        var rc = p_sqlite3_exec(self.handle, sql, 0, 0, &errmsg);
+        var rc = p_sqlite3_exec(self.handle, sql, 0, 0, & errmsg);
         if rc != SQLITE_OK {
             var msg: str = "";
             if errmsg != 0 {
@@ -284,15 +264,20 @@ fn json_escape(s: str) -> str {
     var len = str_len(s);
     while i < len {
         var ch = str_byte_at(s, i);
-        if ch == 34 {        // "
+        if ch == 34 {
+            // "
             result = result + "\\\"";
-        } else if ch == 92 { // backslash
+        } else if ch == 92 {
+            // backslash
             result = result + "\\\\";
-        } else if ch == 10 { // newline
+        } else if ch == 10 {
+            // newline
             result = result + "\\n";
-        } else if ch == 13 { // carriage return
+        } else if ch == 13 {
+            // carriage return
             result = result + "\\r";
-        } else if ch == 9 {  // tab
+        } else if ch == 9 {
+            // tab
             result = result + "\\t";
         } else if ch < 32 {
             // Control character — escape as \uXXXX
@@ -311,11 +296,20 @@ fn hex_digit(n: i64) -> str {
     if n < 10 {
         return p_to_str(n);
     }
-    if n == 10 { return "a"; }
-    if n == 11 { return "b"; }
-    if n == 12 { return "c"; }
-    if n == 13 { return "d"; }
-    if n == 14 { return "e"; }
+    if n == 10 {
+        return "a";
+    }
+    if n == 11 {
+        return "b";
+    }
+    if n == 12 {
+        return "c";
+    }
+    if n == 13 {
+        return "d";
+    }
+    if n == 14 {
+        return "e";
+    }
     return "f";
 }
-

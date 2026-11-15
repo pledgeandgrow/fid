@@ -65,10 +65,7 @@
 //   println(int_to_str(toml_get_int(doc, "pkg.ver", 0)));
 
 module toml;
-
-use vec;
-use string;
-
+ use vec; use string;
 // ─── Flat value model (toml_parse) ──────────────────────────────────────
 
 /// A typed TOML value of the flat form. `kind` is one of
@@ -89,7 +86,9 @@ pub struct TomlEntry {
 }
 
 fn toml_invalid() -> TomlValue {
-    return TomlValue { kind: "invalid", sval: "", items: Vec::new() };
+    return TomlValue {
+        kind: "invalid", sval: "", items: Vec::new()
+    };
 }
 
 // ─── Document model (toml_load) ─────────────────────────────────────────
@@ -117,22 +116,28 @@ pub struct TomlDoc {
 }
 
 // node flags
-const TF_HDR: i64 = 1;      // table defined by a [header] (or an [[x]] element)
-const TF_DOT: i64 = 2;      // table made by dotted keys (in section `sect`)
-const TF_FROZEN: i64 = 4;   // inline table or static array: closed
-const TF_AOT: i64 = 8;      // array made by [[x]] headers
+const TF_HDR: i64 = 1;  // table defined by a [header] (or an [[x]] element)
+const TF_DOT: i64 = 2;  // table made by dotted keys (in section `sect`)
+const TF_FROZEN: i64 = 4;  // inline table or static array: closed
+const TF_AOT: i64 = 8;  // array made by [[x]] headers
 
-fn toml_is_digit(c: i64) -> bool { return c >= 48 && c <= 57; }
+fn toml_is_digit(c: i64) -> bool {
+    return c >= 48 && c <= 57;
+}
+
 fn toml_is_hex(c: i64) -> bool {
     return toml_is_digit(c) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102);
 }
+
 fn tp_is_bare(c: i64) -> bool {
     return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || toml_is_digit(c) || c == 95 || c == 45;
 }
 
 // Byte at j, or -1 past either end.
 fn tp_at(s: str, n: i64, j: i64) -> i64 {
-    if j < 0 || j >= n { return -1; }
+    if j < 0 || j >= n {
+        return - 1;
+    }
     return str_byte_at(s, j);
 }
 
@@ -141,21 +146,23 @@ fn tp_line(s: str, pos: i64) -> i64 {
     var i: i64 = 0;
     var n: i64 = str_len(s);
     while i < pos && i < n {
-        if str_byte_at(s, i) == 10 { line = line + 1; }
+        if str_byte_at(s, i) == 10 {
+            line = line + 1;
+        }
         i = i + 1;
     }
     return line;
 }
 
-fn tp_fail(d: &mut TomlDoc, pos: i64, msg: str) -> i64 {
+fn tp_fail(d: & mut TomlDoc, pos: i64, msg: str) -> i64 {
     if d.ok {
         d.ok = false;
         d.error = "line " + int_to_str(tp_line(d.src, pos)) + ": " + msg;
     }
-    return -1;
+    return - 1;
 }
 
-fn tn_new(d: &mut TomlDoc, kind: str, sval: str, parent: i64, key: str, flags: i64) -> i64 {
+fn tn_new(d: & mut TomlDoc, kind: str, sval: str, parent: i64, key: str, flags: i64) -> i64 {
     var idx: i64 = d.kind.len();
     d.kind.push(kind);
     d.sval.push(sval);
@@ -163,18 +170,22 @@ fn tn_new(d: &mut TomlDoc, kind: str, sval: str, parent: i64, key: str, flags: i
     d.key.push(key);
     d.flags.push(flags);
     d.sect.push(d.section);
-    d.first.push(-1);
-    d.next.push(-1);
-    d.last.push(-1);
+    d.first.push(- 1);
+    d.next.push(- 1);
+    d.last.push(- 1);
     if parent >= 0 {
         var lc: i64 = d.last.get(parent);
-        if lc < 0 { d.first.set(parent, idx); } else { d.next.set(lc, idx); }
+        if lc < 0 {
+            d.first.set(parent, idx);
+        } else {
+            d.next.set(lc, idx);
+        }
         d.last.set(parent, idx);
     }
     return idx;
 }
 
-fn tn_truncate(d: &mut TomlDoc, n: i64) {
+fn tn_truncate(d: & mut TomlDoc, n: i64) {
     while d.kind.len() > n {
         var top: i64 = d.kind.len() - 1;
         var p: i64 = d.parent.get(top);
@@ -191,12 +202,14 @@ fn tn_truncate(d: &mut TomlDoc, n: i64) {
         if p >= 0 && p < top {
             var c: i64 = d.first.get(p);
             if c == top {
-                d.first.set(p, -1);
-                d.last.set(p, -1);
+                d.first.set(p, - 1);
+                d.last.set(p, - 1);
             } else {
-                while c >= 0 && d.next.get(c) != top { c = d.next.get(c); }
+                while c >= 0 && d.next.get(c) != top {
+                    c = d.next.get(c);
+                }
                 if c >= 0 {
-                    d.next.set(c, -1);
+                    d.next.set(c, - 1);
                     d.last.set(p, c);
                 }
             }
@@ -204,26 +217,30 @@ fn tn_truncate(d: &mut TomlDoc, n: i64) {
     }
 }
 
-fn tn_set_flag(d: &mut TomlDoc, node: i64, f: i64) {
+fn tn_set_flag(d: & mut TomlDoc, node: i64, f: i64) {
     d.flags.set(node, d.flags.get(node) | f);
 }
 
 // The child of table `t` with key `k`, or -1.
-fn tn_child(d: &mut TomlDoc, t: i64, k: str) -> i64 {
+fn tn_child(d: & mut TomlDoc, t: i64, k: str) -> i64 {
     var i: i64 = d.first.get(t);
     while i >= 0 {
-        if d.parent.get(i) == t && str_equal(d.key.get(i), k) { return i; }
+        if d.parent.get(i) == t && str_equal(d.key.get(i), k) {
+            return i;
+        }
         i = d.next.get(i);
     }
-    return -1;
+    return - 1;
 }
 
 // The last element of array `a`, or -1.
-fn tn_last(d: &mut TomlDoc, a: i64) -> i64 {
+fn tn_last(d: & mut TomlDoc, a: i64) -> i64 {
     return d.last.get(a);
 }
 
-fn tp_quote_key(k: str) -> str { return "'" + k + "'"; }
+fn tp_quote_key(k: str) -> str {
+    return "'" + k + "'";
+}
 
 // ─── Lexical helpers ────────────────────────────────────────────────────
 
@@ -231,19 +248,27 @@ fn tp_ws(s: str, n: i64, i: i64) -> i64 {
     var j: i64 = i;
     while true {
         var c: i64 = tp_at(s, n, j);
-        if c == 32 || c == 9 { j = j + 1; } else { return j; }
+        if c == 32 || c == 9 {
+            j = j + 1;
+        } else {
+            return j;
+        }
     }
     return j;
 }
 
 // A comment at '#' (j): checks its characters, returns the position of the
 // line end (or the end of the text).
-fn tp_comment(d: &mut TomlDoc, s: str, n: i64, j: i64) -> i64 {
+fn tp_comment(d: & mut TomlDoc, s: str, n: i64, j: i64) -> i64 {
     var k: i64 = j + 1;
     while true {
         var c: i64 = tp_at(s, n, k);
-        if c < 0 || c == 10 { return k; }
-        if c == 13 && tp_at(s, n, k + 1) == 10 { return k; }
+        if c < 0 || c == 10 {
+            return k;
+        }
+        if c == 13 && tp_at(s, n, k + 1) == 10 {
+            return k;
+        }
         if (c < 32 && c != 9) || c == 127 {
             return tp_fail(d, k, "control character in a comment");
         }
@@ -253,42 +278,59 @@ fn tp_comment(d: &mut TomlDoc, s: str, n: i64, j: i64) -> i64 {
 }
 
 // Whitespace, newlines and comments (inside arrays).
-fn tp_wsnl(d: &mut TomlDoc, s: str, n: i64, i: i64) -> i64 {
+fn tp_wsnl(d: & mut TomlDoc, s: str, n: i64, i: i64) -> i64 {
     var j: i64 = i;
     while true {
         var c: i64 = tp_at(s, n, j);
-        if c == 32 || c == 9 || c == 10 { j = j + 1; }
-        else if c == 13 && tp_at(s, n, j + 1) == 10 { j = j + 2; }
-        else if c == 35 {
+        if c == 32 || c == 9 || c == 10 {
+            j = j + 1;
+        } else if c == 13 && tp_at(s, n, j + 1) == 10 {
+            j = j + 2;
+        } else if c == 35 {
             j = tp_comment(d, s, n, j);
-            if j < 0 { return -1; }
+            if j < 0 {
+                return - 1;
+            }
+        } else {
+            return j;
         }
-        else { return j; }
     }
     return j;
 }
 
 // After a key/value pair or a header: whitespace, an optional comment,
 // then a line end or the end of the text. Returns the start of the next line.
-fn tp_eol(d: &mut TomlDoc, s: str, n: i64, i: i64) -> i64 {
+fn tp_eol(d: & mut TomlDoc, s: str, n: i64, i: i64) -> i64 {
     var j: i64 = tp_ws(s, n, i);
     var c: i64 = tp_at(s, n, j);
     if c == 35 {
         j = tp_comment(d, s, n, j);
-        if j < 0 { return -1; }
+        if j < 0 {
+            return - 1;
+        }
         c = tp_at(s, n, j);
     }
-    if c < 0 { return j; }
-    if c == 10 { return j + 1; }
-    if c == 13 && tp_at(s, n, j + 1) == 10 { return j + 2; }
+    if c < 0 {
+        return j;
+    }
+    if c == 10 {
+        return j + 1;
+    }
+    if c == 13 && tp_at(s, n, j + 1) == 10 {
+        return j + 2;
+    }
     return tp_fail(d, j, "expected the end of the line");
 }
 
 // Start of the next line after position i.
 fn tp_skip_line(s: str, n: i64, i: i64) -> i64 {
     var j: i64 = i;
-    while j < n && str_byte_at(s, j) != 10 { j = j + 1; }
-    if j < n { return j + 1; }
+    while j < n && str_byte_at(s, j) != 10 {
+        j = j + 1;
+    }
+    if j < n {
+        return j + 1;
+    }
     return n;
 }
 
@@ -296,7 +338,9 @@ fn tp_skip_line(s: str, n: i64, i: i64) -> i64 {
 
 // UTF-8 encoding of a code point (up to 4 bytes).
 fn toml_encode_utf8(cp: i64) -> str {
-    if cp < 0 { return ""; }
+    if cp < 0 {
+        return "";
+    }
     var bytes: Vec<i64> = Vec::new();
     if cp < 128 {
         bytes.push(cp);
@@ -317,29 +361,58 @@ fn toml_encode_utf8(cp: i64) -> str {
 }
 
 fn tp_hexval(c: i64) -> i64 {
-    if c >= 48 && c <= 57 { return c - 48; }
-    if c >= 65 && c <= 70 { return c - 55; }
+    if c >= 48 && c <= 57 {
+        return c - 48;
+    }
+    if c >= 65 && c <= 70 {
+        return c - 55;
+    }
     return c - 87;
 }
 
 // An escape at '\\' (j): its text in `out`; returns the position after it.
-fn tp_escape(d: &mut TomlDoc, s: str, n: i64, j: i64, out: &mut Vec<str>) -> i64 {
+fn tp_escape(d: & mut TomlDoc, s: str, n: i64, j: i64, out: & mut Vec<str>) -> i64 {
     var e: i64 = tp_at(s, n, j + 1);
-    if e == 98 { out.push(toml_encode_utf8(8)); return j + 2; }
-    if e == 116 { out.push(toml_encode_utf8(9)); return j + 2; }
-    if e == 110 { out.push(toml_encode_utf8(10)); return j + 2; }
-    if e == 102 { out.push(toml_encode_utf8(12)); return j + 2; }
-    if e == 114 { out.push(toml_encode_utf8(13)); return j + 2; }
-    if e == 34 { out.push("\""); return j + 2; }
-    if e == 92 { out.push("\\"); return j + 2; }
+    if e == 98 {
+        out.push(toml_encode_utf8(8));
+        return j + 2;
+    }
+    if e == 116 {
+        out.push(toml_encode_utf8(9));
+        return j + 2;
+    }
+    if e == 110 {
+        out.push(toml_encode_utf8(10));
+        return j + 2;
+    }
+    if e == 102 {
+        out.push(toml_encode_utf8(12));
+        return j + 2;
+    }
+    if e == 114 {
+        out.push(toml_encode_utf8(13));
+        return j + 2;
+    }
+    if e == 34 {
+        out.push("\"");
+        return j + 2;
+    }
+    if e == 92 {
+        out.push("\\");
+        return j + 2;
+    }
     if e == 117 || e == 85 {
         var digits: i64 = 4;
-        if e == 85 { digits = 8; }
+        if e == 85 {
+            digits = 8;
+        }
         var cp: i64 = 0;
         var k: i64 = 0;
         while k < digits {
             var h: i64 = tp_at(s, n, j + 2 + k);
-            if !toml_is_hex(h) { return tp_fail(d, j, "invalid unicode escape"); }
+            if !toml_is_hex(h) {
+                return tp_fail(d, j, "invalid unicode escape");
+            }
             cp = cp * 16 + tp_hexval(h);
             k = k + 1;
         }
@@ -357,13 +430,15 @@ fn tp_bad_char(c: i64) -> bool {
 }
 
 // Basic string at '"' (i): decoded text in `out`, position after it.
-fn tp_basic(d: &mut TomlDoc, s: str, n: i64, i: i64, out: &mut Vec<str>) -> i64 {
+fn tp_basic(d: & mut TomlDoc, s: str, n: i64, i: i64, out: & mut Vec<str>) -> i64 {
     var acc: str = "";
     var j: i64 = i + 1;
     var run: i64 = j;
     while true {
         var c: i64 = tp_at(s, n, j);
-        if c < 0 || c == 10 || c == 13 { return tp_fail(d, i, "unterminated string"); }
+        if c < 0 || c == 10 || c == 13 {
+            return tp_fail(d, i, "unterminated string");
+        }
         if c == 34 {
             out.push(acc + str_slice(s, run, j));
             return j + 1;
@@ -371,60 +446,83 @@ fn tp_basic(d: &mut TomlDoc, s: str, n: i64, i: i64, out: &mut Vec<str>) -> i64 
         if c == 92 {
             acc = acc + str_slice(s, run, j);
             var eo: Vec<str> = Vec::new();
-            var k: i64 = tp_escape(d, s, n, j, &mut eo);
-            if k < 0 { return -1; }
+            var k: i64 = tp_escape(d, s, n, j, & mut eo);
+            if k < 0 {
+                return - 1;
+            }
             acc = acc + eo.get(0);
             j = k;
             run = k;
             continue;
         }
-        if tp_bad_char(c) { return tp_fail(d, j, "control character in a string"); }
+        if tp_bad_char(c) {
+            return tp_fail(d, j, "control character in a string");
+        }
         j = j + 1;
     }
-    return -1;
+    return - 1;
 }
 
 // Literal string at '\'' (i).
-fn tp_literal(d: &mut TomlDoc, s: str, n: i64, i: i64, out: &mut Vec<str>) -> i64 {
+fn tp_literal(d: & mut TomlDoc, s: str, n: i64, i: i64, out: & mut Vec<str>) -> i64 {
     var j: i64 = i + 1;
     while true {
         var c: i64 = tp_at(s, n, j);
-        if c < 0 || c == 10 || c == 13 { return tp_fail(d, i, "unterminated string"); }
+        if c < 0 || c == 10 || c == 13 {
+            return tp_fail(d, i, "unterminated string");
+        }
         if c == 39 {
             out.push(str_slice(s, i + 1, j));
             return j + 1;
         }
-        if tp_bad_char(c) { return tp_fail(d, j, "control character in a string"); }
+        if tp_bad_char(c) {
+            return tp_fail(d, j, "control character in a string");
+        }
         j = j + 1;
     }
-    return -1;
+    return - 1;
 }
 
 fn tp_quotes(cnt: i64, q: str) -> str {
     var out: str = "";
     var k: i64 = 0;
-    while k < cnt { out = out + q; k = k + 1; }
+    while k < cnt {
+        out = out + q;
+        k = k + 1;
+    }
     return out;
 }
 
 // Multi-line string at the first of three quotes (i); `lit` for '''.
-fn tp_multi(d: &mut TomlDoc, s: str, n: i64, i: i64, lit: bool, out: &mut Vec<str>) -> i64 {
+fn tp_multi(d: & mut TomlDoc, s: str, n: i64, i: i64, lit: bool, out: & mut Vec<str>) -> i64 {
     var qc: i64 = 34;
     var qs: str = "\"";
-    if lit { qc = 39; qs = "'"; }
+    if lit {
+        qc = 39;
+        qs = "'";
+    }
     var j: i64 = i + 3;
-    if tp_at(s, n, j) == 10 { j = j + 1; }
-    else if tp_at(s, n, j) == 13 && tp_at(s, n, j + 1) == 10 { j = j + 2; }
+    if tp_at(s, n, j) == 10 {
+        j = j + 1;
+    } else if tp_at(s, n, j) == 13 && tp_at(s, n, j + 1) == 10 {
+        j = j + 2;
+    }
     var acc: str = "";
     var run: i64 = j;
     while true {
         var c: i64 = tp_at(s, n, j);
-        if c < 0 { return tp_fail(d, i, "unterminated multi-line string"); }
+        if c < 0 {
+            return tp_fail(d, i, "unterminated multi-line string");
+        }
         if c == qc {
             var q: i64 = 0;
-            while tp_at(s, n, j + q) == qc { q = q + 1; }
+            while tp_at(s, n, j + q) == qc {
+                q = q + 1;
+            }
             if q >= 3 {
-                if q > 5 { return tp_fail(d, j, "too many quotes at the end of a multi-line string"); }
+                if q > 5 {
+                    return tp_fail(d, j, "too many quotes at the end of a multi-line string");
+                }
                 out.push(acc + str_slice(s, run, j) + tp_quotes(q - 3, qs));
                 return j + q;
             }
@@ -434,39 +532,51 @@ fn tp_multi(d: &mut TomlDoc, s: str, n: i64, i: i64, lit: bool, out: &mut Vec<st
         if c == 92 && !lit {
             acc = acc + str_slice(s, run, j);
             var k: i64 = j + 1;
-            while tp_at(s, n, k) == 32 || tp_at(s, n, k) == 9 { k = k + 1; }
+            while tp_at(s, n, k) == 32 || tp_at(s, n, k) == 9 {
+                k = k + 1;
+            }
             if tp_at(s, n, k) == 10 || (tp_at(s, n, k) == 13 && tp_at(s, n, k + 1) == 10) {
                 // line-ending backslash: drop the newline and the
                 // whitespace up to the next character
                 while true {
                     var w: i64 = tp_at(s, n, k);
-                    if w == 32 || w == 9 || w == 10 { k = k + 1; }
-                    else if w == 13 && tp_at(s, n, k + 1) == 10 { k = k + 2; }
-                    else { break; }
+                    if w == 32 || w == 9 || w == 10 {
+                        k = k + 1;
+                    } else if w == 13 && tp_at(s, n, k + 1) == 10 {
+                        k = k + 2;
+                    } else {
+                        break;
+                    }
                 }
                 j = k;
                 run = k;
                 continue;
             }
             var eo: Vec<str> = Vec::new();
-            var k2: i64 = tp_escape(d, s, n, j, &mut eo);
-            if k2 < 0 { return -1; }
+            var k2: i64 = tp_escape(d, s, n, j, & mut eo);
+            if k2 < 0 {
+                return - 1;
+            }
             acc = acc + eo.get(0);
             j = k2;
             run = k2;
             continue;
         }
         if c == 13 {
-            if tp_at(s, n, j + 1) != 10 { return tp_fail(d, j, "carriage return without a line feed"); }
+            if tp_at(s, n, j + 1) != 10 {
+                return tp_fail(d, j, "carriage return without a line feed");
+            }
             acc = acc + str_slice(s, run, j) + "\n";
             j = j + 2;
             run = j;
             continue;
         }
-        if c != 10 && tp_bad_char(c) { return tp_fail(d, j, "control character in a string"); }
+        if c != 10 && tp_bad_char(c) {
+            return tp_fail(d, j, "control character in a string");
+        }
         j = j + 1;
     }
-    return -1;
+    return - 1;
 }
 
 fn tp_starts3(s: str, n: i64, i: i64, q: i64) -> bool {
@@ -476,39 +586,53 @@ fn tp_starts3(s: str, n: i64, i: i64, q: i64) -> bool {
 // ─── Keys ───────────────────────────────────────────────────────────────
 
 // A (dotted) key at i: its parts in `out`; returns the position after it.
-fn tp_key(d: &mut TomlDoc, s: str, n: i64, i: i64, out: &mut Vec<str>) -> i64 {
+fn tp_key(d: & mut TomlDoc, s: str, n: i64, i: i64, out: & mut Vec<str>) -> i64 {
     var j: i64 = i;
     while true {
         j = tp_ws(s, n, j);
         var c: i64 = tp_at(s, n, j);
         if c == 34 {
-            if tp_starts3(s, n, j, 34) { return tp_fail(d, j, "a multi-line string cannot be a key"); }
+            if tp_starts3(s, n, j, 34) {
+                return tp_fail(d, j, "a multi-line string cannot be a key");
+            }
             j = tp_basic(d, s, n, j, out);
-            if j < 0 { return -1; }
+            if j < 0 {
+                return - 1;
+            }
         } else if c == 39 {
-            if tp_starts3(s, n, j, 39) { return tp_fail(d, j, "a multi-line string cannot be a key"); }
+            if tp_starts3(s, n, j, 39) {
+                return tp_fail(d, j, "a multi-line string cannot be a key");
+            }
             j = tp_literal(d, s, n, j, out);
-            if j < 0 { return -1; }
+            if j < 0 {
+                return - 1;
+            }
         } else if tp_is_bare(c) {
             var k: i64 = j;
-            while tp_is_bare(tp_at(s, n, k)) { k = k + 1; }
+            while tp_is_bare(tp_at(s, n, k)) {
+                k = k + 1;
+            }
             out.push(str_slice(s, j, k));
             j = k;
         } else {
             return tp_fail(d, j, "expected a key");
         }
         var j2: i64 = tp_ws(s, n, j);
-        if tp_at(s, n, j2) != 46 { return j2; }
+        if tp_at(s, n, j2) != 46 {
+            return j2;
+        }
         j = j2 + 1;
     }
-    return -1;
+    return - 1;
 }
 
 fn tp_join_keys(keys: Vec<str>, upto: i64) -> str {
     var out: str = "";
     var k: i64 = 0;
     while k < upto {
-        if k > 0 { out = out + "."; }
+        if k > 0 {
+            out = out + ".";
+        }
         out = out + keys.get(k);
         k = k + 1;
     }
@@ -517,7 +641,7 @@ fn tp_join_keys(keys: Vec<str>, upto: i64) -> str {
 
 // Walk the dotted part of `keys` (all but the last) from table `base`,
 // making the tables it names; returns the table that gets the last key.
-fn tp_dotted(d: &mut TomlDoc, base: i64, keys: Vec<str>, pos: i64) -> i64 {
+fn tp_dotted(d: & mut TomlDoc, base: i64, keys: Vec<str>, pos: i64) -> i64 {
     var t: i64 = base;
     var k: i64 = 0;
     while k < keys.len() - 1 {
@@ -560,7 +684,9 @@ fn tp_num_at(s: str, n: i64, i: i64, count: i64) -> i64 {
     var k: i64 = 0;
     while k < count {
         var c: i64 = tp_at(s, n, i + k);
-        if !toml_is_digit(c) { return -1; }
+        if !toml_is_digit(c) {
+            return - 1;
+        }
         v = v * 10 + (c - 48);
         k = k + 1;
     }
@@ -573,27 +699,37 @@ fn tp_leap(y: i64) -> bool {
 
 fn tp_days_in(y: i64, m: i64) -> i64 {
     if m == 2 {
-        if tp_leap(y) { return 29; }
+        if tp_leap(y) {
+            return 29;
+        }
         return 28;
     }
-    if m == 4 || m == 6 || m == 9 || m == 11 { return 30; }
+    if m == 4 || m == 6 || m == 9 || m == 11 {
+        return 30;
+    }
     return 31;
 }
 
 // A time "hh:mm:ss[.frac]" at i: the position after it, or -1.
-fn tp_time(d: &mut TomlDoc, s: str, n: i64, i: i64) -> i64 {
+fn tp_time(d: & mut TomlDoc, s: str, n: i64, i: i64) -> i64 {
     var hh: i64 = tp_num_at(s, n, i, 2);
     var mm: i64 = tp_num_at(s, n, i + 3, 2);
     var ss: i64 = tp_num_at(s, n, i + 6, 2);
     if hh < 0 || tp_at(s, n, i + 2) != 58 || mm < 0 || tp_at(s, n, i + 5) != 58 || ss < 0 {
         return tp_fail(d, i, "invalid time (hh:mm:ss)");
     }
-    if hh > 23 || mm > 59 || ss > 60 { return tp_fail(d, i, "time out of range"); }
+    if hh > 23 || mm > 59 || ss > 60 {
+        return tp_fail(d, i, "time out of range");
+    }
     var j: i64 = i + 8;
     if tp_at(s, n, j) == 46 {
         var k: i64 = j + 1;
-        while toml_is_digit(tp_at(s, n, k)) { k = k + 1; }
-        if k == j + 1 { return tp_fail(d, j, "a fraction of a second needs digits"); }
+        while toml_is_digit(tp_at(s, n, k)) {
+            k = k + 1;
+        }
+        if k == j + 1 {
+            return tp_fail(d, j, "a fraction of a second needs digits");
+        }
         j = k;
     }
     return j;
@@ -601,7 +737,7 @@ fn tp_time(d: &mut TomlDoc, s: str, n: i64, i: i64) -> i64 {
 
 // A date, date-time or time at i under (parent, key); -2 when the text
 // there is not one.
-fn tp_datetime(d: &mut TomlDoc, s: str, n: i64, i: i64, parent: i64, key: str) -> i64 {
+fn tp_datetime(d: & mut TomlDoc, s: str, n: i64, i: i64, parent: i64, key: str) -> i64 {
     if tp_num_at(s, n, i, 4) >= 0 && tp_at(s, n, i + 4) == 45 {
         var y: i64 = tp_num_at(s, n, i, 4);
         var m: i64 = tp_num_at(s, n, i + 5, 2);
@@ -624,7 +760,9 @@ fn tp_datetime(d: &mut TomlDoc, s: str, n: i64, i: i64, parent: i64, key: str) -
             return j;
         }
         var k: i64 = tp_time(d, s, n, j + 1);
-        if k < 0 { return -1; }
+        if k < 0 {
+            return - 1;
+        }
         text = text + "T" + str_slice(s, j + 1, k);
         var kind: str = "datetime-local";
         var z: i64 = tp_at(s, n, k);
@@ -635,8 +773,12 @@ fn tp_datetime(d: &mut TomlDoc, s: str, n: i64, i: i64, parent: i64, key: str) -
         } else if z == 43 || z == 45 {
             var oh: i64 = tp_num_at(s, n, k + 1, 2);
             var om: i64 = tp_num_at(s, n, k + 4, 2);
-            if oh < 0 || tp_at(s, n, k + 3) != 58 || om < 0 { return tp_fail(d, k, "invalid time offset"); }
-            if oh > 23 || om > 59 { return tp_fail(d, k, "time offset out of range"); }
+            if oh < 0 || tp_at(s, n, k + 3) != 58 || om < 0 {
+                return tp_fail(d, k, "invalid time offset");
+            }
+            if oh > 23 || om > 59 {
+                return tp_fail(d, k, "time offset out of range");
+            }
             text = text + str_slice(s, k, k + 6);
             kind = "datetime";
             k = k + 6;
@@ -646,40 +788,56 @@ fn tp_datetime(d: &mut TomlDoc, s: str, n: i64, i: i64, parent: i64, key: str) -
     }
     if tp_num_at(s, n, i, 2) >= 0 && tp_at(s, n, i + 2) == 58 {
         var k2: i64 = tp_time(d, s, n, i);
-        if k2 < 0 { return -1; }
+        if k2 < 0 {
+            return - 1;
+        }
         tn_new(d, "time-local", str_slice(s, i, k2), parent, key, 0);
         return k2;
     }
-    return -2;
+    return - 2;
 }
 
 // Digits of `base` from i, '_' allowed only between two digits; the
 // digits go to `out`. Returns the position after them, or -1 for a
 // misplaced '_'.
-fn tp_udigits(s: str, n: i64, i: i64, base: i64, out: &mut Vec<str>) -> i64 {
+fn tp_udigits(s: str, n: i64, i: i64, base: i64, out: & mut Vec<str>) -> i64 {
     var j: i64 = i;
     var acc: str = "";
     var prev_digit: bool = false;
     while true {
         var c: i64 = tp_at(s, n, j);
         var ok: bool = false;
-        if base == 16 { ok = toml_is_hex(c); }
-        else if base == 10 { ok = toml_is_digit(c); }
-        else if base == 8 { ok = c >= 48 && c <= 55; }
-        else { ok = c == 48 || c == 49; }
+        if base == 16 {
+            ok = toml_is_hex(c);
+        } else if base == 10 {
+            ok = toml_is_digit(c);
+        } else if base == 8 {
+            ok = c >= 48 && c <= 55;
+        } else {
+            ok = c == 48 || c == 49;
+        }
         if ok {
             acc = acc + str_slice(s, j, j + 1);
             prev_digit = true;
             j = j + 1;
         } else if c == 95 {
-            if !prev_digit { return -1; }
+            if !prev_digit {
+                return - 1;
+            }
             var nx: i64 = tp_at(s, n, j + 1);
             var nok: bool = false;
-            if base == 16 { nok = toml_is_hex(nx); }
-            else if base == 10 { nok = toml_is_digit(nx); }
-            else if base == 8 { nok = nx >= 48 && nx <= 55; }
-            else { nok = nx == 48 || nx == 49; }
-            if !nok { return -1; }
+            if base == 16 {
+                nok = toml_is_hex(nx);
+            } else if base == 10 {
+                nok = toml_is_digit(nx);
+            } else if base == 8 {
+                nok = nx >= 48 && nx <= 55;
+            } else {
+                nok = nx == 48 || nx == 49;
+            }
+            if !nok {
+                return - 1;
+            }
             prev_digit = false;
             j = j + 1;
         } else {
@@ -692,12 +850,16 @@ fn tp_udigits(s: str, n: i64, i: i64, base: i64, out: &mut Vec<str>) -> i64 {
 
 // Is the decimal digit string `ds` (no leading zeros) above `limit`?
 fn tp_over(ds: str, limit: str) -> bool {
-    if str_len(ds) != str_len(limit) { return str_len(ds) > str_len(limit); }
+    if str_len(ds) != str_len(limit) {
+        return str_len(ds) > str_len(limit);
+    }
     var k: i64 = 0;
     while k < str_len(ds) {
         var a: i64 = str_byte_at(ds, k);
         var b: i64 = str_byte_at(limit, k);
-        if a != b { return a > b; }
+        if a != b {
+            return a > b;
+        }
         k = k + 1;
     }
     return false;
@@ -708,20 +870,29 @@ fn tp_token_end(s: str, n: i64, i: i64) -> i64 {
     var j: i64 = i;
     while true {
         var c: i64 = tp_at(s, n, j);
-        if tp_is_bare(c) || c == 43 || c == 46 { j = j + 1; } else { return j; }
+        if tp_is_bare(c) || c == 43 || c == 46 {
+            j = j + 1;
+        } else {
+            return j;
+        }
     }
     return j;
 }
 
-fn tp_number(d: &mut TomlDoc, s: str, n: i64, i: i64, parent: i64, key: str) -> i64 {
+fn tp_number(d: & mut TomlDoc, s: str, n: i64, i: i64, parent: i64, key: str) -> i64 {
     var e: i64 = tp_token_end(s, n, i);
     var t: str = str_slice(s, i, e);
     if str_equal(t, "inf") || str_equal(t, "+inf") {
-        tn_new(d, "float", "inf", parent, key, 0); return e;
+        tn_new(d, "float", "inf", parent, key, 0);
+        return e;
     }
-    if str_equal(t, "-inf") { tn_new(d, "float", "-inf", parent, key, 0); return e; }
+    if str_equal(t, "-inf") {
+        tn_new(d, "float", "-inf", parent, key, 0);
+        return e;
+    }
     if str_equal(t, "nan") || str_equal(t, "+nan") || str_equal(t, "-nan") {
-        tn_new(d, "float", "nan", parent, key, 0); return e;
+        tn_new(d, "float", "nan", parent, key, 0);
+        return e;
     }
     var p: i64 = i;
     var neg: bool = false;
@@ -732,19 +903,29 @@ fn tp_number(d: &mut TomlDoc, s: str, n: i64, i: i64, parent: i64, key: str) -> 
     var c0: i64 = tp_at(s, n, p);
     var c1: i64 = tp_at(s, n, p + 1);
     if c0 == 48 && (c1 == 120 || c1 == 111 || c1 == 98) {
-        if p != i { return tp_fail(d, i, "a hexadecimal, octal or binary integer cannot have a sign"); }
+        if p != i {
+            return tp_fail(d, i, "a hexadecimal, octal or binary integer cannot have a sign");
+        }
         var base: i64 = 16;
-        if c1 == 111 { base = 8; }
-        if c1 == 98 { base = 2; }
+        if c1 == 111 {
+            base = 8;
+        }
+        if c1 == 98 {
+            base = 2;
+        }
         var dg: Vec<str> = Vec::new();
-        var q: i64 = tp_udigits(s, n, p + 2, base, &mut dg);
-        if q < 0 || q != e || str_len(dg.get(0)) == 0 { return tp_fail(d, i, "invalid integer"); }
+        var q: i64 = tp_udigits(s, n, p + 2, base, & mut dg);
+        if q < 0 || q != e || str_len(dg.get(0)) == 0 {
+            return tp_fail(d, i, "invalid integer");
+        }
         var digits: str = dg.get(0);
         var v: i64 = 0;
         var k: i64 = 0;
         while k < str_len(digits) {
             var dv: i64 = tp_hexval(str_byte_at(digits, k));
-            if v > (9223372036854775807 - dv) / base { return tp_fail(d, i, "integer out of range"); }
+            if v > (9223372036854775807 - dv) / base {
+                return tp_fail(d, i, "integer out of range");
+            }
             v = v * base + dv;
             k = k + 1;
         }
@@ -752,17 +933,25 @@ fn tp_number(d: &mut TomlDoc, s: str, n: i64, i: i64, parent: i64, key: str) -> 
         return e;
     }
     var ip: Vec<str> = Vec::new();
-    var q2: i64 = tp_udigits(s, n, p, 10, &mut ip);
-    if q2 < 0 { return tp_fail(d, i, "misplaced '_' in a number"); }
+    var q2: i64 = tp_udigits(s, n, p, 10, & mut ip);
+    if q2 < 0 {
+        return tp_fail(d, i, "misplaced '_' in a number");
+    }
     var intd: str = ip.get(0);
-    if str_len(intd) == 0 { return tp_fail(d, i, "invalid value"); }
-    if str_byte_at(intd, 0) == 48 && str_len(intd) > 1 { return tp_fail(d, i, "leading zeros are not allowed"); }
+    if str_len(intd) == 0 {
+        return tp_fail(d, i, "invalid value");
+    }
+    if str_byte_at(intd, 0) == 48 && str_len(intd) > 1 {
+        return tp_fail(d, i, "leading zeros are not allowed");
+    }
     var is_float: bool = false;
     var text: str = intd;
     if tp_at(s, n, q2) == 46 {
         var fp: Vec<str> = Vec::new();
-        var q3: i64 = tp_udigits(s, n, q2 + 1, 10, &mut fp);
-        if q3 < 0 || str_len(fp.get(0)) == 0 { return tp_fail(d, i, "a decimal point needs digits on both sides"); }
+        var q3: i64 = tp_udigits(s, n, q2 + 1, 10, & mut fp);
+        if q3 < 0 || str_len(fp.get(0)) == 0 {
+            return tp_fail(d, i, "a decimal point needs digits on both sides");
+        }
         text = text + "." + fp.get(0);
         is_float = true;
         q2 = q3;
@@ -771,25 +960,37 @@ fn tp_number(d: &mut TomlDoc, s: str, n: i64, i: i64, parent: i64, key: str) -> 
         var ex4: i64 = q2 + 1;
         var esign: str = "";
         if tp_at(s, n, ex4) == 43 || tp_at(s, n, ex4) == 45 {
-            if tp_at(s, n, ex4) == 45 { esign = "-"; }
+            if tp_at(s, n, ex4) == 45 {
+                esign = "-";
+            }
             ex4 = ex4 + 1;
         }
         var ep: Vec<str> = Vec::new();
-        var ex5: i64 = tp_udigits(s, n, ex4, 10, &mut ep);
-        if ex5 < 0 || str_len(ep.get(0)) == 0 { return tp_fail(d, i, "an exponent needs digits"); }
+        var ex5: i64 = tp_udigits(s, n, ex4, 10, & mut ep);
+        if ex5 < 0 || str_len(ep.get(0)) == 0 {
+            return tp_fail(d, i, "an exponent needs digits");
+        }
         text = text + "e" + esign + ep.get(0);
         is_float = true;
         q2 = ex5;
     }
-    if q2 != e { return tp_fail(d, i, "invalid value"); }
+    if q2 != e {
+        return tp_fail(d, i, "invalid value");
+    }
     if is_float {
-        if neg { text = "-" + text; }
+        if neg {
+            text = "-" + text;
+        }
         tn_new(d, "float", text, parent, key, 0);
         return e;
     }
     if neg {
-        if tp_over(intd, "9223372036854775808") { return tp_fail(d, i, "integer out of range"); }
-        if !str_equal(intd, "0") { text = "-" + intd; }
+        if tp_over(intd, "9223372036854775808") {
+            return tp_fail(d, i, "integer out of range");
+        }
+        if !str_equal(intd, "0") {
+            text = "-" + intd;
+        }
     } else if tp_over(intd, "9223372036854775807") {
         return tp_fail(d, i, "integer out of range");
     }
@@ -797,43 +998,66 @@ fn tp_number(d: &mut TomlDoc, s: str, n: i64, i: i64, parent: i64, key: str) -> 
     return e;
 }
 
-fn tp_array(d: &mut TomlDoc, s: str, n: i64, i: i64, parent: i64, key: str) -> i64 {
+fn tp_array(d: & mut TomlDoc, s: str, n: i64, i: i64, parent: i64, key: str) -> i64 {
     var node: i64 = tn_new(d, "array", "", parent, key, TF_FROZEN);
     var j: i64 = i + 1;
     while true {
         j = tp_wsnl(d, s, n, j);
-        if j < 0 { return -1; }
-        if tp_at(s, n, j) < 0 { return tp_fail(d, i, "unterminated array"); }
-        if tp_at(s, n, j) == 93 { return j + 1; }
+        if j < 0 {
+            return - 1;
+        }
+        if tp_at(s, n, j) < 0 {
+            return tp_fail(d, i, "unterminated array");
+        }
+        if tp_at(s, n, j) == 93 {
+            return j + 1;
+        }
         j = tp_value(d, s, n, j, node, "");
-        if j < 0 { return -1; }
+        if j < 0 {
+            return - 1;
+        }
         j = tp_wsnl(d, s, n, j);
-        if j < 0 { return -1; }
+        if j < 0 {
+            return - 1;
+        }
         var c: i64 = tp_at(s, n, j);
-        if c < 0 { return tp_fail(d, i, "unterminated array"); }
-        if c == 44 { j = j + 1; continue; }
-        if c == 93 { return j + 1; }
+        if c < 0 {
+            return tp_fail(d, i, "unterminated array");
+        }
+        if c == 44 {
+            j = j + 1;
+            continue;
+        }
+        if c == 93 {
+            return j + 1;
+        }
         return tp_fail(d, j, "expected ',' or ']' in an array");
     }
-    return -1;
+    return - 1;
 }
 
 // key = value inside table `t`; returns the position after the value.
-fn tp_keyval(d: &mut TomlDoc, s: str, n: i64, i: i64, t: i64) -> i64 {
+fn tp_keyval(d: & mut TomlDoc, s: str, n: i64, i: i64, t: i64) -> i64 {
     var keys: Vec<str> = Vec::new();
-    var j: i64 = tp_key(d, s, n, i, &mut keys);
-    if j < 0 { return -1; }
-    if tp_at(s, n, j) != 61 { return tp_fail(d, j, "expected '=' after a key"); }
+    var j: i64 = tp_key(d, s, n, i, & mut keys);
+    if j < 0 {
+        return - 1;
+    }
+    if tp_at(s, n, j) != 61 {
+        return tp_fail(d, j, "expected '=' after a key");
+    }
     j = tp_ws(s, n, j + 1);
     var tt: i64 = tp_dotted(d, t, keys, i);
-    if tt < 0 { return -1; }
+    if tt < 0 {
+        return - 1;
+    }
     var last: str = keys.get(keys.len() - 1);
     var old: i64 = tn_child(d, tt, last);
     if old >= 0 {
         if !d.lenient {
             return tp_fail(d, i, "duplicate key " + tp_quote_key(tp_join_keys(keys, keys.len())));
         }
-        d.parent.set(old, -2);
+        d.parent.set(old, - 2);
     }
     var mark: i64 = d.kind.len();
     var k: i64 = tp_value(d, s, n, j, tt, last);
@@ -844,21 +1068,24 @@ fn tp_keyval(d: &mut TomlDoc, s: str, n: i64, i: i64, t: i64) -> i64 {
     return k;
 }
 
-fn tp_inline(d: &mut TomlDoc, s: str, n: i64, i: i64, parent: i64, key: str) -> i64 {
+fn tp_inline(d: & mut TomlDoc, s: str, n: i64, i: i64, parent: i64, key: str) -> i64 {
     var node: i64 = tn_new(d, "table", "", parent, key, 0);
     var j: i64 = tp_ws(s, n, i + 1);
     if tp_at(s, n, j) == 125 {
         tn_set_flag(d, node, TF_FROZEN);
         return j + 1;
-    }
-    while true {
+    } while true {
         j = tp_keyval(d, s, n, j, node);
-        if j < 0 { return -1; }
+        if j < 0 {
+            return - 1;
+        }
         j = tp_ws(s, n, j);
         var c: i64 = tp_at(s, n, j);
         if c == 44 {
             j = tp_ws(s, n, j + 1);
-            if tp_at(s, n, j) == 125 { return tp_fail(d, j, "trailing comma in an inline table"); }
+            if tp_at(s, n, j) == 125 {
+                return tp_fail(d, j, "trailing comma in an inline table");
+            }
             continue;
         }
         if c == 125 {
@@ -867,24 +1094,34 @@ fn tp_inline(d: &mut TomlDoc, s: str, n: i64, i: i64, parent: i64, key: str) -> 
         }
         return tp_fail(d, j, "expected ',' or '}' in an inline table");
     }
-    return -1;
+    return - 1;
 }
 
 // A value at i, made a child of `parent` under `key` ("" in an array).
-fn tp_value(d: &mut TomlDoc, s: str, n: i64, i: i64, parent: i64, key: str) -> i64 {
+fn tp_value(d: & mut TomlDoc, s: str, n: i64, i: i64, parent: i64, key: str) -> i64 {
     var c: i64 = tp_at(s, n, i);
     if c == 34 || c == 39 {
         var out: Vec<str> = Vec::new();
         var j: i64 = 0;
-        if tp_starts3(s, n, i, c) { j = tp_multi(d, s, n, i, c == 39, &mut out); }
-        else if c == 34 { j = tp_basic(d, s, n, i, &mut out); }
-        else { j = tp_literal(d, s, n, i, &mut out); }
-        if j < 0 { return -1; }
+        if tp_starts3(s, n, i, c) {
+            j = tp_multi(d, s, n, i, c == 39, & mut out);
+        } else if c == 34 {
+            j = tp_basic(d, s, n, i, & mut out);
+        } else {
+            j = tp_literal(d, s, n, i, & mut out);
+        }
+        if j < 0 {
+            return - 1;
+        }
         tn_new(d, "string", out.get(0), parent, key, 0);
         return j;
     }
-    if c == 91 { return tp_array(d, s, n, i, parent, key); }
-    if c == 123 { return tp_inline(d, s, n, i, parent, key); }
+    if c == 91 {
+        return tp_array(d, s, n, i, parent, key);
+    }
+    if c == 123 {
+        return tp_inline(d, s, n, i, parent, key);
+    }
     if c == 116 || c == 102 {
         var e: i64 = tp_token_end(s, n, i);
         var w: str = str_slice(s, i, e);
@@ -896,32 +1133,46 @@ fn tp_value(d: &mut TomlDoc, s: str, n: i64, i: i64, parent: i64, key: str) -> i
     }
     if toml_is_digit(c) {
         var dt: i64 = tp_datetime(d, s, n, i, parent, key);
-        if dt != -2 { return dt; }
+        if dt != - 2 {
+            return dt;
+        }
     }
     if toml_is_digit(c) || c == 43 || c == 45 || c == 105 || c == 110 {
         return tp_number(d, s, n, i, parent, key);
     }
-    if c < 0 || c == 10 || c == 13 || c == 35 { return tp_fail(d, i, "missing value"); }
+    if c < 0 || c == 10 || c == 13 || c == 35 {
+        return tp_fail(d, i, "missing value");
+    }
     return tp_fail(d, i, "invalid value");
 }
 
 // ─── Tables ─────────────────────────────────────────────────────────────
 
-fn tp_header(d: &mut TomlDoc, s: str, n: i64, i: i64) -> i64 {
+fn tp_header(d: & mut TomlDoc, s: str, n: i64, i: i64) -> i64 {
     var aot: bool = tp_at(s, n, i + 1) == 91;
     var j: i64 = i + 1;
-    if aot { j = j + 1; }
+    if aot {
+        j = j + 1;
+    }
     var keys: Vec<str> = Vec::new();
-    j = tp_key(d, s, n, j, &mut keys);
-    if j < 0 { return -1; }
-    if tp_at(s, n, j) != 93 { return tp_fail(d, j, "expected ']' at the end of a table header"); }
+    j = tp_key(d, s, n, j, & mut keys);
+    if j < 0 {
+        return - 1;
+    }
+    if tp_at(s, n, j) != 93 {
+        return tp_fail(d, j, "expected ']' at the end of a table header");
+    }
     j = j + 1;
     if aot {
-        if tp_at(s, n, j) != 93 { return tp_fail(d, j, "expected ']]' at the end of an array-of-tables header"); }
+        if tp_at(s, n, j) != 93 {
+            return tp_fail(d, j, "expected ']]' at the end of an array-of-tables header");
+        }
         j = j + 1;
     }
     d.section = d.section + 1;
-    if aot && d.lenient { return tp_skip_line(s, n, j); }
+    if aot && d.lenient {
+        return tp_skip_line(s, n, j);
+    }
     var t: i64 = 0;
     var k: i64 = 0;
     while k < keys.len() - 1 {
@@ -950,7 +1201,9 @@ fn tp_header(d: &mut TomlDoc, s: str, n: i64, i: i64) -> i64 {
             c2 = tn_new(d, "table", "", t, last, TF_HDR);
         } else if str_equal(d.kind.get(c2), "table") {
             var f: i64 = d.flags.get(c2);
-            if (f & TF_FROZEN) != 0 { return tp_fail(d, i, "inline table " + name2 + " cannot be extended"); }
+            if (f & TF_FROZEN) != 0 {
+                return tp_fail(d, i, "inline table " + name2 + " cannot be extended");
+            }
             if !d.lenient && (f & (TF_HDR | TF_DOT)) != 0 {
                 return tp_fail(d, i, "table " + name2 + " is defined more than once");
             }
@@ -978,59 +1231,88 @@ fn tp_utf8_bad(s: str) -> i64 {
     var n: i64 = str_len(s);
     while i < n {
         var c: i64 = str_byte_at(s, i);
-        if c < 128 { i = i + 1; continue; }
+        if c < 128 {
+            i = i + 1;
+            continue;
+        }
         var need: i64 = 0;
         var min: i64 = 0;
         var cp: i64 = 0;
-        if c >= 194 && c <= 223 { need = 1; min = 128; cp = c & 31; }
-        else if c >= 224 && c <= 239 { need = 2; min = 2048; cp = c & 15; }
-        else if c >= 240 && c <= 244 { need = 3; min = 65536; cp = c & 7; }
-        else { return i; }
+        if c >= 194 && c <= 223 {
+            need = 1;
+            min = 128;
+            cp = c & 31;
+        } else if c >= 224 && c <= 239 {
+            need = 2;
+            min = 2048;
+            cp = c & 15;
+        } else if c >= 240 && c <= 244 {
+            need = 3;
+            min = 65536;
+            cp = c & 7;
+        } else {
+            return i;
+        }
         var k: i64 = 1;
         while k <= need {
             var b: i64 = tp_at(s, n, i + k);
-            if b < 128 || b > 191 { return i; }
+            if b < 128 || b > 191 {
+                return i;
+            }
             cp = cp * 64 + (b & 63);
             k = k + 1;
         }
-        if cp < min || (cp >= 55296 && cp <= 57343) || cp > 1114111 { return i; }
+        if cp < min || (cp >= 55296 && cp <= 57343) || cp > 1114111 {
+            return i;
+        }
         i = i + need + 1;
     }
-    return -1;
+    return - 1;
 }
 
 fn tp_run(text: str, lenient: bool) -> TomlDoc {
-    var d: TomlDoc = TomlDoc { ok: true, error: "", kind: Vec::new(), sval: Vec::new(),
-        parent: Vec::new(), key: Vec::new(), flags: Vec::new(), sect: Vec::new(),
-        first: Vec::new(), next: Vec::new(), last: Vec::new(),
-        src: text, lenient: lenient, cur: 0, section: 0 };
-    tn_new(&mut d, "table", "", -1, "", TF_HDR);
+    var d: TomlDoc = TomlDoc {
+        ok: true, error: "", kind: Vec::new(), sval: Vec::new(), parent: Vec::new(), key: Vec::new(), flags: Vec::new(), sect: Vec::new(), first: Vec::new(), next: Vec::new(), last: Vec::new(), src: text, lenient: lenient, cur: 0, section: 0
+    };
+    tn_new(& mut d, "table", "", - 1, "", TF_HDR);
     var s: str = text;
     var n: i64 = str_len(s);
     var i: i64 = 0;
     if !lenient {
         var bad: i64 = tp_utf8_bad(s);
         if bad >= 0 {
-            tp_fail(&mut d, bad, "the text is not valid UTF-8");
+            tp_fail(& mut d, bad, "the text is not valid UTF-8");
             return d;
         }
     }
-    if n >= 3 && str_byte_at(s, 0) == 239 && str_byte_at(s, 1) == 187 && str_byte_at(s, 2) == 191 { i = 3; }
-    while i < n {
+    if n >= 3 && str_byte_at(s, 0) == 239 && str_byte_at(s, 1) == 187 && str_byte_at(s, 2) == 191 {
+        i = 3;
+    } while i < n {
         var start: i64 = i;
         var j: i64 = tp_ws(s, n, i);
         var c: i64 = tp_at(s, n, j);
-        if c < 0 { break; }
-        if c == 10 { i = j + 1; continue; }
-        if c == 35 || c == 13 { j = tp_eol(&mut d, s, n, j); }
-        else if c == 91 { j = tp_header(&mut d, s, n, j); }
-        else {
+        if c < 0 {
+            break;
+        }
+        if c == 10 {
+            i = j + 1;
+            continue;
+        }
+        if c == 35 || c == 13 {
+            j = tp_eol(& mut d, s, n, j);
+        } else if c == 91 {
+            j = tp_header(& mut d, s, n, j);
+        } else {
             var cur: i64 = d.cur;
-            j = tp_keyval(&mut d, s, n, j, cur);
-            if j >= 0 { j = tp_eol(&mut d, s, n, j); }
+            j = tp_keyval(& mut d, s, n, j, cur);
+            if j >= 0 {
+                j = tp_eol(& mut d, s, n, j);
+            }
         }
         if j < 0 {
-            if !lenient { return d; }
+            if !lenient {
+                return d;
+            }
             d.ok = true;
             d.error = "";
             j = tp_skip_line(s, n, start);
@@ -1049,23 +1331,31 @@ pub fn toml_load(text: str) -> TomlDoc {
 
 /// The kind of `node` ("missing" for -1).
 pub fn toml_node_kind(doc: TomlDoc, node: i64) -> str {
-    if node < 0 || node >= doc.kind.len() { return "missing"; }
+    if node < 0 || node >= doc.kind.len() {
+        return "missing";
+    }
     return doc.kind.get(node);
 }
 
 /// The value of a scalar node as text ("" for tables, arrays, -1).
 pub fn toml_node_value(doc: TomlDoc, node: i64) -> str {
-    if node < 0 || node >= doc.kind.len() { return ""; }
+    if node < 0 || node >= doc.kind.len() {
+        return "";
+    }
     return doc.sval.get(node);
 }
 
 /// Child nodes of a table or array, in document order.
 pub fn toml_node_items(doc: TomlDoc, node: i64) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
-    if node < 0 || node >= doc.kind.len() { return out; }
+    if node < 0 || node >= doc.kind.len() {
+        return out;
+    }
     var i: i64 = doc.first.get(node);
     while i >= 0 {
-        if doc.parent.get(i) == node { out.push(i); }
+        if doc.parent.get(i) == node {
+            out.push(i);
+        }
         i = doc.next.get(i);
     }
     return out;
@@ -1090,40 +1380,54 @@ pub fn toml_node_keys(doc: TomlDoc, node: i64) -> Vec<str> {
 
 /// The child of table `node` with key `k`, or -1.
 pub fn toml_node_child(doc: TomlDoc, node: i64, k: str) -> i64 {
-    if node < 0 || !str_equal(toml_node_kind(doc, node), "table") { return -1; }
+    if node < 0 || !str_equal(toml_node_kind(doc, node), "table") {
+        return - 1;
+    }
     var i: i64 = doc.first.get(node);
     while i >= 0 {
-        if doc.parent.get(i) == node && str_equal(doc.key.get(i), k) { return i; }
+        if doc.parent.get(i) == node && str_equal(doc.key.get(i), k) {
+            return i;
+        }
         i = doc.next.get(i);
     }
-    return -1;
+    return - 1;
 }
 
 /// Element `index` of array `node`, or -1.
 pub fn toml_node_at(doc: TomlDoc, node: i64, index: i64) -> i64 {
-    if index < 0 || !str_equal(toml_node_kind(doc, node), "array") { return -1; }
+    if index < 0 || !str_equal(toml_node_kind(doc, node), "array") {
+        return - 1;
+    }
     var i: i64 = doc.first.get(node);
     var k: i64 = 0;
     while i >= 0 {
-        if k == index { return i; }
+        if k == index {
+            return i;
+        }
         k = k + 1;
         i = doc.next.get(i);
     }
-    return -1;
+    return - 1;
 }
 
 /// The node at a dotted path from the root ("a.b.2.c": a number indexes
 /// an array); -1 when absent. Keys holding '.' need toml_node_child.
 pub fn toml_lookup(doc: TomlDoc, path: str) -> i64 {
-    if !doc.ok && !doc.lenient { return -1; }
+    if !doc.ok && !doc.lenient {
+        return - 1;
+    }
     var node: i64 = 0;
-    if str_len(path) == 0 { return node; }
+    if str_len(path) == 0 {
+        return node;
+    }
     var segs: Vec<str> = str_split(path, ".");
     var k: i64 = 0;
     while k < segs.len() && node >= 0 {
         var seg: str = segs.get(k);
         if str_equal(toml_node_kind(doc, node), "array") {
-            if !str_is_numeric(seg) { return -1; }
+            if !str_is_numeric(seg) {
+                return - 1;
+            }
             node = toml_node_at(doc, node, str_parse_int(seg));
         } else {
             node = toml_node_child(doc, node, seg);
@@ -1134,7 +1438,7 @@ pub fn toml_lookup(doc: TomlDoc, path: str) -> i64 {
 }
 
 // A JSON string literal of `s` into `sb`.
-fn tj_str(s: str, sb: &mut StringBuilder) {
+fn tj_str(s: str, sb: & mut StringBuilder) {
     sb.append_str("\"");
     var run: i64 = 0;
     var i: i64 = 0;
@@ -1142,13 +1446,20 @@ fn tj_str(s: str, sb: &mut StringBuilder) {
     while i < n {
         var c: i64 = str_byte_at(s, i);
         if c < 32 || c == 34 || c == 92 || c == 127 {
-            if i > run { sb.append_str(str_slice(s, run, i)); }
-            if c == 34 { sb.append_str("\\\""); }
-            else if c == 92 { sb.append_str("\\\\"); }
-            else if c == 10 { sb.append_str("\\n"); }
-            else if c == 9 { sb.append_str("\\t"); }
-            else if c == 13 { sb.append_str("\\r"); }
-            else {
+            if i > run {
+                sb.append_str(str_slice(s, run, i));
+            }
+            if c == 34 {
+                sb.append_str("\\\"");
+            } else if c == 92 {
+                sb.append_str("\\\\");
+            } else if c == 10 {
+                sb.append_str("\\n");
+            } else if c == 9 {
+                sb.append_str("\\t");
+            } else if c == 13 {
+                sb.append_str("\\r");
+            } else {
                 var hx: str = "0123456789abcdef";
                 sb.append_str("\\u00" + str_slice(hx, c / 16, c / 16 + 1) + str_slice(hx, c % 16, c % 16 + 1));
             }
@@ -1156,7 +1467,9 @@ fn tj_str(s: str, sb: &mut StringBuilder) {
         }
         i = i + 1;
     }
-    if n > run { sb.append_str(str_slice(s, run, n)); }
+    if n > run {
+        sb.append_str(str_slice(s, run, n));
+    }
     sb.append_str("\"");
 }
 
@@ -1165,19 +1478,23 @@ fn tj_less(a: str, b: str) -> bool {
     while k < str_len(a) && k < str_len(b) {
         var x: i64 = str_byte_at(a, k);
         var y: i64 = str_byte_at(b, k);
-        if x != y { return x < y; }
+        if x != y {
+            return x < y;
+        }
         k = k + 1;
     }
     return str_len(a) < str_len(b);
 }
 
-fn tj_node(doc: &TomlDoc, node: i64, sb: &mut StringBuilder) {
+fn tj_node(doc: & TomlDoc, node: i64, sb: & mut StringBuilder) {
     var kind: str = doc.kind.get(node);
     if str_equal(kind, "table") {
         var items: Vec<i64> = Vec::new();
         var c: i64 = doc.first.get(node);
         while c >= 0 {
-            if doc.parent.get(c) == node { items.push(c); }
+            if doc.parent.get(c) == node {
+                items.push(c);
+            }
             c = doc.next.get(c);
         }
         // insertion sort by key
@@ -1197,7 +1514,9 @@ fn tj_node(doc: &TomlDoc, node: i64, sb: &mut StringBuilder) {
         sb.append_str("{");
         var k: i64 = 0;
         while k < order.len() {
-            if k > 0 { sb.append_str(","); }
+            if k > 0 {
+                sb.append_str(",");
+            }
             tj_str(doc.key.get(order.get(k)), sb);
             sb.append_str(":");
             tj_node(doc, order.get(k), sb);
@@ -1211,7 +1530,9 @@ fn tj_node(doc: &TomlDoc, node: i64, sb: &mut StringBuilder) {
         var e: i64 = doc.first.get(node);
         var first: bool = true;
         while e >= 0 {
-            if !first { sb.append_str(","); }
+            if !first {
+                sb.append_str(",");
+            }
             first = false;
             tj_node(doc, e, sb);
             e = doc.next.get(e);
@@ -1231,22 +1552,30 @@ fn tj_node(doc: &TomlDoc, node: i64, sb: &mut StringBuilder) {
 /// {"type":"integer","value":"1"}.
 pub fn toml_node_json(doc: TomlDoc, node: i64) -> str {
     var sb: StringBuilder = StringBuilder::new();
-    if node < 0 || node >= doc.kind.len() { return ""; }
-    tj_node(&doc, node, &mut sb);
+    if node < 0 || node >= doc.kind.len() {
+        return "";
+    }
+    tj_node(& doc, node, & mut sb);
     return sb.to_str();
 }
 
 /// The whole document in the toml-test JSON form; "" when it failed.
 pub fn toml_to_json(doc: TomlDoc) -> str {
-    if !doc.ok { return ""; }
+    if !doc.ok {
+        return "";
+    }
     return toml_node_json(doc, 0);
 }
 
 // ─── Flat form (toml_parse) ─────────────────────────────────────────────
 
 fn tf_kind(k: str) -> str {
-    if str_equal(k, "string") { return "str"; }
-    if str_equal(k, "integer") { return "int"; }
+    if str_equal(k, "string") {
+        return "str";
+    }
+    if str_equal(k, "integer") {
+        return "int";
+    }
     return k;
 }
 
@@ -1259,13 +1588,19 @@ pub fn toml_parse(text: str) -> Vec<TomlEntry> {
     var i: i64 = 1;
     while i < d.kind.len() {
         var kind: str = d.kind.get(i);
-        if str_equal(kind, "table") { i = i + 1; continue; }
+        if str_equal(kind, "table") {
+            i = i + 1;
+            continue;
+        }
         // only nodes reached through tables from the root
         var path: str = d.key.get(i);
         var p: i64 = d.parent.get(i);
         var reach: bool = p >= 0;
         while p > 0 {
-            if !str_equal(d.kind.get(p), "table") || d.parent.get(p) < 0 { reach = false; break; }
+            if !str_equal(d.kind.get(p), "table") || d.parent.get(p) < 0 {
+                reach = false;
+                break;
+            }
             path = d.key.get(p) + "." + path;
             p = d.parent.get(p);
         }
@@ -1279,8 +1614,11 @@ pub fn toml_parse(text: str) -> Vec<TomlEntry> {
                     e = e + 1;
                 }
             }
-            entries.push(TomlEntry { path: path,
-                value: TomlValue { kind: tf_kind(kind), sval: d.sval.get(i), items: items } });
+            entries.push(TomlEntry {
+                path: path, value: TomlValue {
+                    kind: tf_kind(kind), sval: d.sval.get(i), items: items
+                }
+            });
         }
         i = i + 1;
     }
@@ -1295,7 +1633,9 @@ pub fn toml_get(doc: Vec<TomlEntry>, path: str) -> TomlValue {
     while i > 0 {
         i = i - 1;
         var e: TomlEntry = doc.get(i);
-        if str_equal(e.path, path) { return e.value; }
+        if str_equal(e.path, path) {
+            return e.value;
+        }
     }
     return toml_invalid();
 }
@@ -1318,8 +1658,12 @@ pub fn toml_get_str(doc: Vec<TomlEntry>, path: str) -> str {
 /// Int value at `path`, `default` when absent or not numeric.
 pub fn toml_get_int(doc: Vec<TomlEntry>, path: str, default: i64) -> i64 {
     var v: TomlValue = toml_get(doc, path);
-    if str_equal(v.kind, "int") { return str_parse_int(v.sval); }
-    if str_equal(v.kind, "float") && !str_contains(v.sval, "n") { return str_parse_float(v.sval) as i64; }
+    if str_equal(v.kind, "int") {
+        return str_parse_int(v.sval);
+    }
+    if str_equal(v.kind, "float") && !str_contains(v.sval, "n") {
+        return str_parse_float(v.sval) as i64;
+    }
     return default;
 }
 
@@ -1335,7 +1679,9 @@ pub fn toml_get_float(doc: Vec<TomlEntry>, path: str, default: f64) -> f64 {
 /// Bool value at `path`, `default` when absent or not a bool.
 pub fn toml_get_bool(doc: Vec<TomlEntry>, path: str, default: bool) -> bool {
     var v: TomlValue = toml_get(doc, path);
-    if str_equal(v.kind, "bool") { return str_equal(v.sval, "true"); }
+    if str_equal(v.kind, "bool") {
+        return str_equal(v.sval, "true");
+    }
     return default;
 }
 
@@ -1355,7 +1701,9 @@ pub fn toml_keys(doc: Vec<TomlEntry>) -> Vec<str> {
 pub fn toml_table_keys(doc: Vec<TomlEntry>, path: str) -> Vec<str> {
     var out: Vec<str> = Vec::new();
     var prefix: str = path;
-    if str_len(prefix) > 0 { prefix = prefix + "."; }
+    if str_len(prefix) > 0 {
+        prefix = prefix + ".";
+    }
     var i: i64 = 0;
     while i < doc.len() {
         var p: str = doc.get(i).path;
@@ -1363,14 +1711,20 @@ pub fn toml_table_keys(doc: Vec<TomlEntry>, path: str) -> Vec<str> {
             var rest: str = str_slice(p, str_len(prefix), str_len(p));
             var dot: i64 = str_find(rest, ".");
             var first: str = rest;
-            if dot >= 0 { first = str_slice(rest, 0, dot); }
+            if dot >= 0 {
+                first = str_slice(rest, 0, dot);
+            }
             var seen: bool = false;
             var j: i64 = 0;
             while j < out.len() {
-                if str_equal(out.get(j), first) { seen = true; }
+                if str_equal(out.get(j), first) {
+                    seen = true;
+                }
                 j = j + 1;
             }
-            if !seen { out.push(first); }
+            if !seen {
+                out.push(first);
+            }
         }
         i = i + 1;
     }

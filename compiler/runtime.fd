@@ -64,11 +64,7 @@
 // per-OS syscall numbers.
 
 module compiler::runtime;
-
-use core;
-use vec;
-use string;
-
+ use core; use vec; use string;
 // ==========================================================================
 // Per-arch ABI boundary (provided by the runtime stub object, not this file)
 // ==========================================================================
@@ -94,16 +90,14 @@ extern "C" {
 //   - free==1 means on the free list (next_free links free blocks)
 //   - heap grows by RT_PAGE_CHUNK (64KB) chunks via rt_sys_mmap
 
-const RT_HDR_SIZE: i64 = 24;
-const RT_ALIGN: i64 = 16;
-const RT_PAGE_CHUNK: i64 = 65536;
-
+const RT_HDR_SIZE: i64 = 24; const RT_ALIGN: i64 = 16; const RT_PAGE_CHUNK: i64 = 65536;
 // Global free-list head (Fides is single-threaded per the opt.fd note).
 var rt_free_head: i64 = 0;
-
-fn rt_align_up(n: i64, a: i64) -> i64 {
+ fn rt_align_up(n: i64, a: i64) -> i64 {
     var r: i64 = n % a;
-    if r == 0 { return n; }
+    if r == 0 {
+        return n;
+    }
     return n + (a - r);
 }
 
@@ -111,17 +105,21 @@ fn rt_align_up(n: i64, a: i64) -> i64 {
 // splice the remainder onto the free list.
 fn rt_grow_heap(need: i64) -> i64 {
     var chunk: i64 = RT_PAGE_CHUNK;
-    if need + RT_HDR_SIZE > chunk { chunk = rt_align_up(need + RT_HDR_SIZE, 4096); }
+    if need + RT_HDR_SIZE > chunk {
+        chunk = rt_align_up(need + RT_HDR_SIZE, 4096);
+    }
     var base: i64 = rt_sys_mmap(chunk);
-    if base == 0 { return 0; }
+    if base == 0 {
+        return 0;
+    }
     var hdr: i64 = base;
-    var p_size: *mut i64 = hdr;
-    var p_free: *mut i64 = hdr + 8;
-    var p_next: *mut i64 = hdr + 16;
+    var p_size: * mut i64 = hdr;
+    var p_free: * mut i64 = hdr + 8;
+    var p_next: * mut i64 = hdr + 16;
     unsafe {
-        *p_size = chunk - RT_HDR_SIZE;
-        *p_free = 1;
-        *p_next = rt_free_head;
+        * p_size = chunk - RT_HDR_SIZE;
+        * p_free = 1;
+        * p_next = rt_free_head;
     }
     rt_free_head = hdr;
     return base;
@@ -130,7 +128,9 @@ fn rt_grow_heap(need: i64) -> i64 {
 // First-fit: find a free block >= need, split if oversized.
 pub fn p_malloc(size: i64) -> i64 {
     var need: i64 = rt_align_up(size, RT_ALIGN);
-    if need <= 0 { need = RT_ALIGN; }
+    if need <= 0 {
+        need = RT_ALIGN;
+    }
 
     var prev: i64 = 0;
     var cur: i64 = rt_free_head;
@@ -138,48 +138,54 @@ pub fn p_malloc(size: i64) -> i64 {
         var b_size: i64 = 0;
         var b_free: i64 = 0;
         var b_next: i64 = 0;
-        var sp: *mut i64 = cur;
-        var fp: *mut i64 = cur + 8;
-        var np: *mut i64 = cur + 16;
+        var sp: * mut i64 = cur;
+        var fp: * mut i64 = cur + 8;
+        var np: * mut i64 = cur + 16;
         unsafe {
-            b_size = *sp;
-            b_free = *fp;
-            b_next = *np;
+            b_size = * sp;
+            b_free = * fp;
+            b_next = * np;
         }
         if b_free == 1 && b_size >= need {
             // Split: leave remainder as a new free block if it can hold
             // header + a minimum payload.
             if b_size >= need + RT_HDR_SIZE + RT_ALIGN {
                 var rem: i64 = cur + RT_HDR_SIZE + need;
-                var rs: *mut i64 = rem;
-                var rf: *mut i64 = rem + 8;
-                var rn: *mut i64 = rem + 16;
+                var rs: * mut i64 = rem;
+                var rf: * mut i64 = rem + 8;
+                var rn: * mut i64 = rem + 16;
                 unsafe {
-                    *rs = b_size - need - RT_HDR_SIZE;
-                    *rf = 1;
-                    *rn = b_next;
+                    * rs = b_size - need - RT_HDR_SIZE;
+                    * rf = 1;
+                    * rn = b_next;
                 }
                 unsafe {
-                    *sp = need;
-                    *fp = 0;
-                    *np = rem;
+                    * sp = need;
+                    * fp = 0;
+                    * np = rem;
                 }
                 // unlink `cur`, point its slot-chain at `rem` instead
                 if prev == 0 {
                     rt_free_head = rem;
                 } else {
-                    var pnext: *mut i64 = prev + 16;
-                    unsafe { *pnext = rem; }
+                    var pnext: * mut i64 = prev + 16;
+                    unsafe {
+                        * pnext = rem;
+                    }
                 }
             } else {
                 // consume whole block
                 if prev == 0 {
                     rt_free_head = b_next;
                 } else {
-                    var pnext2: *mut i64 = prev + 16;
-                    unsafe { *pnext2 = b_next; }
+                    var pnext2: * mut i64 = prev + 16;
+                    unsafe {
+                        * pnext2 = b_next;
+                    }
                 }
-                unsafe { *fp = 0; }
+                unsafe {
+                    * fp = 0;
+                }
             }
             return cur + RT_HDR_SIZE;
         }
@@ -188,18 +194,22 @@ pub fn p_malloc(size: i64) -> i64 {
     }
 
     // Nothing free — grow the heap and retry once.
-    if rt_grow_heap(need) == 0 { return 0; }
+    if rt_grow_heap(need) == 0 {
+        return 0;
+    }
     return p_malloc(size);
 }
 
 pub fn p_free(ptr: i64) {
-    if ptr == 0 { return; }
+    if ptr == 0 {
+        return;
+    }
     var hdr: i64 = ptr - RT_HDR_SIZE;
-    var fp: *mut i64 = hdr + 8;
-    var np: *mut i64 = hdr + 16;
+    var fp: * mut i64 = hdr + 8;
+    var np: * mut i64 = hdr + 16;
     unsafe {
-        *fp = 1;
-        *np = rt_free_head;
+        * fp = 1;
+        * np = rt_free_head;
     }
     rt_free_head = hdr;
     // NOTE: no coalescing yet — adjacent free blocks stay fragmented.
@@ -207,7 +217,9 @@ pub fn p_free(ptr: i64) {
     // coalescing on free.
 }
 
-pub fn p_alloc(size: i64) -> i64 { return p_malloc(size); }
+pub fn p_alloc(size: i64) -> i64 {
+    return p_malloc(size);
+}
 
 // ==========================================================================
 // Raw memory — byte loops (the fast SIMD versions belong in the stubs
@@ -217,8 +229,10 @@ pub fn p_alloc(size: i64) -> i64 { return p_malloc(size); }
 pub fn p_memset(dst: i64, byte: i64, n: i64) -> i64 {
     var i: i64 = 0;
     while i < n {
-        var p: *mut i64 = dst + i;
-        unsafe { *p = byte & 0xFF; }
+        var p: * mut i64 = dst + i;
+        unsafe {
+            * p = byte & 0xFF;
+        }
         i = i + 1;
     }
     return dst;
@@ -227,9 +241,11 @@ pub fn p_memset(dst: i64, byte: i64, n: i64) -> i64 {
 pub fn p_memcpy(dst: i64, src: i64, n: i64) -> i64 {
     var i: i64 = 0;
     while i < n {
-        var d: *mut i64 = dst + i;
-        var s: *mut i64 = src + i;
-        unsafe { *d = *s; }
+        var d: * mut i64 = dst + i;
+        var s: * mut i64 = src + i;
+        unsafe {
+            * d = * s;
+        }
         i = i + 1;
     }
     return dst;
@@ -241,13 +257,13 @@ pub fn p_memcpy(dst: i64, src: i64, n: i64) -> i64 {
 
 pub fn p_str_length(s: i64) -> i64 {
     var n: i64 = 0;
-    var p: *mut i64 = s;
+    var p: * mut i64 = s;
     unsafe {
-        var b: i64 = *p;
+        var b: i64 = * p;
         while b != 0 {
             n = n + 1;
             p = s + n;
-            b = *p;
+            b = * p;
         }
     }
     return n;
@@ -257,28 +273,34 @@ pub fn p_str_concat(a: i64, b: i64) -> i64 {
     var la: i64 = p_str_length(a);
     var lb: i64 = p_str_length(b);
     var out: i64 = p_str_alloc(la + lb);
-    if out == 0 { return 0; }
+    if out == 0 {
+        return 0;
+    }
     p_memcpy(out, a, la);
     p_memcpy(out + la, b, lb);
-    var z: *mut i64 = out + la + lb;
-    unsafe { *z = 0; }
+    var z: * mut i64 = out + la + lb;
+    unsafe {
+        * z = 0;
+    }
     return out;
 }
 
 pub fn p_str_equal(a: i64, b: i64) -> bool {
     var i: i64 = 0;
-    var pa: *mut i64 = a;
-    var pb: *mut i64 = b;
+    var pa: * mut i64 = a;
+    var pb: * mut i64 = b;
     unsafe {
-        var ba: i64 = *pa;
-        var bb: i64 = *pb;
+        var ba: i64 = * pa;
+        var bb: i64 = * pb;
         while ba != 0 && bb != 0 {
-            if ba != bb { return false; }
+            if ba != bb {
+                return false;
+            }
             i = i + 1;
             pa = a + i;
             pb = b + i;
-            ba = *pa;
-            bb = *pb;
+            ba = * pa;
+            bb = * pb;
         }
         return ba == bb;
     }
@@ -287,18 +309,20 @@ pub fn p_str_equal(a: i64, b: i64) -> bool {
 
 pub fn p_str_compare(a: i64, b: i64) -> i64 {
     var i: i64 = 0;
-    var pa: *mut i64 = a;
-    var pb: *mut i64 = b;
+    var pa: * mut i64 = a;
+    var pb: * mut i64 = b;
     unsafe {
-        var ba: i64 = *pa;
-        var bb: i64 = *pb;
+        var ba: i64 = * pa;
+        var bb: i64 = * pb;
         while ba != 0 && bb != 0 {
-            if ba != bb { return ba - bb; }
+            if ba != bb {
+                return ba - bb;
+            }
             i = i + 1;
             pa = a + i;
             pb = b + i;
-            ba = *pa;
-            bb = *pb;
+            ba = * pa;
+            bb = * pb;
         }
         return ba - bb;
     }
@@ -312,61 +336,85 @@ pub fn p_str_compare(a: i64, b: i64) -> i64 {
 pub fn p_to_str(n: i64) -> i64 {
     if n == 0 {
         var z: i64 = p_str_alloc(1);
-        var zp: *mut i64 = z;
-        unsafe { *zp = 48; }
-        var zn: *mut i64 = z + 1;
-        unsafe { *zn = 0; }
+        var zp: * mut i64 = z;
+        unsafe {
+            * zp = 48;
+        }
+        var zn: * mut i64 = z + 1;
+        unsafe {
+            * zn = 0;
+        }
         return z;
     }
     var neg: bool = n < 0;
     var m: i64 = n;
-    if neg { m = -n; }
+    if neg {
+        m = - n;
+    }
     // digits (reverse into a 24-byte scratch on the stack? Fides has no
     // VLAs — use a small heap scratch then reverse into place)
     var scratch: i64 = p_malloc(32);
     var cnt: i64 = 0;
     while m > 0 {
         var d: i64 = m % 10;
-        var dp: *mut i64 = scratch + cnt;
-        unsafe { *dp = 48 + d; }
+        var dp: * mut i64 = scratch + cnt;
+        unsafe {
+            * dp = 48 + d;
+        }
         cnt = cnt + 1;
         m = m / 10;
     }
     var out_len: i64 = cnt;
-    if neg { out_len = cnt + 1; }
+    if neg {
+        out_len = cnt + 1;
+    }
     var out: i64 = p_str_alloc(out_len);
     var oi: i64 = 0;
     if neg {
-        var mp: *mut i64 = out;
-        unsafe { *mp = 45; }
+        var mp: * mut i64 = out;
+        unsafe {
+            * mp = 45;
+        }
         oi = 1;
     }
     var ri: i64 = cnt - 1;
     while ri >= 0 {
-        var sp: *mut i64 = scratch + ri;
-        var op: *mut i64 = out + oi;
-        unsafe { *op = *sp; }
+        var sp: * mut i64 = scratch + ri;
+        var op: * mut i64 = out + oi;
+        unsafe {
+            * op = * sp;
+        }
         oi = oi + 1;
-        if ri == 0 { break; }
+        if ri == 0 {
+            break;
+        }
         ri = ri - 1;
     }
-    var zp2: *mut i64 = out + oi;
-    unsafe { *zp2 = 0; }
+    var zp2: * mut i64 = out + oi;
+    unsafe {
+        * zp2 = 0;
+    }
     p_free(scratch);
     return out;
 }
 
 pub fn p_char_to_str(b: i64) -> i64 {
     var out: i64 = p_str_alloc(1);
-    var p: *mut i64 = out;
-    unsafe { *p = b & 0xFF; }
-    var z: *mut i64 = out + 1;
-    unsafe { *z = 0; }
+    var p: * mut i64 = out;
+    unsafe {
+        * p = b & 0xFF;
+    }
+    var z: * mut i64 = out + 1;
+    unsafe {
+        * z = 0;
+    }
     return out;
 }
 
 pub fn p_bool_to_str(b: bool) -> i64 {
-    if b { return p_str_literal_dup("true"); }
+    if b {
+        return p_str_literal_dup("true");
+    }
     return p_str_literal_dup("false");
 }
 
@@ -403,7 +451,11 @@ pub fn p_print_int(n: i64) {
 }
 
 pub fn p_print_bool(b: bool) {
-    if b { p_print_str_raw("true"); } else { p_print_str_raw("false"); }
+    if b {
+        p_print_str_raw("true");
+    } else {
+        p_print_str_raw("false");
+    }
 }
 
 fn p_print_str_raw(s: str) {
@@ -440,17 +492,12 @@ pub fn p_exit(code: i64) {
 // open flags (Linux): O_RDONLY=0 O_WRONLY=1 O_RDWR=2 O_CREAT=64 O_TRUNC=512
 // mode for O_CREAT: 0644 = 420
 
-const RT_O_RDONLY: i64 = 0;
-const RT_O_WRONLY: i64 = 1;
-const RT_O_RDWR: i64 = 2;
-const RT_O_CREAT: i64 = 64;
-const RT_O_TRUNC: i64 = 512;
-const RT_O_APPEND: i64 = 1024;
-const RT_MODE_644: i64 = 420;
-
-pub fn p_file_write(path: i64, content: i64) -> i64 {
+const RT_O_RDONLY: i64 = 0; const RT_O_WRONLY: i64 = 1; const RT_O_RDWR: i64 = 2; const RT_O_CREAT: i64 = 64; const RT_O_TRUNC: i64 = 512; const RT_O_APPEND: i64 = 1024; const RT_MODE_644: i64 = 420;
+ pub fn p_file_write(path: i64, content: i64) -> i64 {
     var fd: i64 = rt_sys_open(path, RT_O_WRONLY | RT_O_CREAT | RT_O_TRUNC, RT_MODE_644);
-    if fd < 0 { return fd; }
+    if fd < 0 {
+        return fd;
+    }
     var n: i64 = p_str_length(content);
     var w: i64 = rt_sys_write(fd, content, n);
     rt_sys_close(fd);
@@ -459,7 +506,9 @@ pub fn p_file_write(path: i64, content: i64) -> i64 {
 
 pub fn p_file_append(path: i64, content: i64) -> i64 {
     var fd: i64 = rt_sys_open(path, RT_O_WRONLY | RT_O_CREAT | RT_O_APPEND, RT_MODE_644);
-    if fd < 0 { return fd; }
+    if fd < 0 {
+        return fd;
+    }
     var n: i64 = p_str_length(content);
     var w: i64 = rt_sys_write(fd, content, n);
     rt_sys_close(fd);
@@ -468,7 +517,9 @@ pub fn p_file_append(path: i64, content: i64) -> i64 {
 
 pub fn p_file_exists(path: i64) -> bool {
     var fd: i64 = rt_sys_open(path, RT_O_RDONLY, 0);
-    if fd < 0 { return false; }
+    if fd < 0 {
+        return false;
+    }
     rt_sys_close(fd);
     return true;
 }
@@ -476,7 +527,9 @@ pub fn p_file_exists(path: i64) -> bool {
 // Read whole file into a NUL-terminated heap buffer. Grows by doubling.
 pub fn p_file_read(path: i64) -> i64 {
     var fd: i64 = rt_sys_open(path, RT_O_RDONLY, 0);
-    if fd < 0 { return 0; }
+    if fd < 0 {
+        return 0;
+    }
     var cap: i64 = 4096;
     var buf: i64 = p_malloc(cap + 1);
     var total: i64 = 0;
@@ -491,14 +544,18 @@ pub fn p_file_read(path: i64) -> i64 {
             cap = ncap;
         }
         r = rt_sys_read(fd, buf + total, 4096);
-        if r > 0 { total = total + r; }
+        if r > 0 {
+            total = total + r;
+        }
     }
     rt_sys_close(fd);
     // Wrap the raw buffer in a length header so str_len is O(1).
     var out: i64 = p_str_alloc(total);
     p_memcpy(out, buf, total);
-    var z: *mut i64 = out + total;
-    unsafe { *z = 0; }
+    var z: * mut i64 = out + total;
+    unsafe {
+        * z = 0;
+    }
     p_free(buf);
     return out;
 }
@@ -507,26 +564,40 @@ pub fn p_file_read(path: i64) -> i64 {
 // Process args / environment / clock
 // ==========================================================================
 
-pub fn p_argc() -> i64 { return rt_sys_argc(); }
+pub fn p_argc() -> i64 {
+    return rt_sys_argc();
+}
 
 // Copy a C string into a length-headered Fides string (str_len O(1)).
 pub fn p_str_wrap(s: i64) -> i64 {
-    if s == 0 { return 0; }
+    if s == 0 {
+        return 0;
+    }
     var n: i64 = p_str_length(s);
     var out: i64 = p_str_alloc(n);
     p_memcpy(out, s, n + 1);
     return out;
 }
 
-pub fn p_argv(i: i64) -> i64 { return p_str_wrap(rt_sys_argv(i)); }
+pub fn p_argv(i: i64) -> i64 {
+    return p_str_wrap(rt_sys_argv(i));
+}
 
-pub fn p_getenv(name: i64) -> i64 { return p_str_wrap(rt_sys_getenv(name)); }
+pub fn p_getenv(name: i64) -> i64 {
+    return p_str_wrap(rt_sys_getenv(name));
+}
 
-pub fn p_clock_now() -> i64 { return rt_sys_clock_ns(); }
+pub fn p_clock_now() -> i64 {
+    return rt_sys_clock_ns();
+}
 
-pub fn p_clock_now_ms() -> i64 { return rt_sys_clock_ns() / 1000000; }
+pub fn p_clock_now_ms() -> i64 {
+    return rt_sys_clock_ns() / 1000000;
+}
 
-pub fn p_clock_now_us() -> i64 { return rt_sys_clock_ns() / 1000; }
+pub fn p_clock_now_us() -> i64 {
+    return rt_sys_clock_ns() / 1000;
+}
 
 // ==========================================================================
 // TODO — the rest of the builtin surface (tracked by layer)

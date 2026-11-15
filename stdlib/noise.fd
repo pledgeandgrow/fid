@@ -2,23 +2,18 @@
 // Poisson-disk sampling. Deterministic from a seed; no state tables
 // beyond a per-call hash, so results are identical on every backend.
 module noise;
-
-use vec;
-use math;
-
+ use vec; use math;
 // --- hashing -----------------------------------------------------------------
 // Integer lattice hash -> uniform [0,1). Deterministic splitmix-ish mix.
 
-@wrapping
-fn hash2(x: i64, y: i64, seed: i64) -> i64 {
+@wrapping fn hash2(x: i64, y: i64, seed: i64) -> i64 {
     var h: i64 = x * 374761393 + y * 668265263 + seed * 974711;
     h = (h ^ (h >> 13)) * 1274126177;
     h = h ^ (h >> 16);
     return h & 0x3FFFFFFF;
 }
 
-@wrapping
-fn hash3(x: i64, y: i64, z: i64, seed: i64) -> i64 {
+@wrapping fn hash3(x: i64, y: i64, z: i64, seed: i64) -> i64 {
     var h: i64 = x * 374761393 + y * 668265263 + z * 2246822519 + seed * 974711;
     h = (h ^ (h >> 13)) * 1274126177;
     h = h ^ (h >> 16);
@@ -26,26 +21,46 @@ fn hash3(x: i64, y: i64, z: i64, seed: i64) -> i64 {
 }
 
 // fade(t) = 6t^5 - 15t^4 + 10t^3 (Ken Perlin's improved smootherstep)
-fn fade(t: f64) -> f64 { return t * t * t * (t * (t * 6.0 - 15.0) + 10.0); }
-fn lerp(a: f64, b: f64, t: f64) -> f64 { return a + t * (b - a); }
+fn fade(t: f64) -> f64 {
+    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+}
 
-@wrapping
-fn rng_next(r: i64) -> i64 {
+fn lerp(a: f64, b: f64, t: f64) -> f64 {
+    return a + t * (b - a);
+}
+
+@wrapping fn rng_next(r: i64) -> i64 {
     return (r * 6364136223846793005 + 1442695040888963407) & 0x7FFFFFFFFFFFFFFF;
 }
 
-fn floori(v: f64) -> i64 { return math_floor(v) as i64; }
+fn floori(v: f64) -> i64 {
+    return math_floor(v) as i64;
+}
 
 // 2D gradient: one of 8 directions chosen by hash bits.
 fn grad2(h: i64, dx: f64, dy: f64) -> f64 {
     var g: i64 = h & 7;
-    if g == 0 { return dx + dy; }
-    if g == 1 { return dx - dy; }
-    if g == 2 { return 0.0 - dx + dy; }
-    if g == 3 { return 0.0 - dx - dy; }
-    if g == 4 { return dx; }
-    if g == 5 { return 0.0 - dx; }
-    if g == 6 { return dy; }
+    if g == 0 {
+        return dx + dy;
+    }
+    if g == 1 {
+        return dx - dy;
+    }
+    if g == 2 {
+        return 0.0 - dx + dy;
+    }
+    if g == 3 {
+        return 0.0 - dx - dy;
+    }
+    if g == 4 {
+        return dx;
+    }
+    if g == 5 {
+        return 0.0 - dx;
+    }
+    if g == 6 {
+        return dy;
+    }
     return 0.0 - dy;
 }
 
@@ -55,7 +70,7 @@ fn grad2(h: i64, dx: f64, dy: f64) -> f64 {
 ///
 /// Example:
 ///   println(float_to_str(noise2(1.5, 2.5, 42)));
-///   // same call, same output — noise is deterministic
+///   // same call, same output -- noise is deterministic
 
 pub fn noise2(x: f64, y: f64, seed: i64) -> f64 {
     var x0: i64 = floori(x);
@@ -76,10 +91,19 @@ fn grad3(h: i64, dx: f64, dy: f64, dz: f64) -> f64 {
     // 16 of the 32 edge-midpoint gradients (Perlin's cube edges)
     var u: f64 = dx;
     var v: f64 = dy;
-    if g >= 8 { u = dy; v = dz; }
-    if (g & 4) != 0 { v = dz; }
-    if (g & 1) != 0 { u = 0.0 - u; }
-    if (g & 2) != 0 { v = 0.0 - v; }
+    if g >= 8 {
+        u = dy;
+        v = dz;
+    }
+    if (g & 4) != 0 {
+        v = dz;
+    }
+    if (g & 1) != 0 {
+        u = 0.0 - u;
+    }
+    if (g & 2) != 0 {
+        v = 0.0 - v;
+    }
     return u + v;
 }
 
@@ -94,14 +118,14 @@ pub fn noise3(x: f64, y: f64, z: f64, seed: i64) -> f64 {
     var u: f64 = fade(fx);
     var v: f64 = fade(fy);
     var w: f64 = fade(fz);
-    var n000: f64 = grad3(hash3(x0,y0,z0,seed), fx, fy, fz);
-    var n100: f64 = grad3(hash3(x0+1,y0,z0,seed), fx-1.0, fy, fz);
-    var n010: f64 = grad3(hash3(x0,y0+1,z0,seed), fx, fy-1.0, fz);
-    var n110: f64 = grad3(hash3(x0+1,y0+1,z0,seed), fx-1.0, fy-1.0, fz);
-    var n001: f64 = grad3(hash3(x0,y0,z0+1,seed), fx, fy, fz-1.0);
-    var n101: f64 = grad3(hash3(x0+1,y0,z0+1,seed), fx-1.0, fy, fz-1.0);
-    var n011: f64 = grad3(hash3(x0,y0+1,z0+1,seed), fx, fy-1.0, fz-1.0);
-    var n111: f64 = grad3(hash3(x0+1,y0+1,z0+1,seed), fx-1.0, fy-1.0, fz-1.0);
+    var n000: f64 = grad3(hash3(x0, y0, z0, seed), fx, fy, fz);
+    var n100: f64 = grad3(hash3(x0 + 1, y0, z0, seed), fx - 1.0, fy, fz);
+    var n010: f64 = grad3(hash3(x0, y0 + 1, z0, seed), fx, fy - 1.0, fz);
+    var n110: f64 = grad3(hash3(x0 + 1, y0 + 1, z0, seed), fx - 1.0, fy - 1.0, fz);
+    var n001: f64 = grad3(hash3(x0, y0, z0 + 1, seed), fx, fy, fz - 1.0);
+    var n101: f64 = grad3(hash3(x0 + 1, y0, z0 + 1, seed), fx - 1.0, fy, fz - 1.0);
+    var n011: f64 = grad3(hash3(x0, y0 + 1, z0 + 1, seed), fx, fy - 1.0, fz - 1.0);
+    var n111: f64 = grad3(hash3(x0 + 1, y0 + 1, z0 + 1, seed), fx - 1.0, fy - 1.0, fz - 1.0);
     var x00: f64 = lerp(n000, n100, u);
     var x10: f64 = lerp(n010, n110, u);
     var x01: f64 = lerp(n001, n101, u);
@@ -124,7 +148,9 @@ pub fn fbm2(x: f64, y: f64, oct: i64, gain: f64, seed: i64) -> f64 {
         f = f * 2.0;
         i = i + 1;
     }
-    if norm == 0.0 { return 0.0; }
+    if norm == 0.0 {
+        return 0.0;
+    }
     return sum / norm;
 }
 
@@ -142,7 +168,9 @@ pub fn fbm3(x: f64, y: f64, z: f64, oct: i64, gain: f64, seed: i64) -> f64 {
         f = f * 2.0;
         i = i + 1;
     }
-    if norm == 0.0 { return 0.0; }
+    if norm == 0.0 {
+        return 0.0;
+    }
     return sum / norm;
 }
 
@@ -154,20 +182,30 @@ pub fn fbm3(x: f64, y: f64, z: f64, oct: i64, gain: f64, seed: i64) -> f64 {
 /// active point (30 is standard). seed randomizes the start + picks.
 pub fn poisson2(w: i64, h: i64, r: i64, tries: i64, seed: i64) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
-    if r <= 0 || w <= 0 || h <= 0 { return out; }
-    var cell: i64 = r * 7 / 10;               // r / sqrt(2)
-    if cell < 1 { cell = 1; }
+    if r <= 0 || w <= 0 || h <= 0 {
+        return out;
+    }
+    var cell: i64 = r * 7 / 10;
+    // r / sqrt(2)
+    if cell < 1 {
+        cell = 1;
+    }
     var gw: i64 = (w + cell - 1) / cell;
     var gh: i64 = (h + cell - 1) / cell;
     var grid: Vec<i64> = Vec::new();
     var i: i64 = 0;
-    while i < gw * gh { grid.push(-1); i = i + 1; }
-    var active: Vec<i64> = Vec::new();        // packed x*100000+y
+    while i < gw * gh {
+        grid.push(- 1);
+        i = i + 1;
+    }
+    var active: Vec<i64> = Vec::new();
+    // packed x*100000+y
     var r2: i64 = r * r;
     // first sample: center-ish, seeded
     var x0: i64 = (hash2(7, 3, seed) % 1000) * w / 1000;
     var y0: i64 = (hash2(11, 5, seed) % 1000) * h / 1000;
-    out.push(x0); out.push(y0);
+    out.push(x0);
+    out.push(y0);
     active.push(x0 * 100000 + y0);
     grid.set((y0 / cell) * gw + x0 / cell, x0 * 100000 + y0);
     var rng: i64 = seed;
@@ -197,7 +235,9 @@ pub fn poisson2(w: i64, h: i64, r: i64, tries: i64, seed: i64) -> Vec<i64> {
                             if o >= 0 {
                                 var ox: i64 = o / 100000 - nx;
                                 var oy: i64 = o % 100000 - ny;
-                                if ox * ox + oy * oy < r2 { ok = false; }
+                                if ox * ox + oy * oy < r2 {
+                                    ok = false;
+                                }
                             }
                         }
                         gx = gx + 1;
@@ -205,7 +245,8 @@ pub fn poisson2(w: i64, h: i64, r: i64, tries: i64, seed: i64) -> Vec<i64> {
                     gy = gy + 1;
                 }
                 if ok {
-                    out.push(nx); out.push(ny);
+                    out.push(nx);
+                    out.push(ny);
                     active.push(nx * 100000 + ny);
                     grid.set((ny / cell) * gw + nx / cell, nx * 100000 + ny);
                     found = true;

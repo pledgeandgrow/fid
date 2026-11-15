@@ -36,30 +36,20 @@
 // using the available Interpreter API.
 
 module compiler::debugger;
-
-use core;
-use vec;
-use string;
-use compiler::interp;
-use compiler::ir;
-use compiler;
-use compiler::lower;
-
+ use core; use vec; use string; use compiler::interp; use compiler::ir; use compiler; use compiler::lower;
 // --- Breakpoint ---
 
 pub struct Breakpoint {
     pub id: i64,
     pub func_name: str,
-    pub line: i64,        // -1 means no specific line
+    pub line: i64,
+    // -1 means no specific line
     pub hit_count: i64,
 }
 
 pub fn Breakpoint_new(id: i64, func_name: str, line: i64) -> Breakpoint {
     return Breakpoint {
-        id: id,
-        func_name: func_name,
-        line: line,
-        hit_count: 0,
+        id: id, func_name: func_name, line: line, hit_count: 0,
     };
 }
 
@@ -71,7 +61,8 @@ pub struct Debugger {
     pub stepping: bool,
     pub step_over: bool,
     pub step_over_depth: i64,
-    pub watches: Vec<(str, str)>,    // (name, last_value_str)
+    pub watches: Vec<(str, str)>,
+    // (name, last_value_str)
     pub recording: bool,
     pub source_lines: Vec<str>,
     pub source_path: str,
@@ -79,20 +70,13 @@ pub struct Debugger {
 
 pub fn Debugger_new(source: str, source_path: str) -> Debugger {
     return Debugger {
-        breakpoints: Vec::new(),
-        next_bp_id: 1,
-        stepping: true,  // Start in stepping mode
-        step_over: false,
-        step_over_depth: 0,
-        watches: Vec::new(),
-        recording: false,
-        source_lines: str_lines(source),
-        source_path: source_path,
+        breakpoints: Vec::new(), next_bp_id: 1, stepping: true,  // Start in stepping mode
+        step_over: false, step_over_depth: 0, watches: Vec::new(), recording: false, source_lines: str_lines(source), source_path: source_path,
     };
 }
 
 /// Parse a breakpoint spec: "func", "func:42", "42" (line in any function)
-pub fn Debugger_parse_bp_spec(self: &Debugger, spec: str) -> (str, i64) {
+pub fn Debugger_parse_bp_spec(self: & Debugger, spec: str) -> (str, i64) {
     var colon_pos: i64 = str_find_char(spec, ":");
     if colon_pos >= 0 {
         var func: str = str_slice(spec, 0, colon_pos);
@@ -104,16 +88,11 @@ pub fn Debugger_parse_bp_spec(self: &Debugger, spec: str) -> (str, i64) {
     if n > 0 {
         return ("main", n);
     }
-    return (spec, -1);
+    return (spec, - 1);
 }
 
 /// Check if we should break at the current position
-pub fn Debugger_should_break(
-    self: &mut Debugger,
-    func_name: str,
-    source_line: i64,
-    call_depth: i64
-) -> bool {
+pub fn Debugger_should_break(self: & mut Debugger, func_name: str, source_line: i64, call_depth: i64) -> bool {
     // Stepping mode -- break on every instruction
     if self.stepping {
         if self.step_over && call_depth > self.step_over_depth {
@@ -144,7 +123,7 @@ pub fn Debugger_should_break(
 // --- Breakpoint management ---
 
 /// Add a breakpoint. Returns the new breakpoint id.
-pub fn Debugger_add_breakpoint(self: &mut Debugger, func_name: str, line: i64) -> i64 {
+pub fn Debugger_add_breakpoint(self: & mut Debugger, func_name: str, line: i64) -> i64 {
     var id: i64 = self.next_bp_id;
     self.next_bp_id = self.next_bp_id + 1;
     self.breakpoints.push(Breakpoint_new(id, func_name, line));
@@ -152,7 +131,7 @@ pub fn Debugger_add_breakpoint(self: &mut Debugger, func_name: str, line: i64) -
 }
 
 /// Delete a breakpoint by id. Returns true if deleted.
-pub fn Debugger_delete_breakpoint(self: &mut Debugger, id: i64) -> bool {
+pub fn Debugger_delete_breakpoint(self: & mut Debugger, id: i64) -> bool {
     var i: i64 = 0;
     while i < self.breakpoints.len() {
         if self.breakpoints.get(i).id == id {
@@ -165,7 +144,7 @@ pub fn Debugger_delete_breakpoint(self: &mut Debugger, id: i64) -> bool {
 }
 
 /// List all breakpoints as a formatted string.
-pub fn Debugger_list_breakpoints(self: &Debugger) -> str {
+pub fn Debugger_list_breakpoints(self: & Debugger) -> str {
     if self.breakpoints.len() == 0 {
         return "No breakpoints set.";
     }
@@ -174,9 +153,12 @@ pub fn Debugger_list_breakpoints(self: &Debugger) -> str {
     while i < self.breakpoints.len() {
         var bp: Breakpoint = self.breakpoints.get(i);
         var line_str: str = "";
-        if bp.line >= 0 { line_str = ":" + int_to_str(bp.line); } else { line_str = ""; }
-        result = result + "  #" + int_to_str(bp.id) + " " + bp.func_name + line_str
-            + " (hits: " + int_to_str(bp.hit_count) + ")\n";
+        if bp.line >= 0 {
+            line_str = ":" + int_to_str(bp.line);
+        } else {
+            line_str = "";
+        }
+        result = result + "  #" + int_to_str(bp.id) + " " + bp.func_name + line_str + " (hits: " + int_to_str(bp.hit_count) + ")\n";
         i = i + 1;
     }
     return result;
@@ -185,16 +167,16 @@ pub fn Debugger_list_breakpoints(self: &Debugger) -> str {
 // --- Watch management ---
 
 /// Add a watch on a variable.
-pub fn Debugger_add_watch(self: &mut Debugger, name: str) -> void {
+pub fn Debugger_add_watch(self: & mut Debugger, name: str) -> void {
     self.watches.push((name, ""));
 }
 
 /// Update a watch's last-seen value. Returns true if value changed.
-pub fn Debugger_update_watch(self: &mut Debugger, name: str, value_str: str) -> bool {
+pub fn Debugger_update_watch(self: & mut Debugger, name: str, value_str: str) -> bool {
     var i: i64 = 0;
     while i < self.watches.len() {
         var entry: (str, str) = self.watches.get(i);
-        var (w0, w1) = entry;
+        var(w0, w1) = entry;
         if w0 == name {
             var changed: bool = w1 != value_str;
             self.watches.set(i, (name, value_str));
@@ -206,7 +188,7 @@ pub fn Debugger_update_watch(self: &mut Debugger, name: str, value_str: str) -> 
 }
 
 /// List all watches as a formatted string.
-pub fn Debugger_list_watches(self: &Debugger) -> str {
+pub fn Debugger_list_watches(self: & Debugger) -> str {
     if self.watches.len() == 0 {
         return "No watches set.";
     }
@@ -214,7 +196,7 @@ pub fn Debugger_list_watches(self: &Debugger) -> str {
     var i: i64 = 0;
     while i < self.watches.len() {
         var entry: (str, str) = self.watches.get(i);
-        var (lw0, lw1) = entry;
+        var(lw0, lw1) = entry;
         result = result + "  " + lw0 + " = " + lw1 + "\n";
         i = i + 1;
     }
@@ -224,20 +206,28 @@ pub fn Debugger_list_watches(self: &Debugger) -> str {
 // --- Source listing ---
 
 /// Show source around a line.
-pub fn Debugger_list_source(self: &Debugger, line: i64, context: i64) -> str {
+pub fn Debugger_list_source(self: & Debugger, line: i64, context: i64) -> str {
     var start: i64 = line - context;
-    if start < 0 { start = 0; }
+    if start < 0 {
+        start = 0;
+    }
     var end: i64 = line + context + 1;
-    if end > self.source_lines.len() { end = self.source_lines.len(); }
+    if end > self.source_lines.len() {
+        end = self.source_lines.len();
+    }
 
     var result: str = "";
     var i: i64 = start;
     while i < end {
         var marker: str = "  ";
-        if i + 1 == line { marker = "-> "; }
+        if i + 1 == line {
+            marker = "-> ";
+        }
         var line_num: str = int_to_str(i + 1);
         // Pad line number to 4 chars
-        while str_len(line_num) < 4 { line_num = " " + line_num; }
+        while str_len(line_num) < 4 {
+            line_num = " " + line_num;
+        }
         var src: str = "";
         if i < self.source_lines.len() {
             src = self.source_lines.get(i);
@@ -253,14 +243,30 @@ pub fn Debugger_list_source(self: &Debugger, line: i64, context: i64) -> str {
 /// Format a Value for display.
 pub fn format_value(v: Value) -> str {
     match v {
-        Value::Int(i) => { return "i64: " + int_to_str(i); }
-        Value::Float(f) => { return "f64: " + float_to_str(f); }
-        Value::Bool(b) => { return "bool: " + bool_to_str(b); }
-        Value::Str(s) => { return "str: \"" + s + "\""; }
-        Value::Ptr(p) => { return "ptr: 0x" + int_to_hex(p); }
-        Value::Void => { return "void"; }
-        Value::Vec(idx) => { return "Vec[#" + int_to_str(idx) + "]"; }
-        Value::Map(idx) => { return "Map{#" + int_to_str(idx) + "}"; }
+        Value::Int(i) => {
+            return "i64: " + int_to_str(i);
+        }
+        Value::Float(f) => {
+            return "f64: " + float_to_str(f);
+        }
+        Value::Bool(b) => {
+            return "bool: " + bool_to_str(b);
+        }
+        Value::Str(s) => {
+            return "str: \"" + s + "\"";
+        }
+        Value::Ptr(p) => {
+            return "ptr: 0x" + int_to_hex(p);
+        }
+        Value::Void => {
+            return "void";
+        }
+        Value::Vec(idx) => {
+            return "Vec[#" + int_to_str(idx) + "]";
+        }
+        Value::Map(idx) => {
+            return "Map{#" + int_to_str(idx) + "}";
+        }
     }
     return "?";
 }
@@ -268,27 +274,7 @@ pub fn format_value(v: Value) -> str {
 // --- Help text ---
 
 pub fn print_debugger_help() -> str {
-    return "Fides Debugger Commands:\n"
-        + "  break <func>[:<line>]  Set a breakpoint\n"
-        + "  break                  List breakpoints\n"
-        + "  delete <n>             Delete breakpoint n\n"
-        + "  run                    Run until breakpoint or program end\n"
-        + "  step                   Step one instruction (into calls)\n"
-        + "  next                   Step one instruction (over calls)\n"
-        + "  continue               Continue execution\n"
-        + "  print <var>            Print a variable's value\n"
-        + "  print                  Print all variables in scope\n"
-        + "  backtrace              Show call stack\n"
-        + "  info locals            Show all local variables\n"
-        + "  info functions         List all functions\n"
-        + "  info breakpoints       List breakpoints\n"
-        + "  list                   Show source around current position\n"
-        + "  ir                     Show IR for current function\n"
-        + "  effects                Show active effects for current function\n"
-        + "  watch <var>            Watch a variable (print on change)\n"
-        + "  record                 Start recording execution trace\n"
-        + "  replay <file>          Replay a recorded trace\n"
-        + "  quit                   Exit debugger\n";
+    return "Fides Debugger Commands:\n" + "  break <func>[:<line>]  Set a breakpoint\n" + "  break                  List breakpoints\n" + "  delete <n>             Delete breakpoint n\n" + "  run                    Run until breakpoint or program end\n" + "  step                   Step one instruction (into calls)\n" + "  next                   Step one instruction (over calls)\n" + "  continue               Continue execution\n" + "  print <var>            Print a variable's value\n" + "  print                  Print all variables in scope\n" + "  backtrace              Show call stack\n" + "  info locals            Show all local variables\n" + "  info functions         List all functions\n" + "  info breakpoints       List breakpoints\n" + "  list                   Show source around current position\n" + "  ir                     Show IR for current function\n" + "  effects                Show active effects for current function\n" + "  watch <var>            Watch a variable (print on change)\n" + "  record                 Start recording execution trace\n" + "  replay <file>          Replay a recorded trace\n" + "  quit                   Exit debugger\n";
 }
 
 // --- Command parsing ---
@@ -308,7 +294,9 @@ pub fn parse_command(line: str) -> (str, str) {
 // --- Local helpers ---
 
 fn int_to_hex(n: i64) -> str {
-    if n == 0 { return "0"; }
+    if n == 0 {
+        return "0";
+    }
     var num: i64 = n;
     var buf: str = "";
     while num > 0 {
@@ -324,7 +312,9 @@ fn int_to_hex(n: i64) -> str {
 }
 
 fn bool_to_str(b: bool) -> str {
-    if b { return "true"; }
+    if b {
+        return "true";
+    }
     return "false";
 }
 
@@ -344,19 +334,25 @@ fn str_to_int(s: str) -> i64 {
     var result: i64 = 0;
     var i: i64 = 0;
     var negative: bool = false;
-    if str_len(s) == 0 { return -1; }
+    if str_len(s) == 0 {
+        return - 1;
+    }
     var first: i64 = str_byte_at(s, 0);
-    if first == 45 { // '-'
+    if first == 45 {
+        // '-'
         negative = true;
         i = 1;
-    }
-    while i < str_len(s) {
+    } while i < str_len(s) {
         var b: i64 = str_byte_at(s, i);
-        if b < 48 || b > 57 { return -1; }
+        if b < 48 || b > 57 {
+            return - 1;
+        }
         result = result * 10 + (b - 48);
         i = i + 1;
     }
-    if negative { return -result; }
+    if negative {
+        return - result;
+    }
     return result;
 }
 
@@ -381,10 +377,12 @@ fn str_lines(s: str) -> Vec<str> {
 fn str_find_char(s: str, ch: i64) -> i64 {
     var i: i64 = 0;
     while i < str_len(s) {
-        if str_byte_at(s, i) == ch { return i; }
+        if str_byte_at(s, i) == ch {
+            return i;
+        }
         i = i + 1;
     }
-    return -1;
+    return - 1;
 }
 
 // ===========================================================================
@@ -419,40 +417,14 @@ pub struct DebuggerState {
 
 pub fn DebuggerState_new() -> DebuggerState {
     return DebuggerState {
-        breakpoints: Vec::new(),
-        next_bp_id: 1,
-        stepping: true,
-        step_over: false,
-        watches: Vec::new(),
-        recording: false,
-        last_cmd: "step",
-        quit: false,
-        current_func: "",
-        current_block: "",
-        current_inst: 0,
-        current_source_line: 0,
-        call_depth: 0,
-        trace: Vec::new(),
+        breakpoints: Vec::new(), next_bp_id: 1, stepping: true, step_over: false, watches: Vec::new(), recording: false, last_cmd: "step", quit: false, current_func: "", current_block: "", current_inst: 0, current_source_line: 0, call_depth: 0, trace: Vec::new(),
     };
 }
 
 /// Initialize DebuggerState from an existing Debugger (copies breakpoints/watches).
-pub fn DebuggerState_from_debugger(dbg: &Debugger) -> DebuggerState {
+pub fn DebuggerState_from_debugger(dbg: & Debugger) -> DebuggerState {
     return DebuggerState {
-        breakpoints: dbg.breakpoints,
-        next_bp_id: dbg.next_bp_id,
-        stepping: true,
-        step_over: false,
-        watches: dbg.watches,
-        recording: dbg.recording,
-        last_cmd: "step",
-        quit: false,
-        current_func: "",
-        current_block: "",
-        current_inst: 0,
-        current_source_line: 0,
-        call_depth: 0,
-        trace: Vec::new(),
+        breakpoints: dbg.breakpoints, next_bp_id: dbg.next_bp_id, stepping: true, step_over: false, watches: dbg.watches, recording: dbg.recording, last_cmd: "step", quit: false, current_func: "", current_block: "", current_inst: 0, current_source_line: 0, call_depth: 0, trace: Vec::new(),
     };
 }
 
@@ -470,11 +442,7 @@ pub struct TraceEntry {
 
 pub fn TraceEntry_new(func_name: str, block_id: i64, inst_id: i64, source_line: i64) -> TraceEntry {
     return TraceEntry {
-        func_name: func_name,
-        block_id: block_id,
-        inst_id: inst_id,
-        source_line: source_line,
-        value_repr: OptStr::None,
+        func_name: func_name, block_id: block_id, inst_id: inst_id, source_line: source_line, value_repr: OptStr::None,
     };
 }
 
@@ -508,7 +476,8 @@ pub fn print_locals(values: Vec<Value>, func: IrFunction) -> str {
         if vid < values.len() {
             var v: Value = values.get(vid);
             match v {
-                Value::Void => { /* skip unbound */ }
+                Value::Void => {/* skip unbound */
+                }
                 _ => {
                     result = result + "  " + local.name + " = " + format_value(v) + "\n";
                     printed = printed + 1;
@@ -522,10 +491,13 @@ pub fn print_locals(values: Vec<Value>, func: IrFunction) -> str {
     if printed == 0 {
         var vi: i64 = 0;
         while vi < values.len() {
-            if vi >= 20 { break; }
+            if vi >= 20 {
+                break;
+            }
             var v: Value = values.get(vi);
             match v {
-                Value::Void => { /* skip */ }
+                Value::Void => {/* skip */
+                }
                 _ => {
                     result = result + "  v" + int_to_str(vi) + " = " + format_value(v) + "\n";
                 }
@@ -559,7 +531,8 @@ pub fn print_var(name: str, values: Vec<Value>, func: IrFunction) -> str {
             if vid < values.len() {
                 var v: Value = values.get(vid);
                 match v {
-                    Value::Void => { /* fall through to not found */ }
+                    Value::Void => {/* fall through to not found */
+                    }
                     _ => {
                         return "  " + name + " = " + format_value(v) + "\n";
                     }
@@ -571,13 +544,15 @@ pub fn print_var(name: str, values: Vec<Value>, func: IrFunction) -> str {
 
     // Try parsing as v<number>
     if str_len(name) > 1 {
-        if str_byte_at(name, 0) == 118 { // 'v'
+        if str_byte_at(name, 0) == 118 {
+            // 'v'
             var num_str: str = str_slice(name, 1, str_len(name));
             var n: i64 = str_to_int(num_str);
             if n >= 0 && n < values.len() {
                 var v: Value = values.get(n);
                 match v {
-                    Value::Void => { /* fall through */ }
+                    Value::Void => {/* fall through */
+                    }
                     _ => {
                         return "  " + name + " = " + format_value(v) + "\n";
                     }
@@ -601,14 +576,15 @@ pub fn show_ir(func: IrFunction) -> str {
     var params_str: str = "";
     var pi: i64 = 0;
     while pi < func.params.len() {
-        if pi > 0 { params_str = params_str + ", "; }
+        if pi > 0 {
+            params_str = params_str + ", ";
+        }
         var param: ValueIdType = func.params.get(pi);
         params_str = params_str + "v" + int_to_str(param.id) + ": " + ir_type_to_str(param.ty);
         pi = pi + 1;
     }
 
-    var result: str = "function " + func.name + "(" + params_str + ") -> "
-        + ir_type_to_str(func.ret_ty) + "\n";
+    var result: str = "function " + func.name + "(" + params_str + ") -> " + ir_type_to_str(func.ret_ty) + "\n";
 
     // Iterate blocks
     var bi: i64 = 0;
@@ -620,24 +596,27 @@ pub fn show_ir(func: IrFunction) -> str {
         var ii: i64 = 0;
         while ii < block.instructions.len() {
             var inst_id: i64 = block.instructions.get(ii);
-            var inst_opt: OptInst = IrFunction_get_inst(&func, inst_id);
+            var inst_opt: OptInst = IrFunction_get_inst(& func, inst_id);
             match inst_opt {
                 OptInst::Some(inst) => {
                     var line_str: str = "";
-                    var meta_opt: OptValueMeta = IrFunction_get_meta(&func, inst_id);
+                    var meta_opt: OptValueMeta = IrFunction_get_meta(& func, inst_id);
                     match meta_opt {
                         OptValueMeta::Some(meta) => {
                             match meta.source_line {
                                 OptU64::Some(line) => {
                                     line_str = " (line " + int_to_str(line) + ")";
                                 }
-                                OptU64::None => { line_str = ""; }
+                                OptU64::None => {
+                                    line_str = "";
+                                }
                             }
                         }
-                        OptValueMeta::None => { line_str = ""; }
+                        OptValueMeta::None => {
+                            line_str = "";
+                        }
                     }
-                    result = result + "    v" + int_to_str(inst_id) + " = "
-                        + inst_kind_name(&inst) + line_str + "\n";
+                    result = result + "    v" + int_to_str(inst_id) + " = " + inst_kind_name(& inst) + line_str + "\n";
                 }
                 OptInst::None => {
                     result = result + "    v" + int_to_str(inst_id) + " (missing)\n";
@@ -659,14 +638,15 @@ pub fn show_ir_with_current(func: IrFunction, current_inst: i64) -> str {
     var params_str: str = "";
     var pi: i64 = 0;
     while pi < func.params.len() {
-        if pi > 0 { params_str = params_str + ", "; }
+        if pi > 0 {
+            params_str = params_str + ", ";
+        }
         var param: ValueIdType = func.params.get(pi);
         params_str = params_str + "v" + int_to_str(param.id) + ": " + ir_type_to_str(param.ty);
         pi = pi + 1;
     }
 
-    var result: str = "function " + func.name + "(" + params_str + ") -> "
-        + ir_type_to_str(func.ret_ty) + "\n";
+    var result: str = "function " + func.name + "(" + params_str + ") -> " + ir_type_to_str(func.ret_ty) + "\n";
 
     var bi: i64 = 0;
     while bi < func.blocks.len() {
@@ -676,26 +656,31 @@ pub fn show_ir_with_current(func: IrFunction, current_inst: i64) -> str {
         var ii: i64 = 0;
         while ii < block.instructions.len() {
             var inst_id: i64 = block.instructions.get(ii);
-            var inst_opt: OptInst = IrFunction_get_inst(&func, inst_id);
+            var inst_opt: OptInst = IrFunction_get_inst(& func, inst_id);
             match inst_opt {
                 OptInst::Some(inst) => {
                     var line_str: str = "";
-                    var meta_opt: OptValueMeta = IrFunction_get_meta(&func, inst_id);
+                    var meta_opt: OptValueMeta = IrFunction_get_meta(& func, inst_id);
                     match meta_opt {
                         OptValueMeta::Some(meta) => {
                             match meta.source_line {
                                 OptU64::Some(line) => {
                                     line_str = " (line " + int_to_str(line) + ")";
                                 }
-                                OptU64::None => { line_str = ""; }
+                                OptU64::None => {
+                                    line_str = "";
+                                }
                             }
                         }
-                        OptValueMeta::None => { line_str = ""; }
+                        OptValueMeta::None => {
+                            line_str = "";
+                        }
                     }
                     var marker: str = "  ";
-                    if inst_id == current_inst { marker = "-> "; }
-                    result = result + "  " + marker + "v" + int_to_str(inst_id) + " = "
-                        + inst_kind_name(&inst) + line_str + "\n";
+                    if inst_id == current_inst {
+                        marker = "-> ";
+                    }
+                    result = result + "  " + marker + "v" + int_to_str(inst_id) + " = " + inst_kind_name(& inst) + line_str + "\n";
                 }
                 OptInst::None => {
                     result = result + "    v" + int_to_str(inst_id) + " (missing)\n";
@@ -714,7 +699,7 @@ pub fn show_ir_with_current(func: IrFunction, current_inst: i64) -> str {
 
 pub fn show_effects(func: IrFunction) -> str {
     var result: str = "Function: " + func.name + "\n";
-    result = result + "  Effects: " + EffectSet_to_str(&func.effects) + "\n";
+    result = result + "  Effects: " + EffectSet_to_str(& func.effects) + "\n";
     result = result + "  @wrapping: " + bool_to_str(func.is_wrapping) + "\n";
     result = result + "  @deterministic: " + bool_to_str(func.is_deterministic) + "\n";
     result = result + "  @crashfree: " + bool_to_str(func.is_crashfree) + "\n";
@@ -723,7 +708,8 @@ pub fn show_effects(func: IrFunction) -> str {
         OptU64::Some(gas) => {
             result = result + "  @gas: " + int_to_str(gas) + "\n";
         }
-        OptU64::None => { /* no gas limit */ }
+        OptU64::None => {/* no gas limit */
+        }
     }
     return result;
 }
@@ -743,8 +729,7 @@ pub fn list_functions(module: IrModule) -> str {
         var func: IrFunction = entry.func;
         var params: i64 = func.params.len();
         var blocks: i64 = func.blocks.len();
-        result = result + "  " + entry.name + " (" + int_to_str(params) + " params, "
-            + int_to_str(blocks) + " blocks)\n";
+        result = result + "  " + entry.name + " (" + int_to_str(params) + " params, " + int_to_str(blocks) + " blocks)\n";
         i = i + 1;
     }
     return result;
@@ -770,7 +755,7 @@ pub fn list_functions(module: IrModule) -> str {
 // creates the interpreter, and runs it. Interactive stepping is documented as
 // a future enhancement. The function returns the program exit code.
 
-pub fn Debugger_run(self: &mut Debugger, source: str, source_path: str) -> i64 {
+pub fn Debugger_run(self: & mut Debugger, source: str, source_path: str) -> i64 {
     p_eprint_str("Fides Debugger -- fidesc debug ");
     p_eprint_str(source_path);
     p_eprint_str("\n");
@@ -797,10 +782,10 @@ pub fn Debugger_run(self: &mut Debugger, source: str, source_path: str) -> i64 {
             var interp_inst: Interpreter = Interpreter_new(module);
 
             // Enable debug mode (simplified: no callback hook yet)
-            Interpreter_set_debug_hook(&mut interp_inst);
+            Interpreter_set_debug_hook(& mut interp_inst);
 
             // Run the interpreter
-            var result: RunResult = Interpreter_run(&mut interp_inst);
+            var result: RunResult = Interpreter_run(& mut interp_inst);
 
             // Handle result
             match result {
@@ -809,8 +794,12 @@ pub fn Debugger_run(self: &mut Debugger, source: str, source_path: str) -> i64 {
                     p_eprint_str(format_value(v));
                     p_eprint_str("\n");
                     match v {
-                        Value::Int(i) => { return i; }
-                        _ => { return 0; }
+                        Value::Int(i) => {
+                            return i;
+                        }
+                        _ => {
+                            return 0;
+                        }
                     }
                 }
                 RunResult::Panic(msg) => {
@@ -842,8 +831,7 @@ pub fn save_trace(trace: Vec<TraceEntry>, path: str) -> bool {
     var i: i64 = 0;
     while i < trace.len() {
         var entry: TraceEntry = trace.get(i);
-        var line: str = entry.func_name + " " + int_to_str(entry.block_id) + " "
-            + int_to_str(entry.inst_id) + " " + int_to_str(entry.source_line) + " ";
+        var line: str = entry.func_name + " " + int_to_str(entry.block_id) + " " + int_to_str(entry.inst_id) + " " + int_to_str(entry.source_line) + " ";
         match entry.value_repr {
             OptStr::Some(val_str) => {
                 line = line + val_str;
@@ -875,8 +863,15 @@ pub fn load_trace(path: str) -> Vec<TraceEntry> {
     while i < lines.len() {
         var line: str = str_trim(lines.get(i));
         // Skip comments and empty lines
-        if str_len(line) == 0 { i = i + 1; continue; }
-        if str_byte_at(line, 0) == 35 { i = i + 1; continue; } // '#'
+        if str_len(line) == 0 {
+            i = i + 1;
+            continue;
+        }
+        if str_byte_at(line, 0) == 35 {
+            i = i + 1;
+            continue;
+        }
+        // '#'
 
         // Split by whitespace: func_name block_id inst_id source_line [value]
         var parts: Vec<str> = split_whitespace(line);
@@ -927,13 +922,13 @@ pub fn replay_trace(path: str) -> i64 {
     var idx: i64 = 0;
     while idx < trace.len() {
         var entry: TraceEntry = trace.get(idx);
-        var line: str = "  [" + int_to_str(idx + 1) + "/" + int_to_str(trace.len()) + "] "
-            + entry.func_name + " v" + int_to_str(entry.inst_id);
+        var line: str = "  [" + int_to_str(idx + 1) + "/" + int_to_str(trace.len()) + "] " + entry.func_name + " v" + int_to_str(entry.inst_id);
         match entry.value_repr {
             OptStr::Some(val_str) => {
                 line = line + " = " + val_str;
             }
-            OptStr::None => { /* no value */ }
+            OptStr::None => {/* no value */
+            }
         }
         line = line + " (line " + int_to_str(entry.source_line) + ")\n";
         p_eprint_str(line);
@@ -954,19 +949,27 @@ pub fn replay_trace(path: str) -> i64 {
 fn split_whitespace(s: str) -> Vec<str> {
     var result: Vec<str> = Vec::new();
     var i: i64 = 0;
-    var start: i64 = -1;
+    var start: i64 = - 1;
     while i < str_len(s) {
         var b: i64 = str_byte_at(s, i);
         var is_space: bool = false;
-        if b == 32 { is_space = true; }      // space
-        if b == 9 { is_space = true; }       // tab
+        if b == 32 {
+            is_space = true;
+        }
+        // space
+        if b == 9 {
+            is_space = true;
+        }
+        // tab
         if is_space {
             if start >= 0 {
                 result.push(str_slice(s, start, i));
-                start = -1;
+                start = - 1;
             }
         } else {
-            if start < 0 { start = i; }
+            if start < 0 {
+                start = i;
+            }
         }
         i = i + 1;
     }

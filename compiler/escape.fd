@@ -14,12 +14,7 @@
 // Dependencies: compiler::ast
 
 module compiler::escape;
-
-use core;
-use vec;
-use string;
-use compiler::ast;
-
+ use core; use vec; use string; use compiler::ast;
 /// What a reference-holding value points into: a local variable (or
 /// by-value parameter) declared at block depth `depth`, or the function's
 /// `index`-th parameter, a reference the caller supplied.
@@ -47,17 +42,22 @@ pub enum OptEscVar {
 /// A function body with the name it is called by (`Type_method` for methods).
 pub struct EscFunc {
     pub key: str,
-    pub skey: str,   // skip-set key ("fn:n" / "impl:s:m" / "trait:t:m")
+    pub skey: str,
+    // skip-set key ("fn:n" / "impl:s:m" / "trait:t:m")
     pub func: Func,
 }
 
 pub struct EscapeChecker {
     pub all: Vec<EscFunc>,
-    pub func_index: i64,       // HashMap: key -> index + 1 into all
-    pub method_index: i64,     // HashMap: method name -> index + 1 into method_keys
+    pub func_index: i64,
+    // HashMap: key -> index + 1 into all
+    pub method_index: i64,
+    // HashMap: method name -> index + 1 into method_keys
     pub method_keys: Vec<Vec<str>>,
-    pub globals: i64,          // HashMap: global or const name -> 1
-    pub summary_index: i64,    // HashMap: key -> index + 1 into summaries
+    pub globals: i64,
+    // HashMap: global or const name -> 1
+    pub summary_index: i64,
+    // HashMap: key -> index + 1 into summaries
     pub summaries: Vec<Vec<i64>>,
     pub scopes: Vec<Vec<EscVar>>,
     pub func_name: str,
@@ -68,34 +68,47 @@ pub struct EscapeChecker {
     pub line: i64,
     pub report: bool,
     pub errors: Vec<str>,
-    pub type_names: i64,       // HashMap: declared struct or enum name -> 1
+    pub type_names: i64,
+    // HashMap: declared struct or enum name -> 1
     // Facts about each function of `all`, computed once (release D8: the
     // method-call check copied a whole Func per candidate method)
-    pub ret_has_ref: Vec<bool>,      // esc_contains_ref(ret_ty)
-    pub ret_is_ref: Vec<bool>,       // esc_is_ref_type(ret_ty)
-    pub param_has_ref: Vec<Vec<bool>>, // esc_contains_ref(params[j].ty)
+    pub ret_has_ref: Vec<bool>,
+    // esc_contains_ref(ret_ty)
+    pub ret_is_ref: Vec<bool>,
+    // esc_is_ref_type(ret_ty)
+    pub param_has_ref: Vec<Vec<bool>>,  // esc_contains_ref(params[j].ty)
 }
 
 // --- Root sets ------------------------------------------------------------
 
 fn esc_local(name: str, depth: i64) -> EscRoot {
-    return EscRoot { is_param: false, name: name, depth: depth, index: 0 };
+    return EscRoot {
+        is_param: false, name: name, depth: depth, index: 0
+    };
 }
 
 fn esc_param(index: i64) -> EscRoot {
-    return EscRoot { is_param: true, name: "", depth: 0, index: index };
+    return EscRoot {
+        is_param: true, name: "", depth: 0, index: index
+    };
 }
 
 // Rust's derived order: every Local before every Param; Locals by name, then
 // depth; Params by index.
 fn esc_root_cmp(a: EscRoot, b: EscRoot) -> i64 {
     if a.is_param != b.is_param {
-        if a.is_param { return 1; }
-        return -1;
+        if a.is_param {
+            return 1;
+        }
+        return - 1;
     }
-    if a.is_param { return a.index - b.index; }
+    if a.is_param {
+        return a.index - b.index;
+    }
     var c: i64 = str_compare(a.name, b.name);
-    if c != 0 { return c; }
+    if c != 0 {
+        return c;
+    }
     return a.depth - b.depth;
 }
 
@@ -119,15 +132,21 @@ fn esc_with(rs: Vec<EscRoot>, r: EscRoot) -> Vec<EscRoot> {
         out.push(x);
         i = i + 1;
     }
-    if !placed { out.push(r); }
+    if !placed {
+        out.push(r);
+    }
     return out;
 }
 
 fn esc_union(a: Vec<EscRoot>, b: Vec<EscRoot>) -> Vec<EscRoot> {
     // Root sets are never changed in place, so an empty side shares the
     // other (most sets are empty; this avoids most allocations).
-    if b.len() == 0 { return a; }
-    if a.len() == 0 { return b; }
+    if b.len() == 0 {
+        return a;
+    }
+    if a.len() == 0 {
+        return b;
+    }
     var out: Vec<EscRoot> = Vec::new();
     var i: i64 = 0;
     while i < a.len() {
@@ -163,13 +182,27 @@ fn esc_is_transparent(name: str) -> bool {
 /// parameters' or result's references).
 pub fn esc_contains_ref(t: Type) -> bool {
     match t {
-        Type::Ref(_, _) => { return true; }
-        Type::Generic(_, args) => { return esc_any_ref(args); }
-        Type::Tuple(args) => { return esc_any_ref(args); }
-        Type::Array(e, _) => { return esc_contains_ref(box_type_unbox(e)); }
-        Type::ArrayConst(e, _) => { return esc_contains_ref(box_type_unbox(e)); }
-        Type::ShapedTensor(e, _) => { return esc_contains_ref(box_type_unbox(e)); }
-        _ => { return false; }
+        Type::Ref(_, _) => {
+            return true;
+        }
+        Type::Generic(_, args) => {
+            return esc_any_ref(args);
+        }
+        Type::Tuple(args) => {
+            return esc_any_ref(args);
+        }
+        Type::Array(e, _) => {
+            return esc_contains_ref(box_type_unbox(e));
+        }
+        Type::ArrayConst(e, _) => {
+            return esc_contains_ref(box_type_unbox(e));
+        }
+        Type::ShapedTensor(e, _) => {
+            return esc_contains_ref(box_type_unbox(e));
+        }
+        _ => {
+            return false;
+        }
     }
     return false;
 }
@@ -177,7 +210,9 @@ pub fn esc_contains_ref(t: Type) -> bool {
 fn esc_any_ref(ts: Vec<Type>) -> bool {
     var i: i64 = 0;
     while i < ts.len() {
-        if esc_contains_ref(ts.get(i)) { return true; }
+        if esc_contains_ref(ts.get(i)) {
+            return true;
+        }
         i = i + 1;
     }
     return false;
@@ -187,7 +222,9 @@ fn esc_all_digits(s: str) -> bool {
     var i: i64 = 0;
     while i < str_len(s) {
         var c: i64 = str_byte_at(s, i);
-        if c < 48 || c > 57 { return false; }
+        if c < 48 || c > 57 {
+            return false;
+        }
         i = i + 1;
     }
     return true;
@@ -209,7 +246,9 @@ pub fn EscapeChecker_new(program: Program) -> EscapeChecker {
     var i: i64 = 0;
     while i < program.funcs.len() {
         var f: Func = program.funcs.get(i);
-        all.push(EscFunc { key: f.name, skey: "fn:" + f.name, func: f });
+        all.push(EscFunc {
+            key: f.name, skey: "fn:" + f.name, func: f
+        });
         i = i + 1;
     }
     var ii: i64 = 0;
@@ -218,7 +257,9 @@ pub fn EscapeChecker_new(program: Program) -> EscapeChecker {
         var mi: i64 = 0;
         while mi < imp.methods.len() {
             var m: Func = imp.methods.get(mi);
-            all.push(EscFunc { key: imp.struct_name + "_" + m.name, skey: "impl:" + imp.struct_name + ":" + m.name, func: m });
+            all.push(EscFunc {
+                key: imp.struct_name + "_" + m.name, skey: "impl:" + imp.struct_name + ":" + m.name, func: m
+            });
             mi = mi + 1;
         }
         ii = ii + 1;
@@ -229,7 +270,9 @@ pub fn EscapeChecker_new(program: Program) -> EscapeChecker {
         var tmi: i64 = 0;
         while tmi < timp.methods.len() {
             var tm: Func = timp.methods.get(tmi);
-            all.push(EscFunc { key: timp.type_name + "_" + tm.name, skey: "trait:" + timp.type_name + ":" + tm.name, func: tm });
+            all.push(EscFunc {
+                key: timp.type_name + "_" + tm.name, skey: "trait:" + timp.type_name + ":" + tm.name, func: tm
+            });
             tmi = tmi + 1;
         }
         ti = ti + 1;
@@ -303,52 +346,69 @@ pub fn EscapeChecker_new(program: Program) -> EscapeChecker {
         fk = fk + 1;
     }
     return EscapeChecker {
-        ret_has_ref: ret_has_ref,
-        ret_is_ref: ret_is_ref,
-        param_has_ref: param_has_ref,
-        all: all,
-        func_index: func_index,
-        method_index: method_index,
-        method_keys: method_keys,
-        globals: globals,
-        summary_index: HashMap_new(),
-        summaries: Vec::new(),
-        scopes: Vec::new(),
-        func_name: "",
-        flows: Vec::new(),
-        loop_depths: Vec::new(),
-        closure_base: 0,
-        unsafe_depth: 0,
-        line: 0,
-        report: false,
-        errors: Vec::new(),
-        type_names: type_names,
+        ret_has_ref: ret_has_ref, ret_is_ref: ret_is_ref, param_has_ref: param_has_ref, all: all, func_index: func_index, method_index: method_index, method_keys: method_keys, globals: globals, summary_index: HashMap_new(), summaries: Vec::new(), scopes: Vec::new(), func_name: "", flows: Vec::new(), loop_depths: Vec::new(), closure_base: 0, unsafe_depth: 0, line: 0, report: false, errors: Vec::new(), type_names: type_names,
     };
 }
 
 /// A result type no reference can be in: a scalar, str, void, or a
 /// declared struct or enum (not a type parameter, which a call could make
 /// a reference). Such a function's summary is always empty (CS3).
-fn esc_ret_noref(self: &EscapeChecker, t: Type) -> bool {
+fn esc_ret_noref(self: & EscapeChecker, t: Type) -> bool {
     match t {
-        Type::I8 => { return true; }
-        Type::I16 => { return true; }
-        Type::I32 => { return true; }
-        Type::I64 => { return true; }
-        Type::I128 => { return true; }
-        Type::U8 => { return true; }
-        Type::U16 => { return true; }
-        Type::U32 => { return true; }
-        Type::U64 => { return true; }
-        Type::U128 => { return true; }
-        Type::F32 => { return true; }
-        Type::F64 => { return true; }
-        Type::Bool => { return true; }
-        Type::Str => { return true; }
-        Type::Void => { return true; }
-        Type::Never => { return true; }
-        Type::Named(n) => { return HashMap_get(self.type_names, n) != 0; }
-        _ => { return false; }
+        Type::I8 => {
+            return true;
+        }
+        Type::I16 => {
+            return true;
+        }
+        Type::I32 => {
+            return true;
+        }
+        Type::I64 => {
+            return true;
+        }
+        Type::I128 => {
+            return true;
+        }
+        Type::U8 => {
+            return true;
+        }
+        Type::U16 => {
+            return true;
+        }
+        Type::U32 => {
+            return true;
+        }
+        Type::U64 => {
+            return true;
+        }
+        Type::U128 => {
+            return true;
+        }
+        Type::F32 => {
+            return true;
+        }
+        Type::F64 => {
+            return true;
+        }
+        Type::Bool => {
+            return true;
+        }
+        Type::Str => {
+            return true;
+        }
+        Type::Void => {
+            return true;
+        }
+        Type::Never => {
+            return true;
+        }
+        Type::Named(n) => {
+            return HashMap_get(self.type_names, n) != 0;
+        }
+        _ => {
+            return false;
+        }
     }
     return false;
 }
@@ -356,14 +416,20 @@ fn esc_ret_noref(self: &EscapeChecker, t: Type) -> bool {
 /// A `&mut`/`&` parameter holding a Vec, HashMap or str, given to a value
 /// parameter: the lowering reads the value through it, so the callee gets a
 /// value, not the reference (as src/escape.rs read_through).
-fn esc_read_through(self: &EscapeChecker, arg: Expr) -> bool {
+fn esc_read_through(self: & EscapeChecker, arg: Expr) -> bool {
     var n: str = "";
     match arg {
-        Expr::Ident(name) => { n = name; }
-        _ => { return false; }
+        Expr::Ident(name) => {
+            n = name;
+        }
+        _ => {
+            return false;
+        }
     }
     var slot: i64 = HashMap_get(self.func_index, self.func_name);
-    if slot == 0 { return false; }
+    if slot == 0 {
+        return false;
+    }
     var f: Func = self.all.get(slot - 1).func;
     var i: i64 = 0;
     while i < f.params.len() {
@@ -371,13 +437,23 @@ fn esc_read_through(self: &EscapeChecker, arg: Expr) -> bool {
             match f.params.get(i).ty {
                 Type::Ref(inner, _) => {
                     match box_type_unbox(inner) {
-                        Type::Generic(gn, _) => { return gn == "Vec" || gn == "HashMap"; }
-                        Type::Named(nn) => { return nn == "Vec" || nn == "HashMap"; }
-                        Type::Str => { return true; }
-                        _ => { return false; }
+                        Type::Generic(gn, _) => {
+                            return gn == "Vec" || gn == "HashMap";
+                        }
+                        Type::Named(nn) => {
+                            return nn == "Vec" || nn == "HashMap";
+                        }
+                        Type::Str => {
+                            return true;
+                        }
+                        _ => {
+                            return false;
+                        }
                     }
                 }
-                _ => { return false; }
+                _ => {
+                    return false;
+                }
             }
         }
         i = i + 1;
@@ -385,7 +461,7 @@ fn esc_read_through(self: &EscapeChecker, arg: Expr) -> bool {
     return false;
 }
 
-fn esc_error(self: &mut EscapeChecker, msg: str) {
+fn esc_error(self: & mut EscapeChecker, msg: str) {
     if self.report && self.unsafe_depth == 0 {
         var full: str = "Reference error (line " + int_to_str(self.line) + "): in '" + self.func_name + "', " + msg;
         if !str_vec_contains(self.errors, full) {
@@ -394,17 +470,19 @@ fn esc_error(self: &mut EscapeChecker, msg: str) {
     }
 }
 
-fn esc_is_global(self: &EscapeChecker, name: str) -> bool {
+fn esc_is_global(self: & EscapeChecker, name: str) -> bool {
     return HashMap_get(self.globals, name) != 0;
 }
 
-fn esc_summary(self: &EscapeChecker, key: str) -> Vec<i64> {
+fn esc_summary(self: & EscapeChecker, key: str) -> Vec<i64> {
     var slot: i64 = HashMap_get(self.summary_index, key);
-    if slot == 0 { return Vec::new(); }
+    if slot == 0 {
+        return Vec::new();
+    }
     return self.summaries.get(slot - 1);
 }
 
-fn esc_set_summary(self: &mut EscapeChecker, key: str, flows: Vec<i64>) {
+fn esc_set_summary(self: & mut EscapeChecker, key: str, flows: Vec<i64>) {
     var slot: i64 = HashMap_get(self.summary_index, key);
     if slot == 0 {
         self.summaries.push(flows);
@@ -414,7 +492,7 @@ fn esc_set_summary(self: &mut EscapeChecker, key: str, flows: Vec<i64>) {
     }
 }
 
-fn esc_summary_total(self: &EscapeChecker) -> i64 {
+fn esc_summary_total(self: & EscapeChecker) -> i64 {
     var n: i64 = 0;
     var i: i64 = 0;
     while i < self.summaries.len() {
@@ -428,7 +506,7 @@ fn esc_summary_total(self: &EscapeChecker) -> i64 {
 
 /// A parameter, local or return type: a reference may sit at the top or
 /// inside Option/Result/tuples, never inside storage.
-fn esc_check_value_type(self: &mut EscapeChecker, t: Type, what: str) {
+fn esc_check_value_type(self: & mut EscapeChecker, t: Type, what: str) {
     match t {
         Type::Ref(inner, _) => {
             if esc_contains_ref(box_type_unbox(inner)) {
@@ -453,17 +531,19 @@ fn esc_check_value_type(self: &mut EscapeChecker, t: Type, what: str) {
                 j = j + 1;
             }
         }
-        _ => { esc_check_storage_type(self, t, what); }
+        _ => {
+            esc_check_storage_type(self, t, what);
+        }
     }
 }
 
-fn esc_check_storage_type(self: &mut EscapeChecker, t: Type, what: str) {
+fn esc_check_storage_type(self: & mut EscapeChecker, t: Type, what: str) {
     if esc_contains_ref(t) {
         esc_error(self, what + " has type '" + type_to_str(t) + "', which stores a reference; references can only be passed to calls, held in locals and returned");
     }
 }
 
-fn esc_check_decls(self: &mut EscapeChecker, program: Program) {
+fn esc_check_decls(self: & mut EscapeChecker, program: Program) {
     self.report = true;
     var si: i64 = 0;
     while si < program.structs.len() {
@@ -494,7 +574,8 @@ fn esc_check_decls(self: &mut EscapeChecker, program: Program) {
                         pi = pi + 1;
                     }
                 }
-                OptParams::None => {}
+                OptParams::None => {
+                }
             }
             vi = vi + 1;
         }
@@ -513,106 +594,108 @@ fn esc_check_decls(self: &mut EscapeChecker, program: Program) {
 
 // --- Scopes ---------------------------------------------------------------
 
-fn esc_depth(self: &EscapeChecker) -> i64 {
+fn esc_depth(self: & EscapeChecker) -> i64 {
     return self.scopes.len();
 }
 
-fn esc_push_scope(self: &mut EscapeChecker) {
+fn esc_push_scope(self: & mut EscapeChecker) {
     self.scopes.push(Vec::new());
 }
 
-fn esc_pop_scope(self: &mut EscapeChecker) {
+fn esc_pop_scope(self: & mut EscapeChecker) {
     self.scopes.pop();
 }
 
-fn esc_declare(self: &mut EscapeChecker, name: str, roots: Vec<EscRoot>, is_ref: bool) {
+fn esc_declare(self: & mut EscapeChecker, name: str, roots: Vec<EscRoot>, is_ref: bool) {
     var last: i64 = self.scopes.len() - 1;
     var top: Vec<EscVar> = self.scopes.get(last);
     // A redeclaration in the same block shadows the earlier one.
     var i: i64 = 0;
     while i < top.len() {
         if top.get(i).name == name {
-            self.scopes.get(last).set(i, EscVar { name: name, depth: self.scopes.len(), roots: roots, is_ref: is_ref });
+            self.scopes.get(last).set(i, EscVar {
+                name: name, depth: self.scopes.len(), roots: roots, is_ref: is_ref
+            });
             return;
         }
         i = i + 1;
     }
-    self.scopes.get(last).push(EscVar { name: name, depth: self.scopes.len(), roots: roots, is_ref: is_ref });
+    self.scopes.get(last).push(EscVar {
+        name: name, depth: self.scopes.len(), roots: roots, is_ref: is_ref
+    });
 }
 
 fn esc_is_ref_type(t: Type) -> bool {
     match t {
-        Type::Ref(_, _) => { return true; }
-        _ => { return false; }
+        Type::Ref(_, _) => {
+            return true;
+        }
+        _ => {
+            return false;
+        }
     }
     return false;
 }
 
 /// Whether `e` evaluates to a reference itself (so a `match` on it binds
 /// plain payload values, which hold no reference).
-fn esc_is_reference(self: &EscapeChecker, e: Expr) -> bool {
+fn esc_is_reference(self: & EscapeChecker, e: Expr) -> bool {
     match e {
-        Expr::Ref(_, _) => { return true; }
+        Expr::Ref(_, _) => {
+            return true;
+        }
         Expr::Ident(name) => {
             match esc_lookup(self, name) {
-                OptEscVar::Some(v) => { return v.is_ref; }
-                OptEscVar::None => { return false; }
+                OptEscVar::Some(v) => {
+                    return v.is_ref;
+                }
+                OptEscVar::None => {
+                    return false;
+                }
             }
         }
         Expr::Call(callee, _) => {
             var slot: i64 = HashMap_get(self.func_index, callee);
-            if slot == 0 { return false; }
+            if slot == 0 {
+                return false;
+            }
             return esc_is_ref_type(self.all.get(slot - 1).func.ret_ty);
         }
         Expr::MethodCall(_, method, _) => {
             var mslot: i64 = HashMap_get(self.method_index, method);
-            if mslot == 0 { return false; }
+            if mslot == 0 {
+                return false;
+            }
             var keys: Vec<str> = self.method_keys.get(mslot - 1);
-            if keys.len() == 0 { return false; }
+            if keys.len() == 0 {
+                return false;
+            }
             var k: i64 = 0;
             while k < keys.len() {
-                if !self.ret_is_ref.get(HashMap_get(self.func_index, keys.get(k)) - 1) { return false; }
+                if !self.ret_is_ref.get(HashMap_get(self.func_index, keys.get(k)) - 1) {
+                    return false;
+                }
                 k = k + 1;
             }
             return true;
         }
-        _ => { return false; }
+        _ => {
+            return false;
+        }
     }
     return false;
 }
 
 /// The roots a `match` on `e` passes to its bindings.
-fn esc_binding_roots(self: &mut EscapeChecker, e: Expr) -> Vec<EscRoot> {
+fn esc_binding_roots(self: & mut EscapeChecker, e: Expr) -> Vec<EscRoot> {
     var r: Vec<EscRoot> = esc_expr(self, e);
-    if esc_is_reference(self, e) { return esc_none(); }
+    if esc_is_reference(self, e) {
+        return esc_none();
+    }
     return r;
 }
 
-fn esc_lookup(self: &EscapeChecker, name: str) -> OptEscVar {
-    var s: i64 = self.scopes.len() - 1;
-    while s >= 0 {
-        var scope: Vec<EscVar> = self.scopes.get(s);
-        var i: i64 = 0;
-        while i < scope.len() {
-            var v: EscVar = scope.get(i);
-            if v.name == name { return OptEscVar::Some(v); }
-            i = i + 1;
-        }
-        s = s - 1;
-    }
-    return OptEscVar::None;
-}
-
-fn esc_var_roots(self: &EscapeChecker, name: str) -> Vec<EscRoot> {
-    match esc_lookup(self, name) {
-        OptEscVar::Some(v) => { return v.roots; }
-        OptEscVar::None => { return esc_none(); }
-    }
-    return esc_none();
-}
-
-// Add `extra` to the roots of the innermost variable called `name`.
-fn esc_add_roots(self: &mut EscapeChecker, name: str, extra: Vec<EscRoot>) {
+fn esc_lookup(self: & EscapeChecker, name: str) -> OptEscVar {
     var s: i64 = self.scopes.len() - 1;
     while s >= 0 {
         var scope: Vec<EscVar> = self.scopes.get(s);
@@ -620,7 +703,39 @@ fn esc_add_roots(self: &mut EscapeChecker, name: str, extra: Vec<EscRoot>) {
         while i < scope.len() {
             var v: EscVar = scope.get(i);
             if v.name == name {
-                self.scopes.get(s).set(i, EscVar { name: v.name, depth: v.depth, roots: esc_union(v.roots, extra), is_ref: v.is_ref });
+                return OptEscVar::Some(v);
+            }
+            i = i + 1;
+        }
+        s = s - 1;
+    }
+    return OptEscVar::None;
+}
+
+fn esc_var_roots(self: & EscapeChecker, name: str) -> Vec<EscRoot> {
+    match esc_lookup(self, name) {
+        OptEscVar::Some(v) => {
+            return v.roots;
+        }
+        OptEscVar::None => {
+            return esc_none();
+        }
+    }
+    return esc_none();
+}
+
+// Add `extra` to the roots of the innermost variable called `name`.
+fn esc_add_roots(self: & mut EscapeChecker, name: str, extra: Vec<EscRoot>) {
+    var s: i64 = self.scopes.len() - 1;
+    while s >= 0 {
+        var scope: Vec<EscVar> = self.scopes.get(s);
+        var i: i64 = 0;
+        while i < scope.len() {
+            var v: EscVar = scope.get(i);
+            if v.name == name {
+                self.scopes.get(s).set(i, EscVar {
+                    name: v.name, depth: v.depth, roots: esc_union(v.roots, extra), is_ref: v.is_ref
+                });
                 return;
             }
             i = i + 1;
@@ -631,7 +746,7 @@ fn esc_add_roots(self: &mut EscapeChecker, name: str, extra: Vec<EscRoot>) {
 
 /// Drop the roots that point into blocks deeper than `depth`, reporting each
 /// one: a value leaving those blocks would dangle.
-fn esc_leave_blocks(self: &mut EscapeChecker, roots: Vec<EscRoot>, depth: i64, what: str) -> Vec<EscRoot> {
+fn esc_leave_blocks(self: & mut EscapeChecker, roots: Vec<EscRoot>, depth: i64, what: str) -> Vec<EscRoot> {
     var kept: Vec<EscRoot> = Vec::new();
     var i: i64 = 0;
     while i < roots.len() {
@@ -648,7 +763,7 @@ fn esc_leave_blocks(self: &mut EscapeChecker, roots: Vec<EscRoot>, depth: i64, w
 
 // --- Functions ------------------------------------------------------------
 
-fn esc_analyze_func(self: &mut EscapeChecker, key: str, f: Func) {
+fn esc_analyze_func(self: & mut EscapeChecker, key: str, f: Func) {
     self.func_name = f.name;
     self.line = 0;
     var no_flows: Vec<i64> = Vec::new();
@@ -674,8 +789,11 @@ fn esc_analyze_func(self: &mut EscapeChecker, key: str, f: Func) {
     esc_check_value_type(self, f.ret_ty, "the return type");
     var is_void: bool = false;
     match f.ret_ty {
-        Type::Void => { is_void = true; }
-        _ => {}
+        Type::Void => {
+            is_void = true;
+        }
+        _ => {
+        }
     }
     if is_void {
         var si: i64 = 0;
@@ -690,7 +808,7 @@ fn esc_analyze_func(self: &mut EscapeChecker, key: str, f: Func) {
     esc_set_summary(self, key, self.flows);
 }
 
-fn esc_check_return(self: &mut EscapeChecker, roots: Vec<EscRoot>) {
+fn esc_check_return(self: & mut EscapeChecker, roots: Vec<EscRoot>) {
     var i: i64 = 0;
     while i < roots.len() {
         var r: EscRoot = roots.get(i);
@@ -700,7 +818,9 @@ fn esc_check_return(self: &mut EscapeChecker, roots: Vec<EscRoot>) {
             }
         } else if r.depth > self.closure_base {
             var what: str = "a closure";
-            if self.closure_base == 0 { what = "'" + self.func_name + "'"; }
+            if self.closure_base == 0 {
+                what = "'" + self.func_name + "'";
+            }
             esc_error(self, what + " returns a reference to local '" + r.name + "', which is freed when it returns");
         }
         i = i + 1;
@@ -720,7 +840,9 @@ fn esc_sorted_insert_i64(v: Vec<i64>, x: i64) -> Vec<i64> {
         out.push(y);
         i = i + 1;
     }
-    if !placed { out.push(x); }
+    if !placed {
+        out.push(x);
+    }
     return out;
 }
 
@@ -728,9 +850,11 @@ fn esc_sorted_insert_i64(v: Vec<i64>, x: i64) -> Vec<i64> {
 
 /// Process `stmts` in the current scope and return the roots of their value
 /// (the last statement's, when it is an expression or a branch).
-fn esc_stmts_value(self: &mut EscapeChecker, stmts: Vec<Stmt>) -> Vec<EscRoot> {
+fn esc_stmts_value(self: & mut EscapeChecker, stmts: Vec<Stmt>) -> Vec<EscRoot> {
     var n: i64 = stmts.len();
-    if n == 0 { return esc_none(); }
+    if n == 0 {
+        return esc_none();
+    }
     var i: i64 = 0;
     while i < n - 1 {
         esc_stmt(self, stmts.get(i));
@@ -739,16 +863,21 @@ fn esc_stmts_value(self: &mut EscapeChecker, stmts: Vec<Stmt>) -> Vec<EscRoot> {
     return esc_stmt_value(self, stmts.get(n - 1));
 }
 
-fn esc_stmt_value(self: &mut EscapeChecker, s: Stmt) -> Vec<EscRoot> {
+fn esc_stmt_value(self: & mut EscapeChecker, s: Stmt) -> Vec<EscRoot> {
     self.line = stmt_line(s);
     match s {
-        Stmt::Expr(e, _) => { return esc_expr(self, e); }
+        Stmt::Expr(e, _) => {
+            return esc_expr(self, e);
+        }
         Stmt::If(cond, then_block, else_block, _) => {
             esc_expr(self, cond);
             var r: Vec<EscRoot> = esc_block_value(self, then_block, "the value of this branch");
             match else_block {
-                OptStmts::Some(eb) => { r = esc_union(r, esc_block_value(self, eb, "the value of this branch")); }
-                OptStmts::None => {}
+                OptStmts::Some(eb) => {
+                    r = esc_union(r, esc_block_value(self, eb, "the value of this branch"));
+                }
+                OptStmts::None => {
+                }
             }
             return r;
         }
@@ -762,10 +891,18 @@ fn esc_stmt_value(self: &mut EscapeChecker, s: Stmt) -> Vec<EscRoot> {
             self.unsafe_depth = self.unsafe_depth - 1;
             return ur;
         }
-        Stmt::Sandbox(body, _) => { return esc_block_value(self, body, "the value of this block"); }
-        Stmt::Txn(body, _) => { return esc_block_value(self, body, "the value of this block"); }
-        Stmt::RegionBlock(_, _, _, _, _, body, _) => { return esc_block_value(self, body, "the value of this block"); }
-        Stmt::Handle(body, _, _) => { return esc_block_value(self, body, "the value of this block"); }
+        Stmt::Sandbox(body, _) => {
+            return esc_block_value(self, body, "the value of this block");
+        }
+        Stmt::Txn(body, _) => {
+            return esc_block_value(self, body, "the value of this block");
+        }
+        Stmt::RegionBlock(_, _, _, _, _, body, _) => {
+            return esc_block_value(self, body, "the value of this block");
+        }
+        Stmt::Handle(body, _, _) => {
+            return esc_block_value(self, body, "the value of this block");
+        }
         _ => {
             esc_stmt(self, s);
             return esc_none();
@@ -775,7 +912,7 @@ fn esc_stmt_value(self: &mut EscapeChecker, s: Stmt) -> Vec<EscRoot> {
 }
 
 /// Evaluate a nested block's value; it must not point at the block's own locals.
-fn esc_block_value(self: &mut EscapeChecker, stmts: Vec<Stmt>, what: str) -> Vec<EscRoot> {
+fn esc_block_value(self: & mut EscapeChecker, stmts: Vec<Stmt>, what: str) -> Vec<EscRoot> {
     var outer: i64 = esc_depth(self);
     esc_push_scope(self);
     var r: Vec<EscRoot> = esc_stmts_value(self, stmts);
@@ -783,7 +920,7 @@ fn esc_block_value(self: &mut EscapeChecker, stmts: Vec<Stmt>, what: str) -> Vec
     return esc_leave_blocks(self, r, outer, what);
 }
 
-fn esc_block(self: &mut EscapeChecker, stmts: Vec<Stmt>) {
+fn esc_block(self: & mut EscapeChecker, stmts: Vec<Stmt>) {
     esc_push_scope(self);
     var i: i64 = 0;
     while i < stmts.len() {
@@ -795,7 +932,7 @@ fn esc_block(self: &mut EscapeChecker, stmts: Vec<Stmt>) {
 
 /// Check the arms of a `match`; with `want_value`, also return the roots of
 /// the value it produces.
-fn esc_arms(self: &mut EscapeChecker, arms: Vec<MatchArm>, scrutinee: Vec<EscRoot>, want_value: bool) -> Vec<EscRoot> {
+fn esc_arms(self: & mut EscapeChecker, arms: Vec<MatchArm>, scrutinee: Vec<EscRoot>, want_value: bool) -> Vec<EscRoot> {
     var outer: i64 = esc_depth(self);
     var out: Vec<EscRoot> = Vec::new();
     var ai: i64 = 0;
@@ -804,7 +941,9 @@ fn esc_arms(self: &mut EscapeChecker, arms: Vec<MatchArm>, scrutinee: Vec<EscRoo
         esc_push_scope(self);
         match arm.pattern {
             // A binding is the reference an Option/Result/tuple held.
-            Pattern::Ident(name) => { esc_declare(self, name, scrutinee, scrutinee.len() > 0); }
+            Pattern::Ident(name) => {
+                esc_declare(self, name, scrutinee, scrutinee.len() > 0);
+            }
             Pattern::EnumVariant(_, _, bindings) => {
                 var bi: i64 = 0;
                 while bi < bindings.len() {
@@ -812,11 +951,15 @@ fn esc_arms(self: &mut EscapeChecker, arms: Vec<MatchArm>, scrutinee: Vec<EscRoo
                     bi = bi + 1;
                 }
             }
-            _ => {}
+            _ => {
+            }
         }
         match arm.guard {
-            OptBoxExpr::Some(g) => { esc_expr(self, box_expr_deref(g)); }
-            OptBoxExpr::None => {}
+            OptBoxExpr::Some(g) => {
+                esc_expr(self, box_expr_deref(g));
+            }
+            OptBoxExpr::None => {
+            }
         }
         if want_value {
             var r: Vec<EscRoot> = esc_stmts_value(self, arm.body);
@@ -835,25 +978,32 @@ fn esc_arms(self: &mut EscapeChecker, arms: Vec<MatchArm>, scrutinee: Vec<EscRoo
     return out;
 }
 
-fn esc_loop_body(self: &mut EscapeChecker, body: Vec<Stmt>) {
+fn esc_loop_body(self: & mut EscapeChecker, body: Vec<Stmt>) {
     self.loop_depths.push(esc_depth(self));
     esc_block(self, body);
     self.loop_depths.pop();
 }
 
-fn esc_stmt(self: &mut EscapeChecker, s: Stmt) {
+fn esc_stmt(self: & mut EscapeChecker, s: Stmt) {
     self.line = stmt_line(s);
     match s {
         Stmt::Let(name, ty, expr, _, _, _, _) => {
             match ty {
-                OptType::Some(t) => { esc_check_value_type(self, t, "local '" + name + "'"); }
-                OptType::None => {}
+                OptType::Some(t) => {
+                    esc_check_value_type(self, t, "local '" + name + "'");
+                }
+                OptType::None => {
+                }
             }
             var r: Vec<EscRoot> = esc_expr(self, expr);
             var is_ref: bool = false;
             match ty {
-                OptType::Some(t2) => { is_ref = esc_is_ref_type(t2); }
-                OptType::None => { is_ref = esc_is_reference(self, expr); }
+                OptType::Some(t2) => {
+                    is_ref = esc_is_ref_type(t2);
+                }
+                OptType::None => {
+                    is_ref = esc_is_reference(self, expr);
+                }
             }
             esc_declare(self, name, r, is_ref);
         }
@@ -886,8 +1036,11 @@ fn esc_stmt(self: &mut EscapeChecker, s: Stmt) {
             if fr.len() > 0 {
                 if esc_all_digits(field) {
                     match object {
-                        Expr::Ident(base) => { esc_assign_to(self, base, fr); }
-                        _ => {}
+                        Expr::Ident(base) => {
+                            esc_assign_to(self, base, fr);
+                        }
+                        _ => {
+                        }
                     }
                 } else {
                     esc_error(self, "a reference cannot be stored in field '" + field + "'");
@@ -901,14 +1054,17 @@ fn esc_stmt(self: &mut EscapeChecker, s: Stmt) {
                 esc_error(self, "a reference cannot be stored through another reference");
             }
         }
-        Stmt::Expr(e, _) => { esc_expr(self, e); }
+        Stmt::Expr(e, _) => {
+            esc_expr(self, e);
+        }
         Stmt::Return(value, _) => {
             match value {
                 OptBoxExpr::Some(e) => {
                     var rr: Vec<EscRoot> = esc_expr(self, box_expr_deref(e));
                     esc_check_return(self, rr);
                 }
-                OptBoxExpr::None => {}
+                OptBoxExpr::None => {
+                }
             }
         }
         Stmt::Break(value, _) => {
@@ -919,15 +1075,19 @@ fn esc_stmt(self: &mut EscapeChecker, s: Stmt) {
                         esc_leave_blocks(self, br, self.loop_depths.get(self.loop_depths.len() - 1), "the value of this loop");
                     }
                 }
-                OptBoxExpr::None => {}
+                OptBoxExpr::None => {
+                }
             }
         }
         Stmt::If(cond, then_block, else_block, _) => {
             esc_expr(self, cond);
             esc_block(self, then_block);
             match else_block {
-                OptStmts::Some(eb) => { esc_block(self, eb); }
-                OptStmts::None => {}
+                OptStmts::Some(eb) => {
+                    esc_block(self, eb);
+                }
+                OptStmts::None => {
+                }
             }
         }
         Stmt::While(cond, body, _) => {
@@ -947,7 +1107,9 @@ fn esc_stmt(self: &mut EscapeChecker, s: Stmt) {
             esc_pop_scope(self);
             self.loop_depths.pop();
         }
-        Stmt::Loop(body, _) => { esc_loop_body(self, body); }
+        Stmt::Loop(body, _) => {
+            esc_loop_body(self, body);
+        }
         Stmt::Match(expr, arms, _) => {
             var mr: Vec<EscRoot> = esc_binding_roots(self, expr);
             esc_arms(self, arms, mr, false);
@@ -957,14 +1119,30 @@ fn esc_stmt(self: &mut EscapeChecker, s: Stmt) {
             esc_block(self, body);
             self.unsafe_depth = self.unsafe_depth - 1;
         }
-        Stmt::Defer(body, _) => { esc_block(self, body); }
-        Stmt::Sandbox(body, _) => { esc_block(self, body); }
-        Stmt::Txn(body, _) => { esc_block(self, body); }
-        Stmt::Handle(body, _, _) => { esc_block(self, body); }
-        Stmt::RegionBlock(_, _, _, _, _, body, _) => { esc_block(self, body); }
-        Stmt::SpawnScope(body, _) => { esc_block(self, body); }
-        Stmt::Query(_, body, _) => { esc_block(self, body); }
-        Stmt::GradBlock(_, body, _) => { esc_block(self, body); }
+        Stmt::Defer(body, _) => {
+            esc_block(self, body);
+        }
+        Stmt::Sandbox(body, _) => {
+            esc_block(self, body);
+        }
+        Stmt::Txn(body, _) => {
+            esc_block(self, body);
+        }
+        Stmt::Handle(body, _, _) => {
+            esc_block(self, body);
+        }
+        Stmt::RegionBlock(_, _, _, _, _, body, _) => {
+            esc_block(self, body);
+        }
+        Stmt::SpawnScope(body, _) => {
+            esc_block(self, body);
+        }
+        Stmt::Query(_, body, _) => {
+            esc_block(self, body);
+        }
+        Stmt::GradBlock(_, body, _) => {
+            esc_block(self, body);
+        }
         Stmt::Parallel(branches, _) => {
             var pi: i64 = 0;
             while pi < branches.len() {
@@ -988,8 +1166,11 @@ fn esc_stmt(self: &mut EscapeChecker, s: Stmt) {
                 ci = ci + 1;
             }
             match default {
-                OptStmts::Some(d) => { esc_block(self, d); }
-                OptStmts::None => {}
+                OptStmts::Some(d) => {
+                    esc_block(self, d);
+                }
+                OptStmts::None => {
+                }
             }
         }
         Stmt::Do(_, _, args, _) => {
@@ -1003,17 +1184,24 @@ fn esc_stmt(self: &mut EscapeChecker, s: Stmt) {
             esc_expr(self, cont);
             esc_expr(self, value);
         }
-        Stmt::Backward(loss, _) => { esc_expr(self, loss); }
-        _ => {}
+        Stmt::Backward(loss, _) => {
+            esc_expr(self, loss);
+        }
+        _ => {
+        }
     }
 }
 
 /// `target = <value with roots r>`: the target must not outlive any root.
-fn esc_assign_to(self: &mut EscapeChecker, target: str, r: Vec<EscRoot>) {
-    if r.len() == 0 { return; }
+fn esc_assign_to(self: & mut EscapeChecker, target: str, r: Vec<EscRoot>) {
+    if r.len() == 0 {
+        return;
+    }
     var target_depth: i64 = 0;
     match esc_lookup(self, target) {
-        OptEscVar::Some(v) => { target_depth = v.depth; }
+        OptEscVar::Some(v) => {
+            target_depth = v.depth;
+        }
         OptEscVar::None => {
             if esc_is_global(self, target) {
                 esc_error(self, "global '" + target + "' cannot hold a reference");
@@ -1037,7 +1225,7 @@ fn esc_assign_to(self: &mut EscapeChecker, target: str, r: Vec<EscRoot>) {
 
 // --- Expressions ----------------------------------------------------------
 
-fn esc_exprs(self: &mut EscapeChecker, es: Vec<Expr>) -> Vec<Vec<EscRoot>> {
+fn esc_exprs(self: & mut EscapeChecker, es: Vec<Expr>) -> Vec<Vec<EscRoot>> {
     var out: Vec<Vec<EscRoot>> = Vec::new();
     var i: i64 = 0;
     while i < es.len() {
@@ -1058,10 +1246,14 @@ fn esc_union_all(rs: Vec<Vec<EscRoot>>) -> Vec<EscRoot> {
 }
 
 /// The roots of `e`'s value (empty when it holds no reference).
-fn esc_expr(self: &mut EscapeChecker, e: Expr) -> Vec<EscRoot> {
+fn esc_expr(self: & mut EscapeChecker, e: Expr) -> Vec<EscRoot> {
     match e {
-        Expr::Ident(name) => { return esc_var_roots(self, name); }
-        Expr::Ref(inner, _) => { return esc_place(self, box_expr_deref(inner)); }
+        Expr::Ident(name) => {
+            return esc_var_roots(self, name);
+        }
+        Expr::Ref(inner, _) => {
+            return esc_place(self, box_expr_deref(inner));
+        }
         Expr::Deref(inner) => {
             esc_expr(self, box_expr_deref(inner));
             return esc_none();
@@ -1070,7 +1262,9 @@ fn esc_expr(self: &mut EscapeChecker, e: Expr) -> Vec<EscRoot> {
             // A tuple field passes its reference through; any other field
             // cannot hold one (rule 2).
             var fr: Vec<EscRoot> = esc_expr(self, box_expr_deref(inner));
-            if esc_all_digits(field) { return fr; }
+            if esc_all_digits(field) {
+                return fr;
+            }
             return esc_none();
         }
         Expr::OptionalFieldAccess(inner, _) => {
@@ -1121,32 +1315,45 @@ fn esc_expr(self: &mut EscapeChecker, e: Expr) -> Vec<EscRoot> {
             esc_expr(self, box_expr_deref(inner));
             return esc_none();
         }
-        Expr::Await(inner) => { return esc_expr(self, box_expr_deref(inner)); }
-        Expr::NamedArg(_, inner) => { return esc_expr(self, box_expr_deref(inner)); }
+        Expr::Await(inner) => {
+            return esc_expr(self, box_expr_deref(inner));
+        }
+        Expr::NamedArg(_, inner) => {
+            return esc_expr(self, box_expr_deref(inner));
+        }
         Expr::Spawn(inner) => {
             // Everything handed to the task: a call's arguments as well as its result.
             var task: Expr = box_expr_deref(inner);
             var sr: Vec<EscRoot> = esc_expr(self, task);
             match task {
-                Expr::Call(_, args) => { sr = esc_union(sr, esc_union_all(esc_exprs(self, args))); }
+                Expr::Call(_, args) => {
+                    sr = esc_union(sr, esc_union_all(esc_exprs(self, args)));
+                }
                 Expr::MethodCall(recv, _, margs) => {
                     sr = esc_union(sr, esc_expr(self, box_expr_deref(recv)));
                     sr = esc_union(sr, esc_union_all(esc_exprs(self, margs)));
                 }
-                _ => {}
+                _ => {
+                }
             }
             if sr.len() > 0 {
                 esc_error(self, "a reference cannot be sent to another task");
             }
             return esc_none();
         }
-        Expr::Try(inner) => { return esc_expr(self, box_expr_deref(inner)); }
+        Expr::Try(inner) => {
+            return esc_expr(self, box_expr_deref(inner));
+        }
         Expr::Coalesce(inner, default) => {
             var cr: Vec<EscRoot> = esc_expr(self, box_expr_deref(inner));
             return esc_union(cr, esc_expr(self, box_expr_deref(default)));
         }
-        Expr::Call(callee, args) => { return esc_call(self, callee, args); }
-        Expr::MethodCall(receiver, method, args) => { return esc_method_call(self, box_expr_deref(receiver), method, args); }
+        Expr::Call(callee, args) => {
+            return esc_call(self, callee, args);
+        }
+        Expr::MethodCall(receiver, method, args) => {
+            return esc_method_call(self, box_expr_deref(receiver), method, args);
+        }
         Expr::PipeForward(left, right) => {
             var pr: Vec<EscRoot> = esc_expr(self, box_expr_deref(left));
             return esc_union(pr, esc_expr(self, box_expr_deref(right)));
@@ -1162,21 +1369,28 @@ fn esc_expr(self: &mut EscapeChecker, e: Expr) -> Vec<EscRoot> {
                 fi = fi + 1;
             }
             match spread {
-                OptBoxExpr::Some(sp) => { esc_expr(self, box_expr_deref(sp)); }
-                OptBoxExpr::None => {}
+                OptBoxExpr::Some(sp) => {
+                    esc_expr(self, box_expr_deref(sp));
+                }
+                OptBoxExpr::None => {
+                }
             }
             return esc_none();
         }
         Expr::EnumLit(enum_name, variant, args) => {
             var rs: Vec<Vec<EscRoot>> = esc_exprs(self, args);
             var joined: Vec<EscRoot> = esc_union_all(rs);
-            if esc_is_transparent(enum_name) { return joined; }
+            if esc_is_transparent(enum_name) {
+                return joined;
+            }
             if joined.len() > 0 {
                 esc_error(self, "a reference cannot be stored in variant '" + enum_name + "::" + variant + "'");
             }
             return esc_none();
         }
-        Expr::TupleLit(items) => { return esc_union_all(esc_exprs(self, items)); }
+        Expr::TupleLit(items) => {
+            return esc_union_all(esc_exprs(self, items));
+        }
         Expr::ArrayLit(_, elements) => {
             var ai: i64 = 0;
             while ai < elements.len() {
@@ -1192,8 +1406,11 @@ fn esc_expr(self: &mut EscapeChecker, e: Expr) -> Vec<EscRoot> {
             esc_expr(self, box_expr_deref(cond));
             var ir: Vec<EscRoot> = esc_block_value(self, then_block, "the value of this `if`");
             match else_block {
-                OptStmts::Some(eb) => { ir = esc_union(ir, esc_block_value(self, eb, "the value of this `if`")); }
-                OptStmts::None => {}
+                OptStmts::Some(eb) => {
+                    ir = esc_union(ir, esc_block_value(self, eb, "the value of this `if`"));
+                }
+                OptStmts::None => {
+                }
             }
             return ir;
         }
@@ -1201,43 +1418,64 @@ fn esc_expr(self: &mut EscapeChecker, e: Expr) -> Vec<EscRoot> {
             var s: Vec<EscRoot> = esc_binding_roots(self, box_expr_deref(scrut));
             return esc_arms(self, arms, s, true);
         }
-        Expr::Block(b) => { return esc_block_value(self, b, "the value of this block"); }
-        Expr::TryBlock(b) => { return esc_block_value(self, b, "the value of this block"); }
-        Expr::Closure(params, body, _) => { return esc_closure(self, params, body); }
+        Expr::Block(b) => {
+            return esc_block_value(self, b, "the value of this block");
+        }
+        Expr::TryBlock(b) => {
+            return esc_block_value(self, b, "the value of this block");
+        }
+        Expr::Closure(params, body, _) => {
+            return esc_closure(self, params, body);
+        }
         Expr::FString(parts) => {
             var pi: i64 = 0;
             while pi < parts.len() {
                 match parts.get(pi) {
-                    FStringPart::Expr(x) => { esc_expr(self, x); }
-                    FStringPart::Literal(_) => {}
+                    FStringPart::Expr(x) => {
+                        esc_expr(self, x);
+                    }
+                    FStringPart::Literal(_) => {
+                    }
                 }
                 pi = pi + 1;
             }
             return esc_none();
         }
-        _ => { return esc_none(); }
+        _ => {
+            return esc_none();
+        }
     }
     return esc_none();
 }
 
 /// The roots of `&place`.
-fn esc_place(self: &mut EscapeChecker, e: Expr) -> Vec<EscRoot> {
+fn esc_place(self: & mut EscapeChecker, e: Expr) -> Vec<EscRoot> {
     match e {
         // The variable's own storage (for a reference variable `r`, `&r`
         // points at `r` itself, a local).
         Expr::Ident(name) => {
             match esc_lookup(self, name) {
-                OptEscVar::Some(v) => { return esc_one(esc_local(name, v.depth)); }
-                OptEscVar::None => { return esc_none(); }
+                OptEscVar::Some(v) => {
+                    return esc_one(esc_local(name, v.depth));
+                }
+                OptEscVar::None => {
+                    return esc_none();
+                }
             }
         }
-        Expr::FieldAccess(inner, _) => { return esc_place_inside(self, box_expr_deref(inner)); }
-        Expr::OptionalFieldAccess(inner, _) => { return esc_place_inside(self, box_expr_deref(inner)); }
+        Expr::FieldAccess(inner, _) => {
+            return esc_place_inside(self, box_expr_deref(inner));
+        }
+        Expr::OptionalFieldAccess(inner, _) => {
+            return esc_place_inside(self, box_expr_deref(inner));
+        }
         Expr::Index(array, index) => {
             esc_expr(self, box_expr_deref(index));
             return esc_place_inside(self, box_expr_deref(array));
         }
-        Expr::Deref(inner) => { return esc_expr(self, box_expr_deref(inner)); }
+        Expr::Deref(inner) => {
+            return esc_expr(self, box_expr_deref(inner));
+        }
         _ => {
             // `&f()`, `&(a + b)`: a temporary in the current block.
             esc_expr(self, e);
@@ -1250,21 +1488,27 @@ fn esc_place(self: &mut EscapeChecker, e: Expr) -> Vec<EscRoot> {
 /// The roots of a place inside `base` (`base.field`, `base[i]`): when `base`
 /// is a reference the place is behind it, otherwise it is part of `base`'s
 /// own storage.
-fn esc_place_inside(self: &mut EscapeChecker, base: Expr) -> Vec<EscRoot> {
+fn esc_place_inside(self: & mut EscapeChecker, base: Expr) -> Vec<EscRoot> {
     var through: Vec<EscRoot> = esc_expr(self, base);
-    if through.len() == 0 { return esc_place(self, base); }
+    if through.len() == 0 {
+        return esc_place(self, base);
+    }
     return through;
 }
 
 fn esc_is_closure(e: Expr) -> bool {
     match e {
-        Expr::Closure(_, _, _) => { return true; }
-        _ => { return false; }
+        Expr::Closure(_, _, _) => {
+            return true;
+        }
+        _ => {
+            return false;
+        }
     }
     return false;
 }
 
-fn esc_call(self: &mut EscapeChecker, callee: str, args: Vec<Expr>) -> Vec<EscRoot> {
+fn esc_call(self: & mut EscapeChecker, callee: str, args: Vec<Expr>) -> Vec<EscRoot> {
     var rs: Vec<Vec<EscRoot>> = esc_exprs(self, args);
     if callee == "Some" || callee == "Ok" || callee == "Err" {
         return esc_union_all(rs);
@@ -1272,11 +1516,16 @@ fn esc_call(self: &mut EscapeChecker, callee: str, args: Vec<Expr>) -> Vec<EscRo
     // Calling a closure held in a local: its result may be any reference it
     // captured or was given.
     match esc_lookup(self, callee) {
-        OptEscVar::Some(v) => { return esc_union(v.roots, esc_union_all(rs)); }
-        OptEscVar::None => {}
+        OptEscVar::Some(v) => {
+            return esc_union(v.roots, esc_union_all(rs));
+        }
+        OptEscVar::None => {
+        }
     }
     var slot: i64 = HashMap_get(self.func_index, callee);
-    if slot == 0 { return esc_none(); }
+    if slot == 0 {
+        return esc_none();
+    }
     var f: Func = self.all.get(slot - 1).func;
     var i: i64 = 0;
     while i < rs.len() {
@@ -1284,7 +1533,9 @@ fn esc_call(self: &mut EscapeChecker, callee: str, args: Vec<Expr>) -> Vec<EscRo
             var p: Param = f.params.get(i);
             if !esc_contains_ref(p.ty) {
                 var what: str = "a reference";
-                if esc_is_closure(args.get(i)) { what = "a closure that captures a reference"; }
+                if esc_is_closure(args.get(i)) {
+                    what = "a closure that captures a reference";
+                }
                 esc_error(self, what + " cannot be passed to parameter '" + p.name + "' of '" + callee + "' (type '" + type_to_str(p.ty) + "'), which may keep it; only reference parameters can borrow");
             }
         }
@@ -1295,18 +1546,22 @@ fn esc_call(self: &mut EscapeChecker, callee: str, args: Vec<Expr>) -> Vec<EscRo
     var fi: i64 = 0;
     while fi < flows.len() {
         var idx: i64 = flows.get(fi);
-        if idx < rs.len() { out = esc_union(out, rs.get(idx)); }
+        if idx < rs.len() {
+            out = esc_union(out, rs.get(idx));
+        }
         fi = fi + 1;
     }
     return out;
 }
 
-fn esc_method_call(self: &mut EscapeChecker, receiver: Expr, method: str, args: Vec<Expr>) -> Vec<EscRoot> {
+fn esc_method_call(self: & mut EscapeChecker, receiver: Expr, method: str, args: Vec<Expr>) -> Vec<EscRoot> {
     var recv: Vec<EscRoot> = esc_expr(self, receiver);
     var rs: Vec<Vec<EscRoot>> = esc_exprs(self, args);
     var keys: Vec<str> = Vec::new();
     var mslot: i64 = HashMap_get(self.method_index, method);
-    if mslot != 0 { keys = self.method_keys.get(mslot - 1); }
+    if mslot != 0 {
+        keys = self.method_keys.get(mslot - 1);
+    }
     var j: i64 = 0;
     while j < rs.len() {
         if rs.get(j).len() > 0 {
@@ -1315,7 +1570,9 @@ fn esc_method_call(self: &mut EscapeChecker, receiver: Expr, method: str, args: 
             var ki: i64 = 0;
             while ki < keys.len() && !borrows {
                 var pr: Vec<bool> = self.param_has_ref.get(HashMap_get(self.func_index, keys.get(ki)) - 1);
-                if j + 1 < pr.len() && pr.get(j + 1) { borrows = true; }
+                if j + 1 < pr.len() && pr.get(j + 1) {
+                    borrows = true;
+                }
                 ki = ki + 1;
             }
             if !borrows && !esc_read_only_method(method) {
@@ -1346,10 +1603,10 @@ fn esc_method_call(self: &mut EscapeChecker, receiver: Expr, method: str, args: 
     return out;
 }
 
-fn esc_closure(self: &mut EscapeChecker, params: Vec<Param>, body: Vec<Stmt>) -> Vec<EscRoot> {
+fn esc_closure(self: & mut EscapeChecker, params: Vec<Param>, body: Vec<Stmt>) -> Vec<EscRoot> {
     // Captured references root the closure value (captures are by value).
     var used: Vec<str> = Vec::new();
-    esc_idents_stmts(body, &mut used);
+    esc_idents_stmts(body, & mut used);
     var roots: Vec<EscRoot> = Vec::new();
     var ui: i64 = 0;
     while ui < used.len() {
@@ -1357,7 +1614,9 @@ fn esc_closure(self: &mut EscapeChecker, params: Vec<Param>, body: Vec<Stmt>) ->
         var is_param: bool = false;
         var pi: i64 = 0;
         while pi < params.len() {
-            if params.get(pi).name == name { is_param = true; }
+            if params.get(pi).name == name {
+                is_param = true;
+            }
             pi = pi + 1;
         }
         if !is_param {
@@ -1389,11 +1648,13 @@ fn esc_closure(self: &mut EscapeChecker, params: Vec<Param>, body: Vec<Stmt>) ->
 
 // --- Identifiers a closure body reads (a superset of its captures) ---------
 
-fn esc_note(out: &mut Vec<str>, name: str) {
-    if !str_vec_contains(out, name) { out.push(name); }
+fn esc_note(out: & mut Vec<str>, name: str) {
+    if !str_vec_contains(out, name) {
+        out.push(name);
+    }
 }
 
-pub fn esc_idents_stmts(stmts: Vec<Stmt>, out: &mut Vec<str>) {
+pub fn esc_idents_stmts(stmts: Vec<Stmt>, out: & mut Vec<str>) {
     var i: i64 = 0;
     while i < stmts.len() {
         esc_idents_stmt(stmts.get(i), out);
@@ -1401,19 +1662,30 @@ pub fn esc_idents_stmts(stmts: Vec<Stmt>, out: &mut Vec<str>) {
     }
 }
 
-fn esc_idents_opt_stmts(stmts: OptStmts, out: &mut Vec<str>) {
+fn esc_idents_opt_stmts(stmts: OptStmts, out: & mut Vec<str>) {
     match stmts {
-        OptStmts::Some(b) => { esc_idents_stmts(b, out); }
-        OptStmts::None => {}
+        OptStmts::Some(b) => {
+            esc_idents_stmts(b, out);
+        }
+        OptStmts::None => {
+        }
     }
 }
 
-fn esc_idents_stmt(s: Stmt, out: &mut Vec<str>) {
+fn esc_idents_stmt(s: Stmt, out: & mut Vec<str>) {
     match s {
-        Stmt::Let(_, _, expr, _, _, _, _) => { esc_idents_expr(expr, out); }
-        Stmt::LetTuple(_, expr, _) => { esc_idents_expr(expr, out); }
-        Stmt::Assign(_, _, expr, _) => { esc_idents_expr(expr, out); }
-        Stmt::Expr(expr, _) => { esc_idents_expr(expr, out); }
+        Stmt::Let(_, _, expr, _, _, _, _) => {
+            esc_idents_expr(expr, out);
+        }
+        Stmt::LetTuple(_, expr, _) => {
+            esc_idents_expr(expr, out);
+        }
+        Stmt::Assign(_, _, expr, _) => {
+            esc_idents_expr(expr, out);
+        }
+        Stmt::Expr(expr, _) => {
+            esc_idents_expr(expr, out);
+        }
         Stmt::IndexAssign(_, index, _, expr, _) => {
             esc_idents_expr(index, out);
             esc_idents_expr(expr, out);
@@ -1428,14 +1700,20 @@ fn esc_idents_stmt(s: Stmt, out: &mut Vec<str>) {
         }
         Stmt::Return(value, _) => {
             match value {
-                OptBoxExpr::Some(e) => { esc_idents_expr(box_expr_deref(e), out); }
-                OptBoxExpr::None => {}
+                OptBoxExpr::Some(e) => {
+                    esc_idents_expr(box_expr_deref(e), out);
+                }
+                OptBoxExpr::None => {
+                }
             }
         }
         Stmt::Break(value, _) => {
             match value {
-                OptBoxExpr::Some(e) => { esc_idents_expr(box_expr_deref(e), out); }
-                OptBoxExpr::None => {}
+                OptBoxExpr::Some(e) => {
+                    esc_idents_expr(box_expr_deref(e), out);
+                }
+                OptBoxExpr::None => {
+                }
             }
         }
         Stmt::If(cond, then_block, else_block, _) => {
@@ -1459,21 +1737,42 @@ fn esc_idents_stmt(s: Stmt, out: &mut Vec<str>) {
                 ai = ai + 1;
             }
         }
-        Stmt::Loop(body, _) => { esc_idents_stmts(body, out); }
-        Stmt::Defer(body, _) => { esc_idents_stmts(body, out); }
-        Stmt::Unsafe(body, _) => { esc_idents_stmts(body, out); }
-        Stmt::Sandbox(body, _) => { esc_idents_stmts(body, out); }
-        Stmt::Txn(body, _) => { esc_idents_stmts(body, out); }
-        Stmt::Handle(body, _, _) => { esc_idents_stmts(body, out); }
-        Stmt::RegionBlock(_, _, _, _, _, body, _) => { esc_idents_stmts(body, out); }
-        Stmt::SpawnScope(body, _) => { esc_idents_stmts(body, out); }
-        Stmt::Query(_, body, _) => { esc_idents_stmts(body, out); }
-        Stmt::GradBlock(_, body, _) => { esc_idents_stmts(body, out); }
-        _ => {}
+        Stmt::Loop(body, _) => {
+            esc_idents_stmts(body, out);
+        }
+        Stmt::Defer(body, _) => {
+            esc_idents_stmts(body, out);
+        }
+        Stmt::Unsafe(body, _) => {
+            esc_idents_stmts(body, out);
+        }
+        Stmt::Sandbox(body, _) => {
+            esc_idents_stmts(body, out);
+        }
+        Stmt::Txn(body, _) => {
+            esc_idents_stmts(body, out);
+        }
+        Stmt::Handle(body, _, _) => {
+            esc_idents_stmts(body, out);
+        }
+        Stmt::RegionBlock(_, _, _, _, _, body, _) => {
+            esc_idents_stmts(body, out);
+        }
+        Stmt::SpawnScope(body, _) => {
+            esc_idents_stmts(body, out);
+        }
+        Stmt::Query(_, body, _) => {
+            esc_idents_stmts(body, out);
+        }
+        Stmt::GradBlock(_, body, _) => {
+            esc_idents_stmts(body, out);
+        }
+        _ => {
+        }
     }
 }
 
-fn esc_idents_exprs(es: Vec<Expr>, out: &mut Vec<str>) {
+fn esc_idents_exprs(es: Vec<Expr>, out: & mut Vec<str>) {
     var i: i64 = 0;
     while i < es.len() {
         esc_idents_expr(es.get(i), out);
@@ -1481,9 +1780,11 @@ fn esc_idents_exprs(es: Vec<Expr>, out: &mut Vec<str>) {
     }
 }
 
-fn esc_idents_expr(e: Expr, out: &mut Vec<str>) {
+fn esc_idents_expr(e: Expr, out: & mut Vec<str>) {
     match e {
-        Expr::Ident(n) => { esc_note(out, n); }
+        Expr::Ident(n) => {
+            esc_note(out, n);
+        }
         Expr::Binary(_, l, r) => {
             esc_idents_expr(box_expr_deref(l), out);
             esc_idents_expr(box_expr_deref(r), out);
@@ -1508,20 +1809,48 @@ fn esc_idents_expr(e: Expr, out: &mut Vec<str>) {
             esc_idents_expr(box_expr_deref(l), out);
             esc_idents_expr(box_expr_deref(r), out);
         }
-        Expr::Unary(_, x) => { esc_idents_expr(box_expr_deref(x), out); }
-        Expr::FieldAccess(x, _) => { esc_idents_expr(box_expr_deref(x), out); }
-        Expr::OptionalFieldAccess(x, _) => { esc_idents_expr(box_expr_deref(x), out); }
-        Expr::Ref(x, _) => { esc_idents_expr(box_expr_deref(x), out); }
-        Expr::Deref(x) => { esc_idents_expr(box_expr_deref(x), out); }
-        Expr::Try(x) => { esc_idents_expr(box_expr_deref(x), out); }
-        Expr::IsCheck(x, _) => { esc_idents_expr(box_expr_deref(x), out); }
-        Expr::Cast(x, _) => { esc_idents_expr(box_expr_deref(x), out); }
-        Expr::QuantCast(x, _) => { esc_idents_expr(box_expr_deref(x), out); }
-        Expr::Await(x) => { esc_idents_expr(box_expr_deref(x), out); }
-        Expr::Spawn(x) => { esc_idents_expr(box_expr_deref(x), out); }
-        Expr::Comptime(x) => { esc_idents_expr(box_expr_deref(x), out); }
-        Expr::Yield(x) => { esc_idents_expr(box_expr_deref(x), out); }
-        Expr::NamedArg(_, x) => { esc_idents_expr(box_expr_deref(x), out); }
+        Expr::Unary(_, x) => {
+            esc_idents_expr(box_expr_deref(x), out);
+        }
+        Expr::FieldAccess(x, _) => {
+            esc_idents_expr(box_expr_deref(x), out);
+        }
+        Expr::OptionalFieldAccess(x, _) => {
+            esc_idents_expr(box_expr_deref(x), out);
+        }
+        Expr::Ref(x, _) => {
+            esc_idents_expr(box_expr_deref(x), out);
+        }
+        Expr::Deref(x) => {
+            esc_idents_expr(box_expr_deref(x), out);
+        }
+        Expr::Try(x) => {
+            esc_idents_expr(box_expr_deref(x), out);
+        }
+        Expr::IsCheck(x, _) => {
+            esc_idents_expr(box_expr_deref(x), out);
+        }
+        Expr::Cast(x, _) => {
+            esc_idents_expr(box_expr_deref(x), out);
+        }
+        Expr::QuantCast(x, _) => {
+            esc_idents_expr(box_expr_deref(x), out);
+        }
+        Expr::Await(x) => {
+            esc_idents_expr(box_expr_deref(x), out);
+        }
+        Expr::Spawn(x) => {
+            esc_idents_expr(box_expr_deref(x), out);
+        }
+        Expr::Comptime(x) => {
+            esc_idents_expr(box_expr_deref(x), out);
+        }
+        Expr::Yield(x) => {
+            esc_idents_expr(box_expr_deref(x), out);
+        }
+        Expr::NamedArg(_, x) => {
+            esc_idents_expr(box_expr_deref(x), out);
+        }
         Expr::Call(callee, args) => {
             esc_note(out, callee);
             esc_idents_exprs(args, out);
@@ -1530,9 +1859,15 @@ fn esc_idents_expr(e: Expr, out: &mut Vec<str>) {
             esc_idents_expr(box_expr_deref(recv), out);
             esc_idents_exprs(args, out);
         }
-        Expr::EnumLit(_, _, args) => { esc_idents_exprs(args, out); }
-        Expr::TupleLit(args) => { esc_idents_exprs(args, out); }
-        Expr::ArrayLit(_, args) => { esc_idents_exprs(args, out); }
+        Expr::EnumLit(_, _, args) => {
+            esc_idents_exprs(args, out);
+        }
+        Expr::TupleLit(args) => {
+            esc_idents_exprs(args, out);
+        }
+        Expr::ArrayLit(_, args) => {
+            esc_idents_exprs(args, out);
+        }
         Expr::StructLit(_, fields, spread) => {
             var fi: i64 = 0;
             while fi < fields.len() {
@@ -1540,8 +1875,11 @@ fn esc_idents_expr(e: Expr, out: &mut Vec<str>) {
                 fi = fi + 1;
             }
             match spread {
-                OptBoxExpr::Some(s) => { esc_idents_expr(box_expr_deref(s), out); }
-                OptBoxExpr::None => {}
+                OptBoxExpr::Some(s) => {
+                    esc_idents_expr(box_expr_deref(s), out);
+                }
+                OptBoxExpr::None => {
+                }
             }
         }
         Expr::If(cond, then_block, else_block) => {
@@ -1557,21 +1895,33 @@ fn esc_idents_expr(e: Expr, out: &mut Vec<str>) {
                 ai = ai + 1;
             }
         }
-        Expr::Block(b) => { esc_idents_stmts(b, out); }
-        Expr::TryBlock(b) => { esc_idents_stmts(b, out); }
-        Expr::ComptimeBlock(b) => { esc_idents_stmts(b, out); }
-        Expr::Closure(_, b, _) => { esc_idents_stmts(b, out); }
+        Expr::Block(b) => {
+            esc_idents_stmts(b, out);
+        }
+        Expr::TryBlock(b) => {
+            esc_idents_stmts(b, out);
+        }
+        Expr::ComptimeBlock(b) => {
+            esc_idents_stmts(b, out);
+        }
+        Expr::Closure(_, b, _) => {
+            esc_idents_stmts(b, out);
+        }
         Expr::FString(parts) => {
             var pi: i64 = 0;
             while pi < parts.len() {
                 match parts.get(pi) {
-                    FStringPart::Expr(x) => { esc_idents_expr(x, out); }
-                    FStringPart::Literal(_) => {}
+                    FStringPart::Expr(x) => {
+                        esc_idents_expr(x, out);
+                    }
+                    FStringPart::Literal(_) => {
+                    }
                 }
                 pi = pi + 1;
             }
         }
-        _ => {}
+        _ => {
+        }
     }
 }
 
@@ -1587,7 +1937,7 @@ pub fn escape_check(program: Program) -> Vec<str> {
 // reporting pass skips bodies in the skip set.
 pub fn escape_check_skipped(program: Program, skip: i64) -> Vec<str> {
     var c: EscapeChecker = EscapeChecker_new(program);
-    esc_check_decls(&mut c, program);
+    esc_check_decls(& mut c, program);
     // Infer which parameters reach each function's result, to a fixpoint.
     // Summaries only grow, so an unchanged total means nothing changed.
     // Only a function whose result can hold a reference has a summary to
@@ -1596,16 +1946,18 @@ pub fn escape_check_skipped(program: Program, skip: i64) -> Vec<str> {
     var with_ref: Vec<i64> = Vec::new();
     var wi: i64 = 0;
     while wi < c.all.len() {
-        if !esc_ret_noref(&c, c.all.get(wi).func.ret_ty) { with_ref.push(wi); }
+        if !esc_ret_noref(& c, c.all.get(wi).func.ret_ty) {
+            with_ref.push(wi);
+        }
         wi = wi + 1;
     }
-    var before: i64 = -1;
-    while before != esc_summary_total(&c) {
-        before = esc_summary_total(&c);
+    var before: i64 = - 1;
+    while before != esc_summary_total(& c) {
+        before = esc_summary_total(& c);
         var i: i64 = 0;
         while i < with_ref.len() {
             var ef: EscFunc = c.all.get(with_ref.get(i));
-            esc_analyze_func(&mut c, ef.key, ef.func);
+            esc_analyze_func(& mut c, ef.key, ef.func);
             i = i + 1;
         }
     }
@@ -1614,7 +1966,7 @@ pub fn escape_check_skipped(program: Program, skip: i64) -> Vec<str> {
     while j < c.all.len() {
         var ef2: EscFunc = c.all.get(j);
         if skip == 0 || !HashMap_contains(skip, ef2.skey) {
-            esc_analyze_func(&mut c, ef2.key, ef2.func);
+            esc_analyze_func(& mut c, ef2.key, ef2.func);
         }
         j = j + 1;
     }
