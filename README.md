@@ -1,700 +1,331 @@
 <p align="center">
-  <img src="docs/fid-logo.svg" alt="Fides" width="110">
+  <a href="https://fid-lang.org">
+    <img src="docs/fid-logo.svg" alt="Fid" width="96">
+  </a>
 </p>
 
-<h1 align="center">Fides</h1>
+<h1 align="center">Fid</h1>
 
 <p align="center">
-  <b>A self-hosted systems language with ownership, effects and checked safety rules.</b><br>
-  Its compiler is written in Fides, compiles itself to a byte-identical fixpoint, and makes native executables with no C toolchain.
+  <b>A systems language that checks what it promises.</b><br>
+  Borrow checking without lifetime annotations, capability grants on imports, effect tracking.<br>
+  Its compiler, <b>Fides</b>, is written in Fid and builds itself to a byte-identical fixpoint. No LLVM. No GC.
+</p>
+
+<p align="center">
+  <a href="https://fid-lang.org/playground"><img alt="Try it in your browser" src="https://img.shields.io/badge/try%20it-in%20your%20browser-C2255C?style=for-the-badge"></a>
+  <a href="https://fid-lang.org/docs/install"><img alt="Install" src="https://img.shields.io/badge/install-v0.8.0--unstable-262626?style=for-the-badge"></a>
+  <a href="https://fid-lang.org/docs"><img alt="Documentation" src="https://img.shields.io/badge/read-the%20docs-262626?style=for-the-badge"></a>
 </p>
 
 <p align="center">
   <a href="https://github.com/pledgeandgrow/fid/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/pledgeandgrow/fid/actions/workflows/ci.yml/badge.svg"></a>
-  <a href="https://github.com/pledgeandgrow/fid/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/pledgeandgrow/fid"></a>
-  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
+  <a href="https://github.com/pledgeandgrow/fid/releases"><img alt="Release" src="https://img.shields.io/github/v/release/pledgeandgrow/fid?include_prereleases&color=C2255C"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-C2255C"></a>
+  <a href="https://github.com/pledgeandgrow/fid/discussions"><img alt="Discussions" src="https://img.shields.io/badge/chat-discussions-262626"></a>
 </p>
+
+<p align="center">
+  <a href="#thirty-seconds-of-fid">Taste</a> ·
+  <a href="#what-the-compiler-refuses">What it catches</a> ·
+  <a href="#install">Install</a> ·
+  <a href="#the-toolchain">Toolchain</a> ·
+  <a href="#where-it-runs">Platforms</a> ·
+  <a href="#how-it-works">How it works</a> ·
+  <a href="#honest-status">Status</a> ·
+  <a href="#contributing">Contributing</a>
+</p>
+
+---
+
+## Thirty seconds of Fid
 
 ```rust
 // hello.fd
 fn main() {
-    print("Hello, Fides!");
-    val x = 42;
-    val y = x + 8;
-    if y > 40 { print("y is big"); } else { print("y is small"); }
+    val name = "world";
+    var total = 0;
+
+    for i in 1..=100 {
+        total += i;
+    }
+
+    println(f"Hello, {name}! total = {total}");
 }
 ```
 
 ```bash
-fid run hello.fd                 # interpreter
-fid emit hello.fd -o hello.exe   # native Windows executable, no C compiler
-fid ccompile hello.fd -o hello   # through C (--target for cross builds)
+fid run hello.fd                 # interpret it: no build step
+fid emit hello.fd -o hello.exe   # native executable, written by the compiler itself
+fid ccompile hello.fd -o hello   # or through C, for every other target
 ```
+
+`val` is immutable, `var` is mutable, types are inferred, and `f"..."` strings are part of the language. If you know Rust, Go, Zig or C, you can read Fid today: [what carries over and what differs](https://fid-lang.org/docs/coming-from).
+
+## What the compiler refuses
+
+Three real programs and what `fid` says about each (messages shortened to fit).
+
+<table>
+<tr>
+<td width="33%" valign="top">
+
+**A loop cannot change what it walks**
+
+```rust
+var v: Vec<i64> = Vec::new();
+v.push(1);
+for x in v {
+    v.push(x);
+}
+```
+
+```
+error: borrow error in main:
+cannot change v while a `for`
+loop iterates over it
+```
+
+</td>
+<td width="33%" valign="top">
+
+**A module only gets what you grant**
+
+```rust
+use logger with { FS };
+
+fn main() -> i64 {
+    log_line("started");
+    return 0;
+}
+```
+
+```
+Capability error: 'println()'
+requires 'IO' capability (not
+granted to module 'logger')
+```
+
+</td>
+<td width="33%" valign="top">
+
+**A pure function stays pure**
+
+```rust
+fn pure_sum(a: i64, b: i64)
+    -> i64 !{} {
+    return a + b + helper();
+}
+```
+
+```
+Effect error: function
+'pure_sum' has inferred
+effect '!IO'
+```
+
+</td>
+</tr>
+</table>
+
+Every message is explained on the [Compiler Errors](https://fid-lang.org/docs/errors) page.
+
+## Why Fid
+
+|     |     |
+| --- | --- |
+| **No lifetime annotations** | References are second-class: they cannot be stored or returned from a local, so there is nothing to annotate. Assignment copies; nothing moves out from under you. |
+| **Capabilities on imports** | `use lib with { IO }` and the compiler rejects that module's calls to the network or filesystem. Your `use` lines show what can touch what. |
+| **Effects in signatures** | `!IO`, `!Net`, `!{}`: inferred across the call graph, and under-declaring is a compile error. Handlers are resumable. |
+| **17 safety rules, each with a test that must fail** | `@no-alloc`, `@bounded-stack`, `@constant_time`, `@secret` and more. `fid qualify` writes the evidence as JSON. |
+| **Checks that stay on** | Bounds, integer overflow and double frees panic in every build, not only in debug. |
+| **No macros** | `comptime` runs ordinary Fid code at compile time, with reflection over types. |
+| **No LLVM** | `fid emit` encodes machine code and writes Windows and Linux executables itself: no assembler, no linker, no C compiler. |
+| **Self-hosted** | About 210K lines of Fid compile themselves to a byte-identical fixpoint, checked on every release build. |
 
 ## Install
 
-- **Windows:** download `Fides-Setup-<version>.exe` from the
-  [latest release](https://github.com/pledgeandgrow/fid/releases/latest)
-  and check it against the release's `SHA256SUMS.txt`. It puts `fid.exe` on
-  your PATH with the standard library beside it.
-- **From source** (any OS with Rust and a C compiler, `zig cc` 0.16 tested):
+**Windows.** Download `Fid-Setup-<version>.exe` (`Fides-Setup-<version>.exe` up to 0.8.0) from the [releases page](https://github.com/pledgeandgrow/fid/releases). It puts `fid.exe` on your PATH with the standard library beside it. The installer is not code-signed yet, so Windows will ask you to confirm.
 
-  ```bash
-  cargo build --release
-  RELEASE=1 CC="zig cc" ./scripts/bootstrap.sh   # builds fid in 3 stages → release/fid
-  ./release/fid run tests/bootstrap/hello.fd
-  ```
+**Linux and macOS, or from source anywhere.** You need git, Rust and a C compiler (`zig cc` 0.16 is the tested one):
 
-## Why Fides
+```bash
+git clone https://github.com/pledgeandgrow/fid && cd fid
+cargo build --release                          # the Rust bootstrap compiler and tools
+RELEASE=1 CC="zig cc" ./scripts/bootstrap.sh   # builds fid in 3 stages and checks the fixpoint
+./release/fid run tests/bootstrap/hello.fd
+```
 
-- **Self-hosted, no LLVM required.** `fid` (`compiler/*.fd`, ~159K lines)
-  compiles itself; `fid emit` writes Windows PE and Linux ELF (x86-64,
-  AArch64, RISC-V) itself, with its own instruction encoders and register
-  allocator, and no assembler or linker. The C back end (`fid ccompile`) is there for
-  every other target.
-- **Ownership without a garbage collector.** Values have one owner and are
-  freed at the end of their scope; strings, `Vec` and `HashMap` behave as
-  values (shared until the first write); references are second-class and
-  cannot escape ([proposal 0004](docs/proposals/0004-ownership-and-layout.md)).
-- **Effects and capabilities in the type system.** A function's IO, network,
-  allocation and other effects are checked; `sandbox {}` limits code to
-  granted capabilities.
-- **Safety rules the compiler enforces.** `@no-alloc`, `@bounded-stack`,
-  `@deterministic`, `@constant_time`, `@secret` information flow and more:
-  17 rules, each with a test that must be rejected
-  ([safety-rules.md](docs/reference/safety-rules.md)).
-- **Checked against itself.** A 3-stage bootstrap fixpoint, reproducible
-  builds, rewrite rules proved with z3, the encoders checked against
-  clang's assembler ([verification](docs/verification/README.md)).
+**Nothing to install.** The [playground](https://fid-lang.org/playground) runs in your browser.
 
-## Status at a glance
+Editor support for VS Code, Neovim, Helix, Emacs and Sublime is in [`editors/`](editors/README.md); `fid lsp` speaks the Language Server Protocol.
 
-Fides is young and moving fast. What works today: the interpreter, the C
-back end, native Windows x64 and native Linux on three architectures,
-generics, ownership, effects and the safety rules. Not yet: WebAssembly
-output (use `ccompile --target wasm32-wasi`), macOS native, a package
-registry. **Not for safety-critical use.** Honest details, test results and
-limits: [docs/reference/status.md](docs/reference/status.md); open bugs:
-[known-bugs.md](docs/reference/known-bugs.md).
+## The toolchain
+
+One binary, `fid`, is the compiler, interpreter, test runner, formatter, linter and language server.
+
+| Command | What it does |
+| --- | --- |
+| `fid run file.fd` | Interpret a program. `--leaks` reports memory never freed |
+| `fid emit file.fd -o out` | Native executable with no other tools. `--target x86_64-linux`, `aarch64-linux` or `riscv64-linux` for Linux |
+| `fid ccompile file.fd -o out` | Through C; `--target` cross-compiles with `zig cc` |
+| `fid check file.fd` | Type, borrow and effect checks only |
+| `fid test file.fd` | Run every `test_*` function, each in its own process |
+| `fid fmt` / `fid lint` | Format; unused code and `unwrap()` outside tests |
+| `fid audit file.fd` | List every `unsafe` block the program reaches |
+| `fid qualify file.fd` | Safety evidence as JSON: rules, their tests, annotated functions |
+| `fid explain file.fd` | Which run-time checks were removed or kept, and why |
+| `fid lsp` | Language server over stdio |
+
+Beside it: `ark` (packages, from path or git), `scribe` (documentation from `///` comments) and `veil` (coverage). The full list is in the [CLI reference](https://fid-lang.org/docs/cli).
+
+## Where it runs
+
+| Platform          | Interpreter | Through C | Native (`fid emit`) |
+| ----------------- | :---------: | :-------: | :-----------------: |
+| Windows x64       |     🟢      |    🟢     |         🟢          |
+| Linux x64         |     🟢      |    🟢     |         🟡          |
+| Linux ARM64       |             |    🟡     |         🟡          |
+| Linux RISC-V      |             |    🟡     |         🟡          |
+| macOS             |             |    ⚪     |         ⚪          |
+| WebAssembly       |             |    🟡     |         ⚪          |
+| Bare metal x86-64 |             |           |         ⚪          |
+
+🟢 supported · 🟡 partly tested · ⚪ experimental. Details and test counts: [platforms](docs/reference/platforms.md).
+
+## How it works
+
+```mermaid
+flowchart LR
+    S([main.fd]) --> L[Lexer] --> P[Parser] --> C[Checks<br/>types · borrows · effects]
+    C --> M[Monomorphizer] --> IR[SSA IR<br/>optimizer]
+    IR --> I[Interpreter<br/>fid run]
+    IR --> CB[C backend<br/>fid ccompile]
+    IR --> N[Native emitter<br/>fid emit]
+    CB --> CC[Any C compiler]
+    N --> EXE([PE and ELF executables])
+```
+
+One front end and one IR, three ways out. The native emitter has its own instruction encoders and register allocator, so no assembler or linker is involved.
+
+The compiler checks itself as hard as it checks your code:
+
+- **Fixpoint.** Stage 2 and stage 3 of the bootstrap must produce byte-identical output on every release build.
+- **Proved rewrites.** The optimizer's 108 integer rewrite rules are proved with z3.
+- **Checked encoders.** The instruction encoders are compared with clang's assembler across 1,181 forms.
+- **Conformance.** 104 programs each check one rule of the [language reference](docs/reference/reference.md).
+
+More in [verification](docs/verification/README.md) and the [contributor walkthrough](docs/reference/compiler-walkthrough.md).
+
+## Standard library
+
+169 modules, written in Fid. A sample:
+
+| Area | Modules |
+| --- | --- |
+| Core and collections | `core`, `vec`, `collections`, `string`, `rc`, `arena`, `iter`, `sort` |
+| Text and data | `json`, `toml`, `yaml`, `csv`, `regex`, `unicode`, `protobuf` |
+| Network | `http`, `http2`, `net`, `dns`, `ws`, `tls_crypto`, `url` |
+| Concurrency | `task`, `channel`, `sync`, `parallel`, `async` |
+| Numbers and models | `math`, `bigint`, `decimal`, `tensor`, `simd`, `infer` |
+| Security | `crypto`, `sha512`, `ed25519`, `x25519`, `typed_strings`, `privacy` |
+| Systems | `fs`, `process`, `mmap`, `elf`, `pci`, `uart`, `virtio` |
+| Games and graphics | `ecs`, `physics`, `mesh`, `gltf`, `tilemap`, `shader` |
+
+Signatures for every module: [API reference](https://fid-lang.org/reference).
+
+## Honest status
+
+Fid is young and moving fast.
+
+- **v0.8.0-unstable is a prerelease.** The stable v1.0.0 release is planned for December 2026.
+- **Generated code is slower than Rust's.** Through C, Fid is fastest on one of four benchmarks and up to 1.6 times slower on the others; native output is slower still. [Benchmarks, losses included](docs/benchmarks.md).
+- **No package registry yet.** `ark` installs from a path or a git repository.
+- **The full test suite has not been rerun with the current compiler.** Features are checked with their own tests on each backend.
+- **Not for safety-critical use.** `fid qualify` produces evidence for review, not a certification.
+
+The details: [status](docs/reference/status.md) · [known bugs](docs/reference/known-bugs.md) · [roadmap](docs/roadmap/roadmap.md).
 
 ## Learn
 
-- [The Fides Book](docs/book/01-intro.md) — first program to a network service
-- [Language reference](docs/reference/reference.md) — every rule, with the compiler code that enforces it
-- [Cookbook](docs/cookbook.md) — files, JSON, HTTP, tasks
-- [Examples](examples/) — JSON parser, HTTP server, a mini compiler, a neural network
-- [INDEX.md](INDEX.md) — map of every document and compiler module
+| | |
+| --- | --- |
+| [The Fid Book](docs/book/01-intro.md) | First program to a network service |
+| [Coming from Rust](docs/guides/from-rust.md) · [Go](docs/guides/from-go.md) · [Zig](docs/guides/from-zig.md) · [C](docs/guides/from-c.md) | What you already know, mapped onto Fid |
+| [Language reference](docs/reference/reference.md) | Every rule, with the compiler function that enforces it |
+| [Cookbook](docs/cookbook.md) | Files, JSON, HTTP, tasks |
+| [Examples](examples/) | A JSON parser, an HTTP server, a mini compiler, a neural network, a game loop |
+| [INDEX.md](INDEX.md) | A map of every document and compiler module |
 
-## Community
-
-[Contributing](CONTRIBUTING.md) · [Security policy](SECURITY.md) ·
-[Code of conduct](CODE_OF_CONDUCT.md) · [Support and discussions](SUPPORT.md) ·
-[Changelog](docs/reference/changelog.md) · MIT [license](LICENSE)
-
----
-
-## Building and using the compilers
-
-### Using the self-hosted compiler
-
-```bash
-# Installed: the installer puts fid.exe (self-hosted) and fidesc.exe
-# (Rust) on PATH, with the stdlib beside them.
-fid run      examples/json_parser.fd
-fid ccompile examples/json_parser.fd -o json_parser.exe   # needs a C compiler
-
-# From the repository: build it in 3 stages (checks the fixpoint) into
-# release/fid.exe
-cargo build --release
-RELEASE=1 CC="zig cc" ./scripts/bootstrap.sh
-.\release\fid.exe run tests/bootstrap/hello.fd
-```
-
-The self-hosted compiler finds the stdlib through `$FID_HOME/stdlib`,
-`<exe dir>/stdlib` or `<exe dir>/../stdlib`, so it runs from any folder.
-
-### Using the Rust bootstrap compiler
-
-```bash
-# Build the Rust bootstrap compiler
-cargo build --release
-
-# Run / compile / inspect a Fides program
-.\target\release\fidesc.exe run      tests/bootstrap/hello.fd
-.\target\release\fidesc.exe ccompile tests/bootstrap/hello.fd -o hello.exe
-.\target\release\fidesc.exe dump-c   tests/bootstrap/hello.fd > hello.c
-.\target\release\fidesc.exe ir       tests/bootstrap/hello.fd
-.\target\release\fidesc.exe fmt      tests/bootstrap/hello.fd
-.\target\release\fidesc.exe lsp
-
-# Rebuild the self-hosted compiler: 3 stages + fixpoint → release/fid.exe
-RELEASE=1 CC="zig cc" ./scripts/bootstrap.sh
-# or a single stage for development (dump-c + compile → release/fid.exe,
-# same name, no fixpoint check)
-./scripts/build-selfhost.sh
-
-# Build a native ELF64 executable on Linux (zero external tools needed)
-cargo run -- build tests/bootstrap/hello.fd -o hello
-
-# Cross-compile to ARM64, RISC-V, or Windows
-cargo run -- build tests/bootstrap/hello.fd --target arm64-linux -o hello_arm64
-cargo run -- build tests/bootstrap/hello.fd --target riscv64-linux -o hello_riscv
-cargo run -- build tests/bootstrap/hello.fd --target x86-64-windows -o hello.exe
-
-# Run the test suite (Rust compiler tests)
-cargo run -- test
-```
-
-### When to use which compiler
-
-| Task | Use | Why |
-|------|-----|-----|
-| Writing and running Fides programs | `fid.exe` (self-hosted) or `fidesc.exe` | Both give the same output |
-| Native Windows .exe with no C compiler | `fidesc.exe emit` | The self-hosted native backend is not working yet |
-| Adding stdlib modules, tests | either; run `fidesc test` | The test harness is in the Rust compiler |
-| Changing `compiler/*.fd` | `fidesc.exe` (Rust) to build stage 1 | Then `RELEASE=1 scripts/bootstrap.sh` to check the fixpoint |
-| Adding new language features | `fidesc.exe` (Rust) first, then port to `compiler/*.fd` | New features need both compilers |
-
-### CLI Commands
-
-| Command | Description |
-|---------|-------------|
-| `build <file.fd> -o <out>` | `fid`: same as `emit` (native PE on a Windows host; through C on other hosts without `--target`; `build --native` with the default target, the PIR path, crashes). `fidesc build --target x86-64\|arm64\|riscv64-linux\|x86-64-windows`: its own ELF64/PE path, tier 2–3. |
-| `emit <file.fd> -o <out.exe> [--checked-alloc]` | **Native Windows executable**, no C compiler: IR → x86-64 machine code → PE. `--checked-alloc` puts every block on pages of its own (use after free and overruns fault; written Nov 4, not yet run on the suite). |
-| `emit <file.fd> -o <out.bin> --bare` | Bare-metal flat binary (`fid` since Nov 6: loaded at 0x10000, print to COM1; not yet run under QEMU) |
-| `ccompile <file.fd> -o <out>` | C codegen pipeline: lex → parse → typecheck → lower → C source → `gcc`/`clang` → executable |
-| `run <file.fd> [--leaks] [--checked-alloc]` | Interpret the IR (no external tools). `--leaks` / `--checked-alloc` run the program through C with the debug allocator. |
-| `check <file.fd>` | Type, borrow and escape checks only |
-| `qualify <file.fd> [-o out.json]` | Safety evidence as JSON: compiler and source hashes, check result, annotated functions, each rule with its tests ([safety-rules.md](docs/reference/safety-rules.md)). Always "NOT_QUALIFIED". |
-| `audit <file.fd> [--stdlib] [--strict]` | List the `unsafe` code a program reaches, with its `// SAFETY:` comments |
-| `ir <file.fd>` | Lex → parse → typecheck → lower → print SSA IR |
-| `pir <file.fd> [1\|2\|3\|all] [--opt]` | Lower to PIR (L1/L2/L3) and print; `--opt` runs optimization passes (panics in `fid`, Nov 9) |
-| `opt <file.fd> [pass1,pass2,...]` | Run PIR optimizer and print statistics (`fid` ignores the pass list and panics in `jump_thread_redirect`, Nov 9) |
-| `codegen <file.fd> --target <arch> [--peephole] [--elf\|--macho\|--coff <o>]` | Generate assembly for x86-64, ARM64, or RISC-V; optionally emit object files |
-| `wasm <file.fd> -o <out.wasm> [--wat]` | WebAssembly backend: PIR → WASM binary |
-| `gpu <file.fd>` | SPIR-V GPU backend: PIR → SPIR-V binary |
-| `tokens <file.fd>` | Lex only — print token stream |
-| `ast <file.fd>` | Lex + parse — print AST tree |
-| `test` | Run every test in `tests/bootstrap/` across interpreter, PE emitter, and C codegen (`--fail` for the expected-fail tests) |
-| `repl` | Interactive REPL — evaluate Fides expressions |
-| `verify <file.fd>` | Verify IR correctness (terminators, block refs, value refs) |
-| `sourcemap <file.fd>` | Show source map (IR value → source line mapping) |
-| `parse-header <file.h> -o <out.fd>` | Parse C header file → generate Fides FFI bindings |
-| `watch <file.fd>` | `fidesc`: rebuild and rerun on change (native JIT on ELF64) |
-| `link <files...>` | Link multiple object files (integrated linker) |
-| `profile <file.fd>` | Per-function timing profiler (interpreter mode) |
-| `fmt <file.fd>` | Format a Fides source file |
-| `lint <file.fd>` | Lint checks (unused functions, unused imports) |
-| `bench <file.fd> [-n <count>] [--ccompile]` | Benchmark a file (interpreter or C native) |
-| `debug <file.fd>` | Interactive debugger (breakpoints, step, locals) |
-| `replay <trace.fdtrace>` | Replay a recorded execution trace |
-| `autopsy <file.fd>` | Native binary debug (ptrace-based, Linux only) |
-| `version` | Print compiler version |
-
----
-
-## Verification
-
-The project includes automated verification scripts for ensuring correctness across all backends:
-
-```bash
-# Full verification: build + test + compare to baseline
-./verify.sh
-
-# Save current test results as new baseline (only after intentional changes)
-./verify.sh --save
-
-# Quick build check (no tests)
-./verify.sh --quick
-
-# Bisect which compiler layer broke a test — no script exists; do it manually:
-./target/release/fidesc dump-ir  tests/bootstrap/<name>.fd
-./target/release/fidesc dump-pir tests/bootstrap/<name>.fd 3
-./target/release/fidesc codegen  tests/bootstrap/<name>.fd --target x86-64 --peephole
-```
-
-**Before making any change:** run `./verify.sh` to confirm you're starting from a known-good state. After changes, run `./verify.sh` again to check for regressions. If a test regresses, bisect manually with the `dump-*`/`codegen` commands above to identify which compiler layer (lowering, PIR, codegen, or peephole) is responsible.
-
-Current baseline is stored in `tests/bootstrap/baseline/test_results.txt` —
-`./verify.sh` prints the diff against it.
-
----
-
-## How It Works
-
-The compiler is a multi-stage pipeline:
+## Repository layout
 
 ```
-Source (.fd) → Lexer → Parser → TypeChecker → Monomorphizer → Lowerer → SSA IR
-                                                                         │
-                                                    ┌────────────────────┼────────────────────┐
-                                                    │                    │                    │
-                                                    ▼                    ▼                    ▼
-                                            ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-                                            │  ELF64/PE    │  │  PIR L1/L2/L3│  │  C Codegen   │
-                                            │  Emitter     │  │  → Codegen   │  │  codegen_c.rs│
-                                            │  elf64.rs/   │  │  x64/arm64/  │  └──────────────┘
-                                            │  pe.rs       │  │  riscv       │          │
-                                            └──────────────┘  │  + peephole  │          ▼
-                                                    │        └──────────────┘    C source (.c)
-                                                    ▼                │                │
-                                            Native ELF64/.exe       ▼                ▼
-                                            (zero tools)    Assembly / Object    gcc/clang
-                                                            (.s / .o)          │
-                                                                                ▼
-                                                                          Native executable
+compiler/    the compiler, in Fid: 72 modules, about 210K lines
+stdlib/      the standard library: 169 modules
+src/         the earlier compiler in Rust, frozen; it builds stage 1 and runs the test harness
+tests/       bootstrap (572 programs), conformance (104), selfhost (51), leak checks
+examples/    twelve complete programs
+docs/        book, guides, reference, proposals, roadmap, verification
+editors/     VS Code, Neovim, Helix, Emacs, Sublime
+installer/   the Windows installer
+bench/       benchmark programs in Fid, Rust, Zig, C++ and Go
+scripts/     bootstrap, cross-target tests, fuzzing, verification
 ```
 
-The **ELF64 emitter** (`build` command on Linux) is the primary native backend — it encodes x86_64 instructions directly to machine code bytes and constructs a valid ELF64 executable with zero external tools. **Cross-compilation** to ARM64 and RISC-V uses built-in instruction encoders (`arm64_enc.rs`, `riscv_enc.rs`) and runtime libraries (`runtime_arm64.rs`, `runtime_riscv.rs`) with raw Linux syscalls. The **PE emitter** (`emit` command or `--target x86-64-windows`) does the same for Windows.
-
-### 0. Module Resolution & Monomorphization (`compiler.rs`, `mono.rs`)
-
-Before lowering, the compiler:
-- Auto-includes `stdlib/core.fd` (user definitions override stdlib)
-- Resolves `use` imports by searching for `<path>.fd` or `<path>/mod.fd` files relative to the source
-- Merges stdlib + imported modules + user code (user wins on conflicts)
-- **Monomorphizes** generic functions: analyzes all call sites with concrete type arguments, generates specialized non-generic copies (e.g., `identity__i64`), and replaces calls
-
-### 1. Lexer (`lexer.rs`)
-
-Reads Fides source text and produces a stream of tokens. Handles:
-
-- **Keywords**: `fn`, `val`, `const`, `mut`, `cap`, `type`, `return`, `if`, `else`, `match`, `struct`, `enum`, `impl`, `pub`, `use`, `async`, `await`, `comptime`, `defer`, `spawn`, `for`, `while`, `loop`, `break`, `continue`, `in`, `as`, `where`, `region`, `move`, `static`, `true`, `false`
-- **Primitive types**: `i8`–`i128`, `u8`–`u128`, `f32`, `f64`, `bool`, `str`, `void`
-- **Operators**: `+ - * / % == != < > <= >= && || ! & | ^ ~ << >> = += -= *= /= %= &= |= ^= <<= >>= -> => :: ? .. ..=`
-- **Literals**: integers (hex `0xFF`, binary `0b1010`, octal `0o777`, underscores `1_000`), floats, strings, f-strings, identifiers
-- **Comments**: `//` line comments, `/* */` block comments
-
-### 2. Parser (`parser.rs`)
-
-Recursive descent parser. Consumes the token stream and builds an AST. Handles:
-
-- **Top-level declarations**: `fn` functions, `struct` definitions, `enum` definitions, `impl` blocks, `type` aliases, `const` constants, `use` imports, `#[attributes]`
-- **Statements**: `val`/`var` bindings, `return`, `if`/`else`, `for`/`while`/`loop`, `break`/`continue`, `match`, `defer`, assignment + compound assignment, expression statements
-- **Expressions**: literals, identifiers, binary/unary ops, function calls, method calls, struct literals, field access, array literals + indexing, references/derefs, closures, tuples, f-strings, ranges, block expressions
-- **Types**: all primitives, named types, generic types (`Option<T>`), references (`&T`, `&mut T`), arrays (`[T; N]`), tuples, function types
+## Contributing
 
-### 3. Type Checker (`typechecker.rs`)
+Contributions are welcome, from a test program to a compiler change.
 
-Validates the AST — ensures types are correct before lowering. Checks:
+1. Read [CONTRIBUTING.md](CONTRIBUTING.md) and, before touching `compiler/*.fd`, [AGENTS.md](AGENTS.md) and the [compiler internals](docs/compiler-internals.md).
+2. Build with the two commands under [Install](#install).
+3. Keep a change small: one fix, one test. `RELEASE=1 ./scripts/bootstrap.sh` must still reach its fixpoint.
+4. Language changes start as a [proposal](docs/proposals/0000-template.md).
 
-- Variable bindings have valid types (with inference)
-- Function calls match declared parameter types
-- Binary operations are between compatible types
-- Struct literals have correct field names and types
-- Field access is on valid struct types
-- Return statements match function return type
-- Pattern match arms are type-consistent
-- Constants, type aliases, and generics are resolved
-
-Reports all errors at once (does not stop on first error).
-
-### 4. IR Lowering (`lower.rs`)
-
-Lowers the type-checked AST to a typed **SSA (Static Single Assignment) IR** defined in `ir.rs`. Key features:
-
-- **SSA values**: every value has a unique ID and single definition
-- **Basic blocks**: control flow lowered to blocks with terminators (jump, branch, return)
-- **Alloca + load/store**: mutable variables lowered via stack allocations
-- **Function calls**: lowered to `Inst::Call` with argument passing
-- **Runtime functions**: `print`, `__fides_to_str`, `__fides_str_concat`, `__fides_print_int`, `__fides_print_str`, `__fides_print_bool`, `__fides_panic`
-- **F-string lowering**: literal parts become `ConstStr`, expression parts are converted via `__fides_to_str` (if not already a string), then all parts are concatenated via `__fides_str_concat`
-- **Loop lowering**: `for` loops over ranges become `while`-style blocks with a loop variable alloca; `for` loops over arrays become index-based while loops with `GetElemPtr` + `Load`; `while` loops become condition + body + back-edge blocks
-- **Alloca type tracking**: `HashMap<ValueId, IrType>` maps each alloca to its IR type, enabling correct `Load` types (not hardcoded `I64`)
-- **Defer emission**: `defer_stack` tracks deferred statements; `emit_defers` drains and emits them before `Ret`
-- **Match expression lowering**: `lower_match_expr` with result slot alloca, pattern matching branches (IntLit, StrLit, Range, EnumVariant, Wildcard, Ident), merge block
-- **Method call lowering**: Name mangling (`__fides_StructName_method`), SRET for struct returns, receiver as first arg
-- **Compound assignment**: Uses `get_value_type()` / `alloca_types` for correct `BinOp` type instead of hardcoded `I64`
-
-### 5. IR Interpreter (`interp.rs`)
-
-Executes the SSA IR directly — no external assembler or linker needed. Used by the `run` command. Supports:
-
-- All IR instructions (arithmetic, comparisons, control flow, calls)
-- Runtime function calls (`print`, `__fides_to_str`, `__fides_str_concat`, etc.)
-- Value types: `Int`, `Float`, `Bool`, `Str`, `Ptr`, `Unit`
-- Verbose mode (`-v`) for debugging
-
-### 6. PE Emitter (`pe.rs`) — Direct Native Code Generation
-
-The **PE emitter** is the primary native backend. It encodes x86_64 instructions directly to machine code bytes and constructs a valid PE (Portable Executable) file — no assembler, linker, or C compiler required.
-
-**Pipeline:** `IrModule` → machine code bytes → PE file → `.exe`
-
-**Capabilities:**
-- **Full x86_64 instruction encoding**: REX prefixes, ModR/M + SIB bytes, displacement encoding (8-bit/32-bit), immediate encoding
-- **Register allocation**: Stack-based alloca model — every IR value gets a stack slot at a fixed `rbp` offset; registers used as scratch within instructions
-- **Windows x64 ABI**: RCX/RDX/R8/R9 for first 4 args, 32-byte shadow space, 16-byte stack alignment before calls, RAX for return values
-- **PE file construction**: DOS header, PE header, section headers (.text + .rdata), import directory, IAT (Import Address Table) for `kernel32.dll` functions
-- **Import resolution**: `GetStdHandle`, `WriteFile`, `ExitProcess` imported from `kernel32.dll` via IAT with RIP-relative addressing
-- **Runtime stubs** (generated inline as machine code):
-  - `p_print_int` — integer to string conversion (div/mod loop, reverse fill), `WriteFile` to stdout, newline
-  - `p_print_str` — string + newline to stdout via `WriteFile`
-  - `p_print_bool` — "true"/"false" to stdout
-  - `p_print_float` — (stub, prints truncated int)
-  - `p_panic` — prints message + `ExitProcess`
-  - `p_malloc` / `p_free` — heap allocation (stubs)
-- **Control flow**: Conditional jumps (`jcc`), unconditional jumps (`jmp`), label-based relocation with deferred resolution
-- **Arithmetic**: Integer add/sub/mul/div/mod, float add/sub/mul/div, comparisons, bitwise and/or/xor/shl/shr
-- **Stack frame management**: `push rbp` / `mov rbp, rsp` / `sub rsp, N` prologues, pre-allocated alloca slots at fixed offsets
-- **Non-volatile registers**: `r12`/`r13` saved/restored in runtime stubs
-- **Entry point**: Calls `main`, passes exit code to `ExitProcess`
-- **Read-only data**: String literals stored in `.rdata` section, referenced via RIP-relative addressing
-
-**Instruction encoders** (selected):
-- `mov_rr`, `mov_mem_disp_reg`, `mov_mem_disp_reg32` (32-bit store), `mov_r_imm`, `mov_r8_imm`
-- `add_rr`, `sub_rr`, `imul_rr`, `xor_rr`, `and_rr`, `or_rr`
-- `cmp_rr`, `test_rr`, `jcc_label`, `call_label`, `call_reg`, `call_rip`
-- `return`, `push`, `pop`, `lea_rbp`, `sub_rsp_i32`, `add_rsp_i32`
-- `mov_mem_reg8` (byte store for digit conversion)
-
-### 7. Cross-Compilation Backends (`arm64_enc.rs`, `runtime_arm64.rs`, `riscv_enc.rs`, `runtime_riscv.rs`)
-
-The compiler supports cross-compilation to ARM64 and RISC-V targets with zero external tools. Each target has its own instruction encoder and runtime library:
-
-**ARM64 (AArch64) — `--target arm64-linux`:**
-- **Encoder** (`arm64_enc.rs`): Converts ARM64 assembly text to 4-byte machine code. Supports arithmetic (ADD, SUB, MUL, SDIV, UDIV), load/store (LDR, STR, LDRB, STRB), branches (B, BL, B.cond, RET), ADRP+ADD:lo12 for PC-relative addressing, SVC for syscalls. 17 unit tests.
-- **Runtime** (`runtime_arm64.rs`): ARM64 Linux runtime using raw SVC syscalls (write=64, exit=93, mmap=222). Provides p_print_str, p_print_int, p_print_bool, p_panic, p_malloc, p_to_str, p_str_concat, and Vec operations. 9 unit tests.
-- **ELF machine type**: EM_AARCH64 (183)
-
-**RISC-V (RV64) — `--target riscv64-linux`:**
-- **Encoder** (`riscv_enc.rs`): Converts RV64 assembly text to 4-byte machine code. Supports R-type, I-type, S-type, B-type, J-type, U-type instructions. Includes pseudo-instructions (li, mv, neg, not, seqz, snez, j, call, return, bgez, beqz, bnez, sext.w). 14 unit tests.
-- **Runtime** (`runtime_riscv.rs`): RISC-V Linux runtime using raw ECALL syscalls (write=64, exit=93, mmap=222). Same function set as ARM64 runtime. 7 unit tests.
-- **ELF machine type**: EM_RISCV (243)
-
-**Windows (x86-64) — `--target x86-64-windows`:**
-- Uses the existing PE emitter (`pe.rs`) which generates x86-64 Windows .exe files directly from IR with kernel32.dll imports. No additional runtime needed — PE emitter has its own inline runtime stubs.
-
-**Target triple parsing** (`parse_target_triple()` in `main.rs`): Normalizes target strings to canonical names. Accepted formats: `x86-64`, `arm64`, `aarch64`, `riscv`, `riscv64`, `arm64-linux`, `aarch64-linux`, `riscv64-linux`, `x86-64-windows`, `x64-windows`, `windows`.
-
-**Linker** (`linker.rs`): Target-aware ELF linker. `link_raw_with_runtime_for_target()` links user code + runtime for any target. Handles ARM64 relocations (BL, B, B.cond, ADRP, ADD:lo12) and RISC-V relocations (JAL, branch).
-
-### 8. x86_64 MASM Code Generator (`x86.rs`)
-
-Generates MASM-compatible x86_64 assembly from the SSA IR. Features:
-
-- **Windows x64 calling convention**: RCX, RDX, R8, R9 for first 4 args; 32-byte shadow space; 16-byte stack alignment
-- **Stack frame management**: `push rbp` / `mov rbp, rsp` / `sub rsp, N` prologues; pre-allocated alloca slots
-- **Non-volatile register preservation**: `r12`/`r13` saved/restored in runtime stubs
-- **Runtime stubs** (generated inline, no C runtime):
-  - `__fides_print_int` — integer to string + `WriteFile` to stdout
-  - `__fides_print_str` — string + newline to stdout
-  - `__fides_print_bool` — "true"/"false" to stdout
-  - `__fides_print_float` — (stub, prints truncated int)
-  - `__fides_to_str` — integer to null-terminated string in stack buffer
-  - `__fides_str_concat` — concatenates two strings into static buffer (with temp buffer to avoid aliasing)
-  - `__fides_panic` — prints message + `ExitProcess`
-- **Static data**: string literals, concatenation buffers (`str_concat_buf`, `str_concat_tmp`) in `.data` section
-- **External imports**: `GetStdHandle`, `WriteFile`, `ExitProcess` from `kernel32.lib`
-- **Entry point**: `main` / `_main` (both exported)
-
-### 9. C Code Generator (`codegen_c.rs`)
-
-Translates SSA IR to portable C99 code. Used by the `ccompile` command. Features:
-
-- **Portable C output**: Generates `.c` files compilable with MSVC (`cl.exe`), GCC, or Clang
-- **Function renaming**: `main` → `main_entry`, `abs`/`max`/`min` → `p_abs`/`p_max`/`p_min` (avoids C/MSVC conflicts)
-- **`#undef` directives**: Removes MSVC `max`/`min`/`abs` macros that conflict with Fides functions
-- **SSA variable declarations**: All values declared once at function start; instructions are assignments
-- **Polymorphic `print`**: Dispatches to `p_print_str`/`p_print_int`/`p_print_bool`/`p_print_float` + `p_print_newline()` based on argument type
-- **Runtime functions**: `p_print*`, `p_panic`, `p_malloc`, `p_free`, `p_str_concat`, `p_to_str`, Vec/HashMap/String operations
-- **Control flow**: Basic blocks as C labels with `goto` statements
-- **MSVC integration**: `find_cl()` and `find_vcvarsall()` locate and set up the MSVC compiler environment
-
-### 10. Compiler Pipeline (`compiler.rs`)
-
-Orchestrates the stages. Entry points:
-
-- `emit_source_with_path(source, path)` — Direct PE emission: lex → parse → typecheck → monomorphize → lower → PE bytes
-- `build_executable(source, path)` — Native build pipeline: lex → parse → typecheck → monomorphize → lower → PIR (L1→L2→L3) → codegen → peephole → ELF64/PE executable. Supports cross-compilation via `--target arm64`, `--target riscv`, `--target x86-64-windows`.
-- `ccompile_source_with_path(source, path)` — C codegen pipeline: lex → parse → typecheck → monomorphize → lower → C source string
-- `interpret_source_with_path(source, path, verbose)` — Lex → parse → typecheck → monomorphize → lower → interpret IR
-- `lower_to_ir(source)` — Lex → parse → typecheck → monomorphize → lower → formatted IR string
-- `lex(source)` — Lex only, returns formatted token list
-- `parse_to_ast(source)` — Lex + parse, returns pretty-printed AST
-- `compile(source)` — Legacy ARM64 pipeline (unused for x86/PE/C path)
-
----
-
-## Language Features
-
-### Currently Supported (End-to-End: parse → lower → codegen → run)
-
-| Feature | Syntax | Example |
-|---------|--------|---------|
-| Functions | `fn` | `fn add(a: i32, b: i32) -> i32 { return a + b; }` |
-| Variables | `val` / `var` | `val x = 42;` / `var y = 0;` |
-| Constants | `const` | `const MAX: i32 = 100;` |
-| If/Else | `if` / `else` | `if x > 0 { ... } else { ... }` |
-| For loops | `for x in start..end` | `for i in 0..5 { sum += i; }` |
-| While loops | `while cond` | `while counter < 5 { ... }` |
-| Return | `return` | `return 42;` |
-| Arithmetic | `+ - * / %` | `a + b * c` |
-| Comparison | `== != < > <= >=` | `if x >= 10 { ... }` |
-| Logical | `&& \|\| !` | `if a && !b { ... }` |
-| Bitwise | `& \| ^ ~ << >>` | `0xFF & 0x0F` |
-| Compound assign | `+= -= *= /= %=` | `x += 10;` |
-| Function calls | `name(args)` | `add(10, 20)` |
-| Recursive calls | self-referential `fn` | `fn fact(n: i32) -> i32 { ... fact(n-1) ... }` |
-| Print | `print(...)` | `print("Hello, Fides!");` |
-| String literals | `"..."` | `print("Hello");` |
-| F-strings | `f"{expr}"` | `f"Hello, {name}!"` |
-| F-string with int | `f"x = {x}"` | `print(f"x = {x}");` |
-| Hex/binary/octal | `0xFF` `0b1010` `0o777` | `val y = 0xFF & 0x0F;` |
-| Type annotations | `: type` | `val x: i32 = 42;` |
-| Semicolons | `;` | Statement terminator |
-| Comments | `//` `/* */` | `// line comment` |
-| Structs | `struct Point { x: i32, y: i32 }` | `struct Point { x: i64, y: i64 }` |
-| Struct literals | `Point { x: 1, y: 2 }` | `val p = Point { x: 1, y: 2 };` |
-| Field access | `point.x` | `print(p.x);` |
-| Struct return (SRET) | `fn make_point() -> Point { ... }` | `val p = make_point(); print(p.x);` |
-
-### Lowered (AST → SSA IR → Interpreter + PE Emitter)
-
-| Feature | Syntax |
-|---------|--------|
-| Struct methods | `impl Point { fn get_x(self: Point) -> i32 { ... } }` |
-| Pattern matching | `match val { 1 => { ... } _ => { ... } }` |
-| Match patterns (int, str, range, enum) | `match s { "foo" => { ... } 1..=10 => { ... } Shape::Circle(r) => { ... } }` |
-| Enums with data | `enum Shape { Circle(f64), Rectangle(f64, f64), Unit }` |
-| Enum variant construction | `Shape::Circle(3.14)` |
-| References | `&x`, `&mut x`, `*x` |
-| Closures (lambda lifting) | `fn(x: i32) => x * 2` |
-| `?` operator | `expr?` |
-| Tuples | `(i32, bool)`, `(42, true)` |
-| Array literals | `[1, 2, 3, 4, 5]` |
-| Array indexing + assignment | `arr[0]`, `arr[0] = 10`, `arr[2] += 100` |
-| `for` loop over arrays | `for x in arr { sum += x; }` |
-| `defer` blocks | `defer close(file);` |
-| Block expressions | `{ val a = 10; val b = 20; a + b }` |
-| Linear types (`@linear`) | `@linear fn transfer(...) { ... }` — move semantics, no duplication |
-| `@conserve` | `@conserve fn settle(...) { ... }` — compile-time financial conservation proof |
-| Tuple destructuring | `val (a, b) = expr` |
-| `txn {}` blocks | `txn { transfer(a, b, 100); }` — atomic transactions with rollback |
-| `@gas` | `@gas(1000) fn foo() { ... }` — compile-time gas budgets |
-| `@crashfree` | `@crashfree fn foo() { ... }` — compile-time proof of no panics |
-| `@audit` | `@audit fn foo() { ... }` — automatic function audit logging |
-| Loop-aware linear types | Linear vars consumed in loops → compile error |
-
-### Implemented (Lexer + Parser + Typechecker + Lowering + Codegen)
-
-| Feature | Syntax | Notes |
-|---------|--------|-------|
-| `async` / `await` | `async fn` / `await <expr>` | ✅ Works (Phase 7.6) — Future<T> type, eager evaluation, `p_future_ready`/`p_future_poll` runtime |
-| `spawn` | `spawn <expr>` | ✅ Works (Phase 7.6/8A) — creates OS threads via `p_thread_spawn` |
-| `@derive` | `@derive(Debug/Clone/Serialize/Deserialize)` | ✅ Works (Phase 7.7) — generates debug_str/clone/to_json/from_json methods |
-| `#[test]` attribute | `#[test]` | Parsed but not executed by `fidesc test` (tests are file-based) |
-
-### Planned (Not Yet Implemented)
-
-| Feature | Syntax | Phase |
-|---------|--------|-------|
-| Default arguments | `fn f(x: i32 = 0)` | Future |
-| Variadic arguments | `fn f(...args)` | Future |
-| Self-hosting | (rewrite compiler in Fides) | Phase 6 |
-
----
-
-## Fides Syntax Overview
-
-Fides is a systems language with unique keywords designed for clarity and AI-friendliness:
-
-- **Compile-time financial conservation** — Bugs that cost the real world billions (Knight Capital: $440M in 45 minutes from double-processing) are compile errors in Fides. The `@conserve` annotation proves money-in equals money-out at compile time, and linear types (`@linear`) prevent double-processing of financial values.
-
-```p
-// Function declaration
-fn main() {
-    val x = 42;
-    var y = 0;
-    y = x + 8;
-    print(y);
-}
-
-// Struct with methods
-struct Point {
-    x: f64,
-    y: f64,
-}
-
-impl Point {
-    fn new(x: f64, y: f64) -> Point {
-        Point { x: x, y: y }
-    }
-
-    fn distance(&self, other: &Point) -> f64 {
-        val dx = self.x - other.x;
-        val dy = self.y - other.y;
-        (dx * dx + dy * dy).sqrt()
-    }
-}
-
-// Algebraic enum
-enum Shape {
-    Circle { radius: f64 },
-    Rectangle { width: f64, height: f64 },
-    Triangle(f64, f64, f64),
-}
-
-// Constant
-const MAX_PLAYERS: i32 = 64;
-```
-
-### Fides Keyword Reference
-
-| Keyword | Meaning | Replaces (Rust) |
-|---------|---------|-----------------|
-| `fn` | Fides Function (all functions) | `fn` |
-| `val` / `var` | Variable (immutable / mutable) | `let` / `let mut` |
-| `const` | Constant | `const` |
-| `cap` | Capability / Trait | `trait` |
-| `return` | Return | `return` |
-| `type` | Type alias | `type` |
-| `comptime` | Compile-time code (no macros) | N/A (replaces macros) |
-| `defer` | Deferred cleanup | N/A (Go-inspired) |
-| `spawn` | Task spawning | N/A |
-| `region` | Explicit memory region | `'a` lifetimes |
-
-See `docs/reference/syntax.md` for the complete syntax specification.
-
----
-
-## Project Structure
-
-```
-fid/
-├── compiler/               # 68 self-hosted Fides modules (~159K lines) — THE COMPILER
-│   ├── main.fd / compiler.fd / inc.fd / csplit.fd  # CLI, pipeline, build cache, split C
-│   ├── lexer.fd / parser.fd / ast.fd / token.fd / comptime_eval.fd  # Front end
-│   ├── typechecker.fd / escape.fd / secrecy.fd / borrowck.fd / mono.fd / cowcheck.fd  # Checks
-│   ├── lower.fd / ir.fd / checks.fd / irverify.fd  # AST → SSA IR (ownership 0004), check removal, IR verifier
-│   ├── iropt.fd / iropt_me.fd / rules.fd / egraph.fd  # IR mid-end (native paths)
-│   ├── interp.fd / green_thread.fd / tensor.fd  # `fid run`
-│   ├── codegen_c.fd        # IR → C99 + embedded C runtime
-│   ├── pe_ir.fd / pe_ir_enc.fd / pe_ir_stubs.fd  # Native Windows x64 (default `emit`)
-│   ├── nat_ir.fd / nat_enc.fd  # Machine layer: Linux AArch64/RISC-V/x86-64, `--nat` Windows
-│   ├── fmt.fd / lsp.fd / json.fd / scribe.fd / veil.fd / ark.fd / cparser.fd  # Tools
-│   ├── pir.fd / opt.fd / regalloc.fd / peephole.fd / codegen_x64.fd / codegen_arm64.fd / codegen_riscv.fd
-│   ├── elf64.fd / linker.fd / coff.fd / macho.fd / x86.fd / pe.fd / runtime_*.fd / *_enc.fd  # Old PIR path
-│   ├── wasm.fd / gpu.fd    # Experimental back ends (output does not validate)
-│   └── autograd.fd / codegen.fd / debugger.fd / diag.fd / embedded.fd / flat_ast.fd / hotreload.fd / native_debugger.fd / runtime.fd  # Not used
-├── src/                    # Rust bootstrap reference (57 files, ~112K lines)
-│   ├── main.rs             # CLI entry point (used to generate first-generation C)
-│   ├── escape.rs           # Reference escape analysis (Rust twin of escape.fd)
-│   ├── dwarf.rs            # DWARF debug info (started)
-│   ├── ...                 # Mirrors compiler/*.fd in Rust (reference implementation)
-│   └── bin/                # Binary entry points (fidesc, ark, scribe, veil)
-├── stdlib/                 # 146 standard library modules (~51K lines)
-│   ├── core.fd             # Option, Result, println, assert, max, min, abs, clamp
-│   ├── vec.fd              # Vec<T> with iterator adapters
-│   ├── rc.fd               # Rc<T> / Arc<T> reference counting
-│   └── ...                 # 101 more modules (math, banking, medical, tensor, game/*)
-│                           #   kernel.fd + uefi.fd moved to the fides-os project
-├── tests/                  # 348 .fd test files (302 bootstrap + 46 selfhost) + harness
-├── examples/               # 10 example programs
-├── release/                # Self-hosted compiler binaries + generated C (gitignored)
-│   └── fid.exe             # Self-hosted compiler (RELEASE=1 scripts/bootstrap.sh: 3 stages,
-│                           #   fixpoint; scripts/build-selfhost.sh: 1 stage)
-└── docs/                   # Documentation (reference, guides, meta, roadmap, selfhost)
-```
-
----
-
-## Test Programs
-
-348 test files across `tests/bootstrap/` and `tests/selfhost/`. Key tests:
-
-| Test File | What It Tests |
-|-----------|---------------|
-| `hello.fd` | Hello world — `fn`, `val`, `if/else`, `print` |
-| `arithmetic.fd` | Arithmetic, nested function calls |
-| `struct.fd` | Struct definition, literals, field access |
-| `control_flow.fd` | `if`/`else if`/`else`, `for` ranges, compound assignment |
-| `functions.fd` | User-defined functions, recursive factorial |
-| `strings.fd` | String literals, f-string interpolation |
-| `test_float.fd` | Float arithmetic and printing |
-| `test_fstring_*.fd` | F-string with int, float, vec |
-| `test_vec_*.fd` | Vec creation, push, loop, printing |
-| `test_hashmap.fd` | HashMap insert, get, contains |
-| `test_match.fd` | Pattern matching (int, string, enum, wildcard) |
-| `test_match_guard.fd` | Match guards (`pattern if cond =>`) |
-| `test_match_range.fd` | Match range patterns (`1..=5 =>`) |
-| `test_option.fd` | Option type (Some/None, unwrap) |
-| `test_try.fd` | `?` operator and `try { }` blocks |
-| `test_defer.fd` | `defer` blocks (LIFO cleanup order) |
-| `test_closure.fd` | Closures with environment capture |
-| `test_impl.fd` | `impl` blocks, struct methods |
-| `test_generics.fd` | Generic functions, monomorphization |
-| `test_traits.fd` | `cap` traits, `impl Cap for Type` |
-| `test_trait_assoc.fd` | Trait associated types |
-| `test_trait_default.fd` | Trait default methods |
-| `test_trait_object.fd` | Trait objects (`dyn Trait`) |
-| `test_type_alias.fd` | Type aliases (`type X = T`) |
-| `test_asm.fd` | Inline assembly (`asm!`) |
-| `test_bare.fd` | Bare-metal mode (no stdlib, `asm!("hlt")`) |
-| `test_capabilities.fd` | Capability grants, denial, transitive |
-| `tests/bootstrap/capability/test_cap_*.fd` | Capability security: grant/deny/propagation (Phase 2C) |
-| `tests/bootstrap/safety/test_*.fd` | Bounds safety: OOB, overflow, div-by-zero, unwrap None (Phase 2D) |
-| `tests/bootstrap/effects/test_effect_*.fd` | Effect system: annotations, inference, checking, handlers (Phase 2B) |
-| `tests/bootstrap/regions/test_region_*.fd` | Region inference: region blocks, escape detection, safety (Phase 2A) |
-| `test_refs_mut.fd` | `&mut` references, dereference |
-| `test_pe_*.fd` | PE emitter specific tests (struct, enum, refs, generics, defer, try) |
-| `test_regression_*.fd` | Regression tests (closures, fstrings, collections) |
-| `test_money_*.fd` | Money stdlib: fixed-point arithmetic, linear type enforcement (`test_money_linear_fail`) |
-| `test_money_conserve*.fd` | `@conserve` conservation proof (`test_money_conserve_fail`) |
-| `test_banking_*.fd` | Banking stdlib: accounts, transfers, double-credit/lost-money detection |
-| `test_loop_linear*.fd` | Loop-aware linear types (`test_loop_linear_fail`) |
-| `test_gas*.fd` | `@gas` compile-time gas budgets (`test_gas_fail`) |
-| `test_crashfree*.fd` | `@crashfree` compile-time panic prevention (`test_crashfree_fail`) |
-| `test_tuple_destructure.fd` | Tuple destructuring (`val (a, b) = expr`) |
-| `test_file.fd` | File I/O (`stdlib/file.fd`) |
-| `test_txn.fd` | `txn {}` atomic transaction blocks |
-| `test_time*.fd` | LogicalTime stdlib: construction, extraction, arithmetic, formatting, leap years |
-| `test_typed_strings*.fd` | F67: SQLString, ShellString, HTMLString, JSONString, PathString — escape, bind, is_safe |
-| `test_init_guarantee*.fd` | F63: `var` keyword (without initializer), definite assignment analysis, init guarantee |
-| `test_rc_arc.fd` | Rc/Arc smart pointers (new, clone, drop, get, count) |
-| `test_recursive_box.fd` | Recursive types via `Box<T>` (enum Expr with Box children) |
-| `test_enum_payload_types.fd` | Typed enum payloads (variant types preserved in match) |
-| `test_generic_vec_typed.fd` | Generic Vec<T> with typed elements |
-| `test_vec_math.fd` | Vec2/3/4 + mat4 + quat math types |
-| `test_constant_time*.fd` | `@constant_time` security annotation (pass + fail tests) |
-
-Run all tests: `./target/release/fidesc test` (or `cargo test --test harness`)
-
----
-
-## Design Documents
-
-- `docs/reference/syntax.md` — Complete Fides syntax specification (current `fn`/`val`/`const` syntax + proposed `fn`/`val`/`var` migration)
-- `docs/reference/architecture.md` — Compiler architecture, pipeline stages, and internal design
-- `docs/roadmap/roadmap.md` — Full 8-phase roadmap (currently at Phase 8 in progress)
-- `docs/roadmap/roadmap.md` § Limitations — Verified gap analysis (claimed vs actual)
-- `docs/reference/vision.md` — Language vision and 8 pillars (Originality, Security, Performance, etc.)
-- `docs/reference/vision.md` — Vision, design principles, decisions, future direction
-- `docs/reference/changelog.md` — Version history and detailed change log
-- `docs/reference/features.md` — Feature list and status
-- `docs/reference/positioning.md` — Competitive analysis (vs Rust/Zig/Go/Swift) + adoption strategy
-- `docs/reference/lessons.md` — PL history lessons + IBM AIX/z/OS lessons
-- `docs/reference/architecture.md` — Custom toolchain rationale (§0) + full pipeline reference
-- `docs/reference/vision.md` § Future — Innovation (AI/robotics) + community goals
-- `docs/reference/best-practices.md` — Best practices guide
-- `docs/reference/borrowchecker.md` — Borrow checker documentation
-- `docs/roadmap/roadmap.md` § Opportunities — AI/ML + industry opportunities
-- `docs/reference/testing.md` — Test results across all backends + test batch specifications
-- `docs/reference/tool.md` — Tooling guide
-
-### Learn & contribute
-
-- `docs/book/` — The Fides Book (draft): first program → writing a service
-- `docs/cookbook.md` — Common-task recipes (files, JSON, HTTP, tasks)
-- `docs/guides/` — Coming from Rust / Go / Zig / C
-- `docs/compiler-internals.md` — Pipeline map for compiler contributors
-- `SUPPORT.md` — Questions (Discussions), bugs (Issues), contributing
-
----
-
-## Roadmap
-
-See `docs/roadmap/roadmap.md` for the full phase status and milestones.
-See `docs/roadmap/roadmap.md` § Self-Host Details for the self-hosting plan.
-
-**Self-hosting status:** Bootstrap fixpoint verified (stage 2 == stage 3 byte-for-byte, checked on every release build; last verified Nov 6, 2026). 68 self-hosted modules (~159K lines) in `compiler/*.fd`. The self-hosted compiler is the release compiler (`fid.exe`) and defines the language; the Rust compiler (`fidesc.exe`) is frozen.
+Questions go to [Discussions](https://github.com/pledgeandgrow/fid/discussions), bugs to [issues](https://github.com/pledgeandgrow/fid/issues), and security problems privately through [SECURITY.md](SECURITY.md). Miscompile reports get priority.
+
+## Questions people ask
+
+<details>
+<summary><b>How is Fid different from Rust?</b></summary>
+
+No lifetime annotations: references cannot be stored or returned from a local. Assignment copies instead of moving. No macros; `comptime` instead. Capability grants and effect annotations are built in. Fid is younger, has no package registry, and its generated code is slower. [Full comparison](docs/guides/from-rust.md).
+
+</details>
+
+<details>
+<summary><b>How is Fid different from Zig?</b></summary>
+
+Both have `comptime` and their own backends. Zig leaves memory safety to the engineer; Fid checks borrows and reference escapes at compile time and keeps bounds and overflow checks in every build. [Full comparison](docs/guides/from-zig.md).
+
+</details>
+
+<details>
+<summary><b>Why build a toolchain without LLVM?</b></summary>
+
+Control. The IR carries Fid's own semantics (regions, effects, capabilities), and there is no external toolchain to pin. The cost is optimizer maturity: generated code is slower than LLVM's today.
+
+</details>
+
+<details>
+<summary><b>Is it production-ready?</b></summary>
+
+Not yet for most teams. Pilot it on a bounded tool and read [the status page](docs/reference/status.md) first.
+
+</details>
+
+<details>
+<summary><b>What do the names mean?</b></summary>
+
+<b>Fid</b> is the language. <b>Fides</b>, the Latin word for trust, is its compiler. <code>fid</code> is the command you type.
+
+</details>
+
+## Community and licence
+
+[Website](https://fid-lang.org) · [Discussions](https://github.com/pledgeandgrow/fid/discussions) · [Changelog](docs/reference/changelog.md) · [Code of conduct](CODE_OF_CONDUCT.md) · [Support](SUPPORT.md)
+
+Fid is maintained by Mehdi Berel at [Pledge & Grow](https://github.com/pledgeandgrow) and released under the [MIT licence](LICENSE).
+
+<p align="center">
+  <sub>If Fid is useful to you, a star helps other people find it.</sub>
+</p>
