@@ -8,7 +8,10 @@
 
 ; ─── Version ─────────────────────────────────────────────────────────────
 
-!define VERSION "0.8.0"
+; build-installer.sh passes -DVERSION=<version>; this is the default
+!ifndef VERSION
+  !define VERSION "0.8.0"
+!endif
 !define PRODUCT_NAME "Fides"
 !define PRODUCT_PUBLISHER "Pledge & Grow"
 !define PRODUCT_URL "https://github.com/pledgeandgrow/fid"

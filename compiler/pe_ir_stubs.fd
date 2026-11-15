@@ -527,6 +527,426 @@ pub var g_pe_elf: bool = false;
 /// function it takes `__env` (null here) before the message.
 pub var g_pe_bare_panic_handler: str = "";
 
+// ---------------------------------------------------------------------------
+// The bootable bare image (release G1). With PEIR_BARE_BOOT a `--bare` (and
+// `--boot`) build is a kernel QEMU's `-kernel` and GRUB load directly:
+//
+//   load+0x0000  jmp load+0x1000          (entry of a 64-bit loader such as
+//                                          scripts/bare-run.c)
+//   load+0x0008  Multiboot 1 header        (QEMU -kernel, GRUB `multiboot`)
+//   load+0x0028  Multiboot 2 header        (GRUB `multiboot2`)
+//   load+0x0080  32-bit entry: page tables, PAE, long mode, the GDT below
+//   load+0x0300  64-bit trampoline: segments, TSS, stack, to boot_entry64
+//   load+0x0400  GDT: null, 0x08 kernel code, 0x10 kernel data, 0x18 user
+//                code, 0x20 user data (DPL 3), 0x28 TSS (16 bytes)
+//   load+0x1000  the flat binary as before: [code][int3 to 4 KB][data]
+//
+// The machine the program then runs on (the bare ABI, which kernels such as
+// fides-os build on):
+//   0x0500  IDT descriptor (lidt'd), 0x0510 error code of the last exception
+//           an interrupt function took, 0x0520 the boot loader's magic
+//           (0x2BADB002 Multiboot 1, 0x36D76289 Multiboot 2), 0x0528 its
+//           boot information pointer
+//   0x1000  IDT, 256 gates: every vector has a default handler (an exception
+//           panics with its vector, error code, rip and, for #PF, the
+//           address; IRQs 0x20-0x2F are acknowledged), `@interrupt(N)`
+//           functions are wired to their vector
+//   0x4000  TSS (rsp0 = 0x90000), loaded
+//   0x70000 PML4, 0x71000 PDPT, 0x76000-0x79FFF four PDs: the first 4 GB
+//           identity-mapped with 2 MB pages; 0x72000-0x75FFF user tables
+//           mapping 0x10000 and 0xB8000 (p_enter_user_mode switches to them)
+//   0x90000 top of the stack main runs on
+//   PIC     remapped to 0x20/0x28, IRQ0 (timer) and IRQ1 (keyboard) unmasked,
+//           interrupts on (so `hlt` returns at the next timer tick, ~55 ms;
+//           p_cli() first to set up tables of one's own)
+//   SSE     on (CR4.OSFXSR/OSXMMEXCPT), x87 initialised
+// The end of main writes its result to port 0xF4 and a panic writes 1: under
+// QEMU with `-device isa-debug-exit` that ends QEMU with status 2*code+1.
+// Elsewhere the CPU halts, as before.
+// ---------------------------------------------------------------------------
+
+/// Off: `--bare` writes the old flat binary at 0x10000 (no headers, no long
+/// mode switch, no IDT, no debug exit), `--boot` the old pe.fd kernel.
+pub const PEIR_BARE_BOOT: bool = true;
+/// Bytes in front of the flat binary of a bootable image
+pub const PEIR_BOOT_PREFIX: i64 = 0x1000;
+/// Where a bootable image is loaded (`--load <address>` changes it)
+pub var g_pe_bare_boot_load: i64 = 0x100000;
+/// (vector, function label) of each `@interrupt(N)` function (set by
+/// PeirGen_generate before the entry point is generated)
+pub var g_pe_bare_irqs: Vec<i64> = Vec::new();
+/// main returns nothing: the exit code is 0
+pub var g_pe_bare_main_void: bool = false;
+/// Label of boot_entry64 (the trampoline's target) and of the 256 default
+/// vector stubs and the debug exit (al = code)
+pub var g_pe_bare_boot_label: i64 = -1;
+pub var g_pe_bare_vec_stubs: i64 = -1;
+pub var g_pe_bare_exit: i64 = -1;
+
+/// The boot image is being built (a bare build, not --elf)
+pub fn pe_bare_boot_on() -> bool {
+    return PEIR_BARE_BOOT && !g_pe_elf;
+}
+
+/// Vectors for which the CPU pushes an error code (pe_ir.fd's list)
+fn pe_bare_vec_has_err(v: i64) -> bool {
+    return v == 0x08 || v == 0x0A || v == 0x0B || v == 0x0C
+        || v == 0x0D || v == 0x0E || v == 0x11 || v == 0x1E;
+}
+
+fn pe_b32(e: &mut PeirEnc, v: i64) -> void { PeirEnc_emit_u32(e, v); }
+
+/// mov dword [abs32], imm32 (32-bit code: C7 05 disp32 imm32)
+fn pe_b_store32(e: &mut PeirEnc, addr: i64, v: i64) -> void {
+    pe_emit2(e, 0xC7, 0x05);
+    pe_b32(e, addr);
+    pe_b32(e, v);
+}
+
+fn pe_b_pad(e: &mut PeirEnc, off: i64) -> void {
+    if e.code.len() > off {
+        p_eprint_str("internal error: bare boot prefix: a part does not fit before its offset\n");
+    }
+    while e.code.len() < off { e.code.push(0); }
+}
+
+/// The PEIR_BOOT_PREFIX bytes in front of the flat binary (see above).
+/// `boot64` is the absolute address of boot_entry64 in the flat code.
+pub fn pe_bare_boot_prefix(load: i64, boot64: i64) -> Vec {
+    var e: PeirEnc = PeirEnc_new();
+    var entry32: i64 = load + 0x80;
+    var entry64: i64 = load + 0x300;
+    var gdt: i64 = load + 0x400;
+    var gdt_desc: i64 = load + 0x440;
+    // 0x00: jmp rel32 to load+0x1000 (the same bytes in 32- and 64-bit mode)
+    pe_emit1(&mut e, 0xE9);
+    pe_b32(&mut e, PEIR_BOOT_PREFIX - 5);
+    pe_b_pad(&mut e, 0x08);
+    // 0x08: Multiboot 1 header, a.out kludge (flags: page-align, memory
+    // info, the address fields below are valid)
+    var mb1_flags: i64 = 0x00010003;
+    pe_b32(&mut e, 0x1BADB002);
+    pe_b32(&mut e, mb1_flags);
+    pe_b32(&mut e, (0 - (0x1BADB002 + mb1_flags)) & 0xFFFFFFFF);
+    pe_b32(&mut e, load + 0x08);   // header_addr
+    pe_b32(&mut e, load);          // load_addr
+    pe_b32(&mut e, 0);             // load_end_addr: the whole file
+    pe_b32(&mut e, 0);             // bss_end_addr: none
+    pe_b32(&mut e, entry32);       // entry_addr
+    pe_b_pad(&mut e, 0x28);
+    // 0x28: Multiboot 2 header: address tag, entry address tag, end tag
+    pe_b32(&mut e, 0xE85250D6);
+    pe_b32(&mut e, 0);             // architecture: i386 protected mode
+    pe_b32(&mut e, 64);            // header_length
+    pe_b32(&mut e, (0 - (0xE85250D6 + 0 + 64)) & 0xFFFFFFFF);
+    PeirEnc_emit_u16(&mut e, 2); PeirEnc_emit_u16(&mut e, 0); pe_b32(&mut e, 24);
+    pe_b32(&mut e, load + 0x28);   // header_addr
+    pe_b32(&mut e, load);          // load_addr
+    pe_b32(&mut e, 0);             // load_end_addr: the whole file
+    pe_b32(&mut e, 0);             // bss_end_addr: none
+    PeirEnc_emit_u16(&mut e, 3); PeirEnc_emit_u16(&mut e, 0); pe_b32(&mut e, 12);
+    pe_b32(&mut e, entry32);
+    pe_b32(&mut e, 0);             // tags are 8-byte aligned
+    PeirEnc_emit_u16(&mut e, 0); PeirEnc_emit_u16(&mut e, 0); pe_b32(&mut e, 8);
+    pe_b_pad(&mut e, 0x80);
+
+    // 0x80: 32-bit protected mode, paging off (eax = magic, ebx = info)
+    pe_emit1(&mut e, 0xFA);                              // cli
+    pe_emit1(&mut e, 0xFC);                              // cld
+    pe_emit1(&mut e, 0xA3); pe_b32(&mut e, 0x520);       // mov [0x520], eax
+    pe_emit2(&mut e, 0x89, 0x1D); pe_b32(&mut e, 0x528); // mov [0x528], ebx
+    pe_b_store32(&mut e, 0x524, 0);
+    pe_b_store32(&mut e, 0x52C, 0);
+    pe_emit1(&mut e, 0xBC); pe_b32(&mut e, 0x90000);     // mov esp, 0x90000
+    // zero 0x70000-0x79FFF (the page tables)
+    pe_emit1(&mut e, 0xBF); pe_b32(&mut e, 0x70000);     // mov edi, 0x70000
+    pe_emit1(&mut e, 0xB9); pe_b32(&mut e, 0x2800);      // mov ecx, 0x2800
+    pe_emit2(&mut e, 0x31, 0xC0);                        // xor eax, eax
+    pe_emit2(&mut e, 0xF3, 0xAB);                        // rep stosd
+    // PML4[0] -> PDPT, PDPT[0..3] -> the four PDs
+    pe_b_store32(&mut e, 0x70000, 0x71003);
+    pe_b_store32(&mut e, 0x71000, 0x76003);
+    pe_b_store32(&mut e, 0x71008, 0x77003);
+    pe_b_store32(&mut e, 0x71010, 0x78003);
+    pe_b_store32(&mut e, 0x71018, 0x79003);
+    // 2048 PD entries: 2 MB pages, present | writable | PS
+    pe_emit1(&mut e, 0xBF); pe_b32(&mut e, 0x76000);     // mov edi, 0x76000
+    pe_emit1(&mut e, 0xB8); pe_b32(&mut e, 0x83);        // mov eax, 0x83
+    pe_emit1(&mut e, 0xB9); pe_b32(&mut e, 2048);        // mov ecx, 2048
+    pe_emit2(&mut e, 0x89, 0x07);                        // .l: mov [edi], eax
+    pe_emit1(&mut e, 0x05); pe_b32(&mut e, 0x200000);    // add eax, 0x200000
+    pe_emit3(&mut e, 0x83, 0xC7, 0x08);                  // add edi, 8
+    pe_emit2(&mut e, 0xE2, 0xF4);                        // loop .l
+    // user tables: PML4 0x72000 -> PDPT 0x73000 -> PD 0x74000 -> PT 0x75000
+    // (user | writable | present): 0x10000 and the VGA text page
+    pe_b_store32(&mut e, 0x72000, 0x73007);
+    pe_b_store32(&mut e, 0x73000, 0x74007);
+    pe_b_store32(&mut e, 0x74000, 0x75007);
+    pe_b_store32(&mut e, 0x75080, 0x10007);
+    pe_b_store32(&mut e, 0x755C0, 0xB8007);
+    // TSS at 0x4000: zero 104 bytes, rsp0 = 0x90000, no I/O bitmap
+    pe_emit1(&mut e, 0xBF); pe_b32(&mut e, 0x4000);      // mov edi, 0x4000
+    pe_emit1(&mut e, 0xB9); pe_b32(&mut e, 26);          // mov ecx, 26
+    pe_emit2(&mut e, 0xF3, 0xAB);                        // rep stosd (eax = 0)
+    pe_b_store32(&mut e, 0x4004, 0x90000);
+    pe_emit3(&mut e, 0x66, 0xC7, 0x05); pe_b32(&mut e, 0x4066); PeirEnc_emit_u16(&mut e, 0x68);
+    // CR4: PAE | OSFXSR | OSXMMEXCPT
+    pe_emit3(&mut e, 0x0F, 0x20, 0xE0);                  // mov eax, cr4
+    pe_emit1(&mut e, 0x0D); pe_b32(&mut e, 0x620);       // or eax, 0x620
+    pe_emit3(&mut e, 0x0F, 0x22, 0xE0);                  // mov cr4, eax
+    pe_emit1(&mut e, 0xB8); pe_b32(&mut e, 0x70000);     // mov eax, 0x70000
+    pe_emit3(&mut e, 0x0F, 0x22, 0xD8);                  // mov cr3, eax
+    // EFER.LME
+    pe_emit1(&mut e, 0xB9); pe_b32(&mut e, 0xC0000080);  // mov ecx, IA32_EFER
+    pe_emit2(&mut e, 0x0F, 0x32);                        // rdmsr
+    pe_emit1(&mut e, 0x0D); pe_b32(&mut e, 0x100);       // or eax, LME
+    pe_emit2(&mut e, 0x0F, 0x30);                        // wrmsr
+    // CR0: paging, protection, MP; EM off (SSE)
+    pe_emit3(&mut e, 0x0F, 0x20, 0xC0);                  // mov eax, cr0
+    pe_emit1(&mut e, 0x25); pe_b32(&mut e, 0xFFFFFFFB);  // and eax, ~EM
+    pe_emit1(&mut e, 0x0D); pe_b32(&mut e, 0x80000003);  // or eax, PG|MP|PE
+    pe_emit3(&mut e, 0x0F, 0x22, 0xC0);                  // mov cr0, eax
+    pe_emit3(&mut e, 0x0F, 0x01, 0x15); pe_b32(&mut e, gdt_desc); // lgdt [gdt_desc]
+    pe_emit1(&mut e, 0xEA); pe_b32(&mut e, entry64); PeirEnc_emit_u16(&mut e, 0x08); // jmp 0x08:entry64
+    pe_b_pad(&mut e, 0x300);
+
+    // 0x300: 64-bit mode
+    pe_emit4(&mut e, 0x66, 0xB8, 0x10, 0x00);            // mov ax, 0x10
+    pe_emit2(&mut e, 0x8E, 0xD8);                        // mov ds, ax
+    pe_emit2(&mut e, 0x8E, 0xC0);                        // mov es, ax
+    pe_emit2(&mut e, 0x8E, 0xD0);                        // mov ss, ax
+    pe_emit2(&mut e, 0x31, 0xC0);                        // xor eax, eax
+    pe_emit2(&mut e, 0x8E, 0xE0);                        // mov fs, ax
+    pe_emit2(&mut e, 0x8E, 0xE8);                        // mov gs, ax
+    pe_emit4(&mut e, 0x66, 0xB8, 0x28, 0x00);            // mov ax, 0x28
+    pe_emit3(&mut e, 0x0F, 0x00, 0xD8);                  // ltr ax
+    pe_emit3(&mut e, 0x48, 0xC7, 0xC4); pe_b32(&mut e, 0x90000); // mov rsp, 0x90000
+    pe_emit2(&mut e, 0xDB, 0xE3);                        // fninit
+    pe_emit2(&mut e, 0x48, 0xB8); PeirEnc_emit_u64(&mut e, boot64); // mov rax, boot64
+    pe_emit2(&mut e, 0xFF, 0xE0);                        // jmp rax
+    pe_b_pad(&mut e, 0x400);
+
+    // 0x400: GDT
+    PeirEnc_emit_u64(&mut e, 0);
+    PeirEnc_emit_u64(&mut e, 0x00AF9A000000FFFF);        // 0x08 kernel code, 64-bit
+    PeirEnc_emit_u64(&mut e, 0x00CF92000000FFFF);        // 0x10 kernel data
+    PeirEnc_emit_u64(&mut e, 0x00AFFA000000FFFF);        // 0x18 user code, 64-bit
+    PeirEnc_emit_u64(&mut e, 0x00CFF2000000FFFF);        // 0x20 user data
+    // 0x28: TSS (available 64-bit TSS, base 0x4000, limit 0x67)
+    PeirEnc_emit_u16(&mut e, 0x67); PeirEnc_emit_u16(&mut e, 0x4000);
+    pe_emit4(&mut e, 0x00, 0x89, 0x00, 0x00);
+    PeirEnc_emit_u64(&mut e, 0);
+    pe_b_pad(&mut e, 0x440);
+    PeirEnc_emit_u16(&mut e, 0x37);                      // limit: 7 entries
+    PeirEnc_emit_u64(&mut e, gdt);
+    pe_b_pad(&mut e, PEIR_BOOT_PREFIX);
+    return e.code;
+}
+
+/// Write an interrupt gate at [rdi] for the handler address in rax
+/// (selector 0x08, IST 0, present 64-bit interrupt gate). Uses rdx.
+fn PeirGen_bare_gate(self: &mut PeirGen) -> void {
+    pe_emit3(&mut self.enc, 0x48, 0x89, 0xC2);                    // mov rdx, rax
+    pe_emit3(&mut self.enc, 0x66, 0x89, 0x17);                    // mov [rdi], dx
+    pe_emit6(&mut self.enc, 0x66, 0xC7, 0x47, 0x02, 0x08, 0x00);  // mov word [rdi+2], 0x08
+    pe_emit6(&mut self.enc, 0x66, 0xC7, 0x47, 0x04, 0x00, 0x8E);  // mov word [rdi+4], 0x8E00
+    pe_emit4(&mut self.enc, 0x48, 0xC1, 0xEA, 0x10);              // shr rdx, 16
+    pe_emit4(&mut self.enc, 0x66, 0x89, 0x57, 0x06);              // mov [rdi+6], dx
+    pe_emit4(&mut self.enc, 0x48, 0xC1, 0xEA, 0x10);              // shr rdx, 16
+    pe_emit3(&mut self.enc, 0x89, 0x57, 0x08);                    // mov [rdi+8], edx
+    pe_emit7(&mut self.enc, 0xC7, 0x47, 0x0C, 0x00, 0x00, 0x00, 0x00); // mov dword [rdi+12], 0
+}
+
+/// boot_entry64: where the prefix's trampoline lands. Fills the IDT with
+/// the default stubs, wires the @interrupt(N) functions, loads it, remaps
+/// the PIC, turns interrupts on, then runs the ordinary bare entry (`start`).
+fn PeirGen_gen_bare_boot_entry(self: &mut PeirGen, start: i64) -> void {
+    g_pe_bare_boot_label = PeirEnc_alloc_label(&mut self.enc);
+    PeirEnc_align_to(&mut self.enc, 16);
+    PeirEnc_place_label(&mut self.enc, g_pe_bare_boot_label);
+    // the 256 default gates
+    PeirEnc_lea_label(&mut self.enc, PEIR_RAX, g_pe_bare_vec_stubs);
+    pe_emit5(&mut self.enc, 0xBF, 0x00, 0x10, 0x00, 0x00);        // mov edi, 0x1000
+    pe_emit5(&mut self.enc, 0xB9, 0x00, 0x01, 0x00, 0x00);        // mov ecx, 256
+    var fill: i64 = PeirEnc_alloc_label(&mut self.enc);
+    PeirEnc_place_label(&mut self.enc, fill);
+    PeirGen_bare_gate(self);
+    pe_emit4(&mut self.enc, 0x48, 0x83, 0xC0, 0x10);              // add rax, 16
+    pe_emit4(&mut self.enc, 0x48, 0x83, 0xC7, 0x10);              // add rdi, 16
+    pe_emit2(&mut self.enc, 0xFF, 0xC9);                          // dec ecx
+    PeirEnc_jcc_label(&mut self.enc, 0x5, fill);                  // jnz
+    // @interrupt(N) functions
+    var ii: i64 = 0;
+    while ii + 1 < g_pe_bare_irqs.len() {
+        var vnum: i64 = g_pe_bare_irqs.get(ii);
+        PeirEnc_lea_label(&mut self.enc, PEIR_RAX, g_pe_bare_irqs.get(ii + 1));
+        pe_emit1(&mut self.enc, 0xBF); PeirEnc_emit_u32(&mut self.enc, 0x1000 + vnum * 16); // mov edi, gate
+        PeirGen_bare_gate(self);
+        ii = ii + 2;
+    }
+    // IDT descriptor at 0x500, lidt
+    pe_emit8(&mut self.enc, 0x66, 0xC7, 0x04, 0x25, 0x00, 0x05, 0x00, 0x00);
+    PeirEnc_emit_u16(&mut self.enc, 0x0FFF);                      // mov word [0x500], 0xFFF
+    pe_emit7(&mut self.enc, 0xC7, 0x04, 0x25, 0x02, 0x05, 0x00, 0x00);
+    PeirEnc_emit_u32(&mut self.enc, 0x1000);                      // mov dword [0x502], 0x1000
+    pe_emit7(&mut self.enc, 0xC7, 0x04, 0x25, 0x06, 0x05, 0x00, 0x00);
+    PeirEnc_emit_u32(&mut self.enc, 0);                           // mov dword [0x506], 0
+    pe_emit8(&mut self.enc, 0x0F, 0x01, 0x1C, 0x25, 0x00, 0x05, 0x00, 0x00); // lidt [0x500]
+    // PIC: ICW1-ICW4, master at 0x20, slave at 0x28; unmask IRQ0, IRQ1
+    var pic: Vec<i64> = Vec::new();
+    pic.push(0x20); pic.push(0x11); pic.push(0xA0); pic.push(0x11);
+    pic.push(0x21); pic.push(0x20); pic.push(0xA1); pic.push(0x28);
+    pic.push(0x21); pic.push(0x04); pic.push(0xA1); pic.push(0x02);
+    pic.push(0x21); pic.push(0x01); pic.push(0xA1); pic.push(0x01);
+    pic.push(0x21); pic.push(0xFC); pic.push(0xA1); pic.push(0xFF);
+    var pi: i64 = 0;
+    while pi + 1 < pic.len() {
+        pe_emit4(&mut self.enc, 0xB0, pic.get(pi + 1), 0xE6, pic.get(pi)); // mov al, v; out port, al
+        pi = pi + 2;
+    }
+    pe_emit1(&mut self.enc, 0xFB);                                // sti
+    PeirEnc_jmp_label(&mut self.enc, start);
+}
+
+/// The boot image's runtime pieces: the debug exit, a hex printer, the 256
+/// default vector stubs and the handler they share.
+fn PeirGen_gen_bare_boot_runtime(self: &mut PeirGen, putc: i64, pstr: i64) -> void {
+    // exit(al): QEMU's isa-debug-exit at 0xF4, else halt
+    g_pe_bare_exit = PeirEnc_alloc_label(&mut self.enc);
+    var ehalt: i64 = PeirEnc_alloc_label(&mut self.enc);
+    PeirEnc_align_to(&mut self.enc, 16);
+    PeirEnc_place_label(&mut self.enc, g_pe_bare_exit);
+    pe_emit5(&mut self.enc, 0xBA, 0xF4, 0x00, 0x00, 0x00);        // mov edx, 0xF4
+    pe_emit1(&mut self.enc, 0xEE);                                // out dx, al
+    PeirEnc_place_label(&mut self.enc, ehalt);
+    pe_emit2(&mut self.enc, 0xFA, 0xF4);                          // cli; hlt
+    PeirEnc_jmp_label(&mut self.enc, ehalt);
+
+    // hex(rcx): "0x" and the digits, no leading zeros (uses rax, rdx, r9-r11)
+    var hex: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var h_loop: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var h_emit: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var h_dec: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var h_next: i64 = PeirEnc_alloc_label(&mut self.enc);
+    PeirEnc_align_to(&mut self.enc, 16);
+    PeirEnc_place_label(&mut self.enc, hex);
+    pe_emit3(&mut self.enc, 0x49, 0x89, 0xC9);                    // mov r9, rcx
+    pe_emit5(&mut self.enc, 0xB9, 0x30, 0x00, 0x00, 0x00);        // mov ecx, '0'
+    PeirEnc_call_label(&mut self.enc, putc);
+    pe_emit5(&mut self.enc, 0xB9, 0x78, 0x00, 0x00, 0x00);        // mov ecx, 'x'
+    PeirEnc_call_label(&mut self.enc, putc);
+    pe_emit6(&mut self.enc, 0x41, 0xBB, 0x3C, 0x00, 0x00, 0x00);  // mov r11d, 60
+    pe_emit3(&mut self.enc, 0x45, 0x31, 0xD2);                    // xor r10d, r10d
+    PeirEnc_place_label(&mut self.enc, h_loop);
+    pe_emit3(&mut self.enc, 0x4C, 0x89, 0xC8);                    // mov rax, r9
+    pe_emit3(&mut self.enc, 0x44, 0x89, 0xD9);                    // mov ecx, r11d
+    pe_emit3(&mut self.enc, 0x48, 0xD3, 0xE8);                    // shr rax, cl
+    pe_emit3(&mut self.enc, 0x83, 0xE0, 0x0F);                    // and eax, 15
+    pe_emit2(&mut self.enc, 0x85, 0xC0);                          // test eax, eax
+    PeirEnc_jcc_label(&mut self.enc, 0x5, h_emit);                // jnz
+    pe_emit3(&mut self.enc, 0x45, 0x85, 0xD2);                    // test r10d, r10d
+    PeirEnc_jcc_label(&mut self.enc, 0x5, h_emit);                // jnz
+    pe_emit3(&mut self.enc, 0x45, 0x85, 0xDB);                    // test r11d, r11d
+    PeirEnc_jcc_label(&mut self.enc, 0x4, h_emit);                // jz: the last digit
+    PeirEnc_jmp_label(&mut self.enc, h_next);
+    PeirEnc_place_label(&mut self.enc, h_emit);
+    pe_emit6(&mut self.enc, 0x41, 0xBA, 0x01, 0x00, 0x00, 0x00);  // mov r10d, 1
+    pe_emit3(&mut self.enc, 0x83, 0xF8, 0x0A);                    // cmp eax, 10
+    PeirEnc_jcc_label(&mut self.enc, 0x2, h_dec);                 // jb
+    pe_emit3(&mut self.enc, 0x83, 0xC0, 0x27);                    // add eax, 'a' - '0' - 10
+    PeirEnc_place_label(&mut self.enc, h_dec);
+    pe_emit3(&mut self.enc, 0x83, 0xC0, 0x30);                    // add eax, '0'
+    pe_emit2(&mut self.enc, 0x89, 0xC1);                          // mov ecx, eax
+    PeirEnc_call_label(&mut self.enc, putc);
+    PeirEnc_place_label(&mut self.enc, h_next);
+    pe_emit4(&mut self.enc, 0x41, 0x83, 0xEB, 0x04);              // sub r11d, 4
+    PeirEnc_jcc_label(&mut self.enc, 0x9, h_loop);                // jns
+    PeirEnc_ret(&mut self.enc);
+
+    // 256 stubs of 16 bytes: [push 0 unless the CPU pushed an error code]
+    // push vector; jmp common
+    var common: i64 = PeirEnc_alloc_label(&mut self.enc);
+    g_pe_bare_vec_stubs = PeirEnc_alloc_label(&mut self.enc);
+    PeirEnc_align_to(&mut self.enc, 16);
+    PeirEnc_place_label(&mut self.enc, g_pe_bare_vec_stubs);
+    var v: i64 = 0;
+    while v < 256 {
+        var at: i64 = self.enc.code.len();
+        if pe_bare_vec_has_err(v) {
+            pe_emit2(&mut self.enc, 0x66, 0x90);                  // (the CPU's error code)
+        } else {
+            pe_emit2(&mut self.enc, 0x6A, 0x00);                  // push 0
+        }
+        pe_emit1(&mut self.enc, 0x68); PeirEnc_emit_u32(&mut self.enc, v); // push v
+        PeirEnc_jmp_label(&mut self.enc, common);
+        while self.enc.code.len() < at + 16 { pe_emit1(&mut self.enc, 0xCC); }
+        v = v + 1;
+    }
+
+    // common: [rsp] vector, [rsp+8] error code, [rsp+16] rip
+    var irq: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var irq_master: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var irq_done: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var nl: i64 = PeirEnc_alloc_label(&mut self.enc);
+    PeirEnc_align_to(&mut self.enc, 16);
+    PeirEnc_place_label(&mut self.enc, common);
+    pe_emit5(&mut self.enc, 0x48, 0x83, 0x3C, 0x24, 0x20);        // cmp qword [rsp], 32
+    PeirEnc_jcc_label(&mut self.enc, 0x3, irq);                   // jae
+    // a CPU exception: a panic
+    pe_emit4(&mut self.enc, 0x4C, 0x8B, 0x24, 0x24);              // mov r12, [rsp]
+    pe_emit5(&mut self.enc, 0x4C, 0x8B, 0x6C, 0x24, 0x08);        // mov r13, [rsp+8]
+    pe_emit5(&mut self.enc, 0x4C, 0x8B, 0x74, 0x24, 0x10);        // mov r14, [rsp+16]
+    pe_emit4(&mut self.enc, 0x41, 0x0F, 0x20, 0xD7);              // mov r15, cr2
+    pe_emit4(&mut self.enc, 0x48, 0x83, 0xE4, 0xF0);              // and rsp, -16
+    PeirEnc_sub_rsp_i32(&mut self.enc, 32);
+    if g_pe_bare_panic_handler != "" && HashMap_contains(self.func_labels, g_pe_bare_panic_handler) {
+        PeirEnc_lea_rip(&mut self.enc, PEIR_RDX, PeirGen_str_off(self, "CPU exception"));
+        PeirEnc_xor_rr(&mut self.enc, PEIR_RCX, PEIR_RCX);
+        PeirEnc_call_label(&mut self.enc, HashMap_get(self.func_labels, g_pe_bare_panic_handler));
+    } else {
+        PeirEnc_lea_rip(&mut self.enc, PEIR_RCX, PeirGen_str_off(self, "panic: CPU exception "));
+        PeirEnc_call_label(&mut self.enc, pstr);
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_R12);
+        PeirEnc_call_label(&mut self.enc, HashMap_get(self.func_labels, "p_print_int"));
+        PeirEnc_lea_rip(&mut self.enc, PEIR_RCX, PeirGen_str_off(self, ", error "));
+        PeirEnc_call_label(&mut self.enc, pstr);
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_R13);
+        PeirEnc_call_label(&mut self.enc, hex);
+        PeirEnc_lea_rip(&mut self.enc, PEIR_RCX, PeirGen_str_off(self, ", rip "));
+        PeirEnc_call_label(&mut self.enc, pstr);
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_R14);
+        PeirEnc_call_label(&mut self.enc, hex);
+        pe_emit4(&mut self.enc, 0x49, 0x83, 0xFC, 0x0E);          // cmp r12, 14 (#PF)
+        PeirEnc_jcc_label(&mut self.enc, 0x5, nl);                // jne
+        PeirEnc_lea_rip(&mut self.enc, PEIR_RCX, PeirGen_str_off(self, ", address "));
+        PeirEnc_call_label(&mut self.enc, pstr);
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_R15);
+        PeirEnc_call_label(&mut self.enc, hex);
+        PeirEnc_place_label(&mut self.enc, nl);
+        pe_emit5(&mut self.enc, 0xB9, 0x0A, 0x00, 0x00, 0x00);    // mov ecx, 10
+        PeirEnc_call_label(&mut self.enc, putc);
+    }
+    pe_emit5(&mut self.enc, 0xB8, 0x01, 0x00, 0x00, 0x00);        // mov eax, 1
+    PeirEnc_jmp_label(&mut self.enc, g_pe_bare_exit);
+    // an interrupt nobody handles: acknowledge PIC IRQs, return
+    PeirEnc_place_label(&mut self.enc, irq);
+    pe_emit1(&mut self.enc, 0x50);                                // push rax
+    pe_emit2(&mut self.enc, 0xB0, 0x20);                          // mov al, 0x20 (EOI)
+    pe_emit5(&mut self.enc, 0x48, 0x83, 0x7C, 0x24, 0x08);
+    pe_emit1(&mut self.enc, 0x30);                                // cmp qword [rsp+8], 0x30
+    PeirEnc_jcc_label(&mut self.enc, 0x3, irq_done);              // jae: not a PIC IRQ
+    pe_emit5(&mut self.enc, 0x48, 0x83, 0x7C, 0x24, 0x08);
+    pe_emit1(&mut self.enc, 0x28);                                // cmp qword [rsp+8], 0x28
+    PeirEnc_jcc_label(&mut self.enc, 0x2, irq_master);            // jb
+    pe_emit2(&mut self.enc, 0xE6, 0xA0);                          // out 0xA0, al
+    PeirEnc_place_label(&mut self.enc, irq_master);
+    pe_emit2(&mut self.enc, 0xE6, 0x20);                          // out 0x20, al
+    PeirEnc_place_label(&mut self.enc, irq_done);
+    pe_emit1(&mut self.enc, 0x58);                                // pop rax
+    pe_emit4(&mut self.enc, 0x48, 0x83, 0xC4, 0x10);              // add rsp, 16
+    pe_emit2(&mut self.enc, 0x48, 0xCF);                          // iretq
+}
+
 pub fn PeirGen_gen_bare_runtime(self: &mut PeirGen) -> void {
     PeirGen_gen_interrupt_stubs(self);
     PeirGen_gen_mmu_stubs(self);
@@ -711,6 +1131,12 @@ pub fn PeirGen_gen_bare_runtime(self: &mut PeirGen) -> void {
         PeirEnc_mov_imm32(&mut self.enc, PEIR_RDI, 1);
         pe_emit2(&mut self.enc, 0x0F, 0x05);              // syscall
     }
+    if pe_bare_boot_on() {
+        // exit code 1 to QEMU's isa-debug-exit (else the halt below)
+        pe_emit5(&mut self.enc, 0xB8, 0x01, 0x00, 0x00, 0x00); // mov eax, 1
+        pe_emit5(&mut self.enc, 0xBA, 0xF4, 0x00, 0x00, 0x00); // mov edx, 0xF4
+        pe_emit1(&mut self.enc, 0xEE);                         // out dx, al
+    }
     PeirEnc_place_label(&mut self.enc, halt);
     pe_emit2(&mut self.enc, 0xFA, 0xF4); // cli; hlt
     PeirEnc_jmp_label(&mut self.enc, halt);
@@ -719,6 +1145,10 @@ pub fn PeirGen_gen_bare_runtime(self: &mut PeirGen) -> void {
     PeirGen_place_fn(self, "p_argc");
     PeirEnc_xor_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
     PeirEnc_ret(&mut self.enc);
+
+    if pe_bare_boot_on() {
+        PeirGen_gen_bare_boot_runtime(self, putc, pstr);
+    }
 }
 
 /// Place each of `names` not placed yet at a trap: the runtime functions a
@@ -5750,6 +6180,8 @@ pub fn PeirGen_gen_entry_point(self: &mut PeirGen) -> void {
     if self.bare_mode {
         // Bare-metal entry: on whatever stack the loader set up, aligned
         // to 16 with the 32-byte shadow space main's calls expect
+        var bare_start: i64 = PeirEnc_alloc_label(&mut self.enc);
+        PeirEnc_place_label(&mut self.enc, bare_start);
         PeirEnc_xor_rr(&mut self.enc, PEIR_RBP, PEIR_RBP);
         pe_emit4(&mut self.enc, 0x48, 0x83, 0xE4, 0xF0); // and rsp, -16
         PeirEnc_sub_rsp_i32(&mut self.enc, 32);
@@ -5778,9 +6210,21 @@ pub fn PeirGen_gen_entry_point(self: &mut PeirGen) -> void {
             pe_emit2(&mut self.enc, 0x0F, 0x05);
         }
 
+        if pe_bare_boot_on() {
+            // main's result to QEMU's isa-debug-exit (0 for a void main)
+            if g_pe_bare_main_void { PeirEnc_xor_rr(&mut self.enc, PEIR_RAX, PEIR_RAX); }
+            pe_emit5(&mut self.enc, 0xBA, 0xF4, 0x00, 0x00, 0x00); // mov edx, 0xF4
+            pe_emit1(&mut self.enc, 0xEE);                         // out dx, al
+        }
+
         // Halt loop: hlt; jmp -3 (back to hlt: interrupt handlers still run)
         pe_emit1(&mut self.enc, 0xF4);       // hlt
         pe_emit2(&mut self.enc, 0xEB, 0xFD); // jmp -3
+
+        // A booted image enters here (from the prefix's trampoline)
+        if pe_bare_boot_on() {
+            PeirGen_gen_bare_boot_entry(self, bare_start);
+        }
     } else {
         // sub rsp, 40 (32 shadow space + 8 for alignment)
         PeirEnc_sub_rsp_i32(&mut self.enc, 40);

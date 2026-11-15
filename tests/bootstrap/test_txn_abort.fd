@@ -1,0 +1,71 @@
+// Test: `abort;` inside txn { } puts every local back as it was at the
+// start of the txn and leaves the block; reaching the end keeps the
+// changes. Same on every backend (the lowering snapshots the locals).
+//
+// Expected output:
+// 100 a [1, 2] 5 0
+// 150 ab [1, 2, 3] 6 0
+// 150 ab [1, 2, 3] 6 0
+// inner aborted: 160
+// loop aborted at 0: 160
+// committed after loop: 166
+struct P { x: i64, tags: Vec<str> }
+
+fn show(n: i64, s: str, v: Vec<i64>, p: P) {
+    println(int_to_str(n) + " " + s + " " + Vec_to_str(v) + " " + int_to_str(p.x) + " " + int_to_str(p.tags.len()));
+}
+
+fn main() -> i64 {
+    var n: i64 = 100;
+    var s: str = "a";
+    var v: Vec<i64> = Vec::new();
+    v.push(1);
+    v.push(2);
+    var p = P { x: 5, tags: Vec::new() };
+    show(n, s, v, p);
+    // commit
+    txn {
+        n = n + 50;
+        s = s + "b";
+        v.push(3);
+        p.x = 6;
+    }
+    show(n, s, v, p);
+    // abort: everything back
+    txn {
+        n = 0;
+        s = "changed";
+        v.push(4);
+        v.set(0, 99);
+        p.x = 7;
+        p.tags.push("t");
+        if n == 0 { abort; }
+        n = -1;
+    }
+    show(n, s, v, p);
+    // nested: the inner abort leaves only the inner block
+    txn {
+        n = n + 10;
+        txn {
+            n = n + 1000;
+            abort;
+        }
+    }
+    println("inner aborted: " + int_to_str(n));
+    // abort from inside a loop: i, changed in the txn, goes back to 0 too
+    var i: i64 = 0;
+    txn {
+        while i < 10 {
+            n = n + 1;
+            if i == 3 { abort; }
+            i = i + 1;
+        }
+    }
+    println("loop aborted at " + int_to_str(i) + ": " + int_to_str(n));
+    txn {
+        var k: i64 = 0;
+        while k < 6 { n = n + 1; k = k + 1; }
+    }
+    println("committed after loop: " + int_to_str(n));
+    return 0;
+}

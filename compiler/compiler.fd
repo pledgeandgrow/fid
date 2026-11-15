@@ -401,6 +401,15 @@ pub fn parse_error_position(full: str) -> StrTriple {
         }
     }
 
+    // Any other message that names its line ("Linear type error (line 3)",
+    // "Sandbox error ... at 4:2", an enriched " --> file:4:2"): the
+    // diagnostic was published at line 1 (0 in LSP) for all of them
+    var lc: I64Pair = extract_line_col(full);
+    if lc.first > 0 {
+        var col5: i64 = lc.second;
+        if col5 <= 0 { col5 = 1; }
+        return StrTriple_new(lc.first, col5, error);
+    }
     return StrTriple_new(1, 1, error);
 }
 
@@ -908,6 +917,16 @@ pub fn build_program_no_std_borrowck(source: str, source_path: OptStr, borrowck_
                 }
                 var bc: BorrowChecker = BorrowChecker_new(bc_mode);
                 check(&mut bc, program);
+                // Warn mode collects into bc.warnings (known-bugs 2g.9: nothing was
+                // printed, the code below reads bc.errors only)
+                var wi: i64 = 0;
+                while wi < bc.warnings.len() {
+                    p_eprint_str("warning: ");
+                    p_eprint_str(bc.warnings.get(wi));
+                    p_eprint_str("
+");
+                    wi = wi + 1;
+                }
                 if bc.errors.len() > 0 {
                     var file4: str = "<stdin>";
                     match source_path {
@@ -961,6 +980,9 @@ pub var g_native_rt_dir: str = "pe_runtime";
 // Windows x64 on the machine layer (`fid emit --nat`): the Linux runtime
 // plus its Windows layer (linux_runtime/win.fd)
 pub var g_native_rt_win: bool = false;
+// WebAssembly (`fid wasm`, compiler/wasm.fd): the Linux runtime plus its
+// WASI layer (linux_runtime/wasi.fd)
+pub var g_native_rt_wasi: bool = false;
 pub fn set_native_runtime(dir: str) { g_native_rt_dir = dir; g_pe_runtime_merge = true; }
 
 /// Locate a PE runtime source file: under stdlib/pe_runtime/ (repo and
@@ -1163,6 +1185,7 @@ fn astcache_load() -> OptProgram {
             rt_files.push("../pe_runtime/data.fd");
             rt_files.push("../pe_runtime/tensor.fd");
             if g_native_rt_win { rt_files.push("win.fd"); }
+            if g_native_rt_wasi { rt_files.push("wasi.fd"); }
         }
     }
     var core_raw: str = p_file_read(c_path_join(stdlib_dir(), "core.fd"));
@@ -1868,6 +1891,16 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                         var bc: BorrowChecker = BorrowChecker_new(bc_mode);
                         bc.skip_bodies = core_skip;
                         check(&mut bc, program);
+                        // Warn mode collects into bc.warnings (known-bugs 2g.9: nothing was
+                        // printed, the code below reads bc.errors only)
+                        var wi: i64 = 0;
+                        while wi < bc.warnings.len() {
+                            p_eprint_str("warning: ");
+                            p_eprint_str(bc.warnings.get(wi));
+                            p_eprint_str("
+");
+                            wi = wi + 1;
+                        }
                         BorrowChecker_free_maps(&mut bc);
                         if bc.errors.len() > 0 {
                             var file4: str = "<stdin>";
@@ -3299,6 +3332,9 @@ pub fn merge_programs(stdlib: Program, user: Program) -> Program {
 /// The target of a cross build: "" = the host. `fid ccompile --target`
 /// sets them (os: linux, macos, windows; arch: x86_64, aarch64, riscv64).
 pub var g_cfg_os: str = "";
+/// `--debug` on the command line: `@cfg(debug)` holds (known-bugs 2g.14:
+/// check_cfg was always given false)
+pub var g_cfg_debug: bool = false;
 pub var g_cfg_arch: str = "";
 
 /// Does `@cfg(arch)` name the target's architecture? (x86_64 on the host.)
@@ -3328,26 +3364,26 @@ pub fn apply_cfg_filter(program: &mut Program) {
     var any: bool = false;
     var i: i64 = 0;
     while i < program.funcs.len() && !any {
-        if !check_cfg(program.funcs.get(i).annotations, is_linux, is_windows, is_macos, false) { any = true; }
+        if !check_cfg(program.funcs.get(i).annotations, is_linux, is_windows, is_macos, g_cfg_debug) { any = true; }
         i = i + 1;
     }
     i = 0;
     while i < program.structs.len() && !any {
-        if !check_cfg(program.structs.get(i).annotations, is_linux, is_windows, is_macos, false) { any = true; }
+        if !check_cfg(program.structs.get(i).annotations, is_linux, is_windows, is_macos, g_cfg_debug) { any = true; }
         i = i + 1;
     }
     if !any { return; }
     var funcs: Vec<Func> = Vec::new();
     i = 0;
     while i < program.funcs.len() {
-        if check_cfg(program.funcs.get(i).annotations, is_linux, is_windows, is_macos, false) { funcs.push(program.funcs.get(i)); }
+        if check_cfg(program.funcs.get(i).annotations, is_linux, is_windows, is_macos, g_cfg_debug) { funcs.push(program.funcs.get(i)); }
         i = i + 1;
     }
     program.funcs = funcs;
     var structs: Vec<StructDef> = Vec::new();
     i = 0;
     while i < program.structs.len() {
-        if check_cfg(program.structs.get(i).annotations, is_linux, is_windows, is_macos, false) { structs.push(program.structs.get(i)); }
+        if check_cfg(program.structs.get(i).annotations, is_linux, is_windows, is_macos, g_cfg_debug) { structs.push(program.structs.get(i)); }
         i = i + 1;
     }
     program.structs = structs;

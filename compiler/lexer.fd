@@ -369,6 +369,24 @@ impl Lexer {
             return token_new(TokenKind::FloatLit(val), line, col);
         }
 
+        // Float with an exponent and no fraction: `5e3`, `1E-9` (known-bugs
+        // 2g.18: lexed as 5 then the name e3). Only when digits follow the
+        // e (after an optional sign), so `5.e` and names stay as they were.
+        if self.peek() == 101 || self.peek() == 69 {
+            var ex: i64 = 1;
+            if self.peek_at(1) == 43 || self.peek_at(1) == 45 { ex = 2; }
+            if lex_is_digit(self.peek_at(ex)) {
+                var k: i64 = 0;
+                while k < ex { self.advance(); k = k + 1; }
+                while self.pos < self.src_len && lex_is_digit(self.peek()) {
+                    self.advance();
+                }
+                var eraw: str = str_slice_len(self.source, self.src_len, start_pos, self.pos);
+                var es: str = str_filter_underscores(eraw);
+                return token_new(TokenKind::FloatLit(str_parse_float(es)), line, col);
+            }
+        }
+
         // Build string without underscores
         var raw: str = str_slice_len(self.source, self.src_len, start_pos, self.pos);
         var s: str = str_filter_underscores(raw);

@@ -1436,6 +1436,20 @@ fn activate_reserved_borrows(self: &mut BorrowChecker) -> void {
 
 // Rule 3: mutating a variable. Fails if any borrow is active on it or on
 // any field path under it.
+/// "a.b.c" for a chain of field reads on a variable, or "".
+fn bc_field_path(e: Expr) -> str {
+    match e {
+        Expr::Ident(n) => { return n; }
+        Expr::FieldAccess(x, f) => {
+            var base: str = bc_field_path(bc_box_expr_unbox(x));
+            if base == "" { return ""; }
+            return base + "." + f;
+        }
+        _ => {}
+    }
+    return "";
+}
+
 fn check_mutation(self: &mut BorrowChecker, var: str, line: i64) -> void {
     if bc_is_iterating(self, var) {
         violation(self, line, "cannot change " + var + " while a `for` loop iterates over it: the loop would read past a resize or skip elements.
@@ -1541,17 +1555,17 @@ fn check_stmt(self: &mut BorrowChecker, stmt: Stmt) -> void {
             check_expr(self, expr);
             // `s.x = 1` changes s.x: rejected while s, s.x or a field of
             // s.x is borrowed (release K5)
-            match object {
-                Expr::Ident(oname) => {
-                    var fpath: str = oname + "." + field;
-                    check_mutation(self, fpath, fline);
-                    if has_shared_borrow_on_prefix(self, fpath) {
-                        violation(self, fline, "cannot assign to " + fpath + ": " + oname + " is borrowed" + holder_note(self, oname, 0));
-                    } else if has_mut_borrow_on_prefix(self, fpath) {
-                        violation(self, fline, "cannot assign to " + fpath + ": " + oname + " is mutably borrowed" + holder_note(self, oname, 1));
-                    }
+            // The object may be a field path itself: `s.a.z = 1` changes
+            // s.a.z, rejected while &s.a lives (known-bugs 2g.9)
+            var opath: str = bc_field_path(object);
+            if opath != "" {
+                var fpath: str = opath + "." + field;
+                check_mutation(self, fpath, fline);
+                if has_shared_borrow_on_prefix(self, fpath) {
+                    violation(self, fline, "cannot assign to " + fpath + ": " + opath + " is borrowed" + holder_note(self, opath, 0));
+                } else if has_mut_borrow_on_prefix(self, fpath) {
+                    violation(self, fline, "cannot assign to " + fpath + ": " + opath + " is mutably borrowed" + holder_note(self, opath, 1));
                 }
-                _ => {}
             }
         }
         Stmt::Expr(e, _) => { check_expr(self, e); }
@@ -2051,6 +2065,15 @@ fn check_expr(self: &mut BorrowChecker, expr: Expr) -> void {
         Expr::Spawn(e) => { check_expr(self, bc_box_expr_unbox(e)); }
         Expr::Yield(e) => { check_expr(self, bc_box_expr_unbox(e)); }
         Expr::NamedArg(name, e) => { check_expr(self, bc_box_expr_unbox(e)); }
+        // A cast or a pipe hid what it wraps: `g(&mut x, &mut x) as i64`
+        // was accepted (known-bugs 2g.9)
+        Expr::Cast(e, _) => { check_expr(self, bc_box_expr_unbox(e)); }
+        Expr::QuantCast(e, _) => { check_expr(self, bc_box_expr_unbox(e)); }
+        Expr::Comptime(e) => { check_expr(self, bc_box_expr_unbox(e)); }
+        Expr::PipeForward(l, r) => {
+            check_expr(self, bc_box_expr_unbox(l));
+            check_expr(self, bc_box_expr_unbox(r));
+        }
         Expr::Closure(_, body, _) => {
             // Closures capture variables from the enclosing scope. Check the
             // body in a new scope -- captured variables are treated as

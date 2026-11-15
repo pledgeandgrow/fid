@@ -797,6 +797,8 @@ pub struct TypeChecker {
     sandbox_depth: i64,
     in_conserve: bool,                               // checking a @conserve function
     txn_depth: i64,                                  // inside txn { } blocks
+    struct_tp_names: Vec<str>,                       // generic structs ...
+    struct_tp_lists: Vec<Vec<str>>,                  // ... and their type parameters
     gpu_region_depth: i64,
     region_budgets: Vec<RegionBudget>,
     region_lines: Vec<StringString>,
@@ -1004,6 +1006,8 @@ impl TypeChecker {
             sandbox_depth: 0,
             in_conserve: false,
             txn_depth: 0,
+            struct_tp_names: Vec::new(),
+            struct_tp_lists: Vec::new(),
             gpu_region_depth: 0,
             region_budgets: Vec::new(),
             region_lines: Vec::new(),
@@ -1080,6 +1084,10 @@ pub fn TypeChecker_register_program(self: &mut TypeChecker, program: Program, mo
             fi = fi + 1;
         }
         self.structs.push(StringStructFields_new(s.name, fields));
+        if s.type_params.len() > 0 && !tc_str_vec_contains(self.struct_tp_names, s.name) {
+            self.struct_tp_names.push(s.name);
+            self.struct_tp_lists.push(s.type_params);
+        }
         if tc_has_annotation(s.annotations, "scoped") { self.scoped_structs.push(s.name); }
         TypeChecker_set_item_module(self, s.name, module);
         TypeChecker_set_item_visibility(self, s.name, s.is_pub);
@@ -2180,47 +2188,90 @@ fn tc_has_annotation(anns: Vec<Annotation>, name: str) -> bool {
 }
 
 // A match on an enum or bool covers every case, or has a catch-all arm.
+// An arm with a guard covers nothing (the guard may be false); a generic
+// enum (`Option<T>`, `Result<T, E>`, a user `E<T>`) is checked by its
+// variants as a plain one is; a bare name that is one of the enum's
+// variants (`None`) covers that variant, not everything (known-bugs 2g.7).
 fn TypeChecker_check_exhaustive(self: &mut TypeChecker, match_ty: Type, arms: Vec<MatchArm>, line: i64) {
+    var enum_name: str = "";
+    match match_ty {
+        Type::Named(n) => { enum_name = n; }
+        Type::Generic(gn, _) => { enum_name = gn; }
+        Type::Ref(inner, _) => {
+            match box_type_unbox(inner) {
+                Type::Named(rn) => { enum_name = rn; }
+                Type::Generic(rgn, _) => { enum_name = rgn; }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    var variants: Vec<EnumVariantEntry> = Vec::new();
+    var is_enum: bool = false;
+    if enum_name != "" {
+        var ei: i64 = 0;
+        while ei < self.enum_variants.len() {
+            if self.enum_variants.get(ei).key == enum_name {
+                variants = self.enum_variants.get(ei).val;
+                is_enum = true;
+                ei = self.enum_variants.len();
+            }
+            ei = ei + 1;
+        }
+    }
     var covered: Vec<str> = Vec::new();
     var has_true: bool = false;
     var has_false: bool = false;
     var i: i64 = 0;
     while i < arms.len() {
-        match arms.get(i).pattern {
-            Pattern::Wildcard => { return; }
-            Pattern::Ident(_) => { return; }
-            Pattern::EnumVariant(_, variant, _) => { covered.push(variant); }
-            Pattern::BoolLit(b) => {
-                if b { has_true = true; } else { has_false = true; }
+        var guarded: bool = false;
+        match arms.get(i).guard {
+            OptBoxExpr::Some(_) => { guarded = true; }
+            OptBoxExpr::None => {}
+        }
+        if !guarded {
+            match arms.get(i).pattern {
+                Pattern::Wildcard => { return; }
+                Pattern::Ident(pn) => {
+                    var is_variant: bool = false;
+                    if is_enum {
+                        var vk: i64 = 0;
+                        while vk < variants.len() {
+                            if variants.get(vk).name == pn { is_variant = true; }
+                            vk = vk + 1;
+                        }
+                    }
+                    if !is_variant { return; }
+                    covered.push(pn);
+                }
+                Pattern::EnumVariant(_, variant, _) => { covered.push(variant); }
+                Pattern::BoolLit(b) => {
+                    if b { has_true = true; } else { has_false = true; }
+                }
+                _ => {}
             }
-            _ => {}
         }
         i = i + 1;
     }
-    match match_ty {
-        Type::Named(enum_name) => {
-            var ei: i64 = 0;
-            while ei < self.enum_variants.len() {
-                if self.enum_variants.get(ei).key == enum_name {
-                    var variants: Vec<EnumVariantEntry> = self.enum_variants.get(ei).val;
-                    var missing: str = "";
-                    var vi: i64 = 0;
-                    while vi < variants.len() {
-                        var v: str = variants.get(vi).name;
-                        if !tc_str_vec_contains(covered, v) {
-                            if str_len(missing) > 0 { missing = missing + ", "; }
-                            missing = missing + enum_name + "::" + v;
-                        }
-                        vi = vi + 1;
-                    }
-                    if str_len(missing) > 0 {
-                        self.errors.push("Type error: non-exhaustive match at line " + int_to_str(line) + " in " + self.current_module + " — missing variant(s): " + missing);
-                    }
-                    return;
-                }
-                ei = ei + 1;
+    if is_enum {
+        var missing: str = "";
+        var vi: i64 = 0;
+        while vi < variants.len() {
+            var v: str = variants.get(vi).name;
+            if !tc_str_vec_contains(covered, v) {
+                if str_len(missing) > 0 { missing = missing + ", "; }
+                missing = missing + enum_name + "::" + v;
             }
+            vi = vi + 1;
         }
+        if str_len(missing) > 0 {
+            self.errors.push("Type error: non-exhaustive match at line " + int_to_str(line) + " in " + self.current_module + " — missing variant(s): " + missing
+                + "
+    (an arm with a guard `if ...` covers nothing: add an arm without one, or `_ =>`)");
+        }
+        return;
+    }
+    match match_ty {
         Type::Bool => {
             if !has_true || !has_false {
                 self.errors.push("Type error: non-exhaustive match on bool at line " + int_to_str(line) + " in " + self.current_module);
@@ -6387,7 +6438,10 @@ fn TypeChecker_check_func_body(self: &mut TypeChecker, func: Func) {
         // @conserve: a linear value taken by value (Money, or a struct
         // holding it) must leave the function -- returned or passed on --
         // or the money in it is destroyed. A borrow (&Money) is not owned.
-        if self.in_conserve && TypeChecker_is_linear_type(self, resolved_ty) {
+        // (stdlib/money.fd's operations are the trusted base: they build
+        // their result from the amounts they read)
+        if self.in_conserve && TypeChecker_is_linear_type(self, resolved_ty)
+            && !TypeChecker_in_money_module(self, func.name) {
             var by_ref: bool = false;
             match resolved_ty {
                 Type::Ref(_, _) => { by_ref = true; }
@@ -6468,7 +6522,17 @@ pub fn stmts_always_leave(stmts: Vec<Stmt>) -> bool {
     match stmts.get(stmts.len() - 1) {
         Stmt::Return(_, _) => { return true; }
         Stmt::Expr(_, _) => { return true; }
-        Stmt::If(_, then_block, else_block, _) => {
+        Stmt::If(cond, then_block, else_block, _) => {
+            match cond {
+                Expr::BoolLit(cb) => {
+                    if cb { return stmts_always_leave(then_block); }
+                    match else_block {
+                        OptStmts::Some(eb) => { return stmts_always_leave(eb); }
+                        OptStmts::None => { return false; }
+                    }
+                }
+                _ => {}
+            }
             match else_block {
                 OptStmts::Some(eb) => { return stmts_always_leave(then_block) && stmts_always_leave(eb); }
                 OptStmts::None => { return false; }
@@ -7527,6 +7591,46 @@ fn TypeChecker_method_takes_mut_self(self: &TypeChecker, receiver: Expr, method:
     return false;
 }
 
+/// The type parameters of struct `name` (`struct Pair<A, B>`), or none.
+fn TypeChecker_struct_type_params(self: &TypeChecker, name: str) -> Vec<str> {
+    var i: i64 = 0;
+    while i < self.struct_tp_names.len() {
+        if self.struct_tp_names.get(i) == name { return self.struct_tp_lists.get(i); }
+        i = i + 1;
+    }
+    return Vec::new();
+}
+
+/// The type a value gives a type parameter it is bound to: an integer or
+/// float literal is i64 or f64 (a literal is typed by the smallest type
+/// that holds it).
+fn tc_bind_type(e: Expr, t: Type) -> Type {
+    match e {
+        Expr::IntLit(_) => { return Type::I64; }
+        Expr::FloatLit(_) => { return Type::F64; }
+        Expr::Unary(_, inner) => { return tc_bind_type(box_expr_unbox(inner), t); }
+        _ => {}
+    }
+    return t;
+}
+
+fn tc_type_has_infer(t: Type) -> bool {
+    match t {
+        Type::Infer => { return true; }
+        Type::Generic(_, args) => {
+            var i: i64 = 0;
+            while i < args.len() {
+                if tc_type_has_infer(args.get(i)) { return true; }
+                i = i + 1;
+            }
+        }
+        Type::Ref(inner, _) => { return tc_type_has_infer(box_type_unbox(inner)); }
+        Type::Array(inner, _) => { return tc_type_has_infer(box_type_unbox(inner)); }
+        _ => {}
+    }
+    return false;
+}
+
 fn TypeChecker_impl_type_params(self: &TypeChecker, name: str) -> Vec<str> {
     var i: i64 = 0;
     while i < self.impl_tp_names.len() {
@@ -8395,6 +8499,108 @@ pub fn tc_swizzle_result_type(field: str) -> OptType {
 
 pub fn tc_is_vec_type(name: str) -> bool {
     return name == "vec2" || name == "vec3" || name == "vec4";
+}
+
+/// Types made to be shared between threads (their operations synchronize).
+fn tc_is_sync_handle(name: str) -> bool {
+    return name == "Channel" || name == "Mutex" || name == "Future" || name == "Arc"
+        || name == "RwLock" || name == "AtomicI64" || name == "AtomicBool" || name == "Atomic";
+}
+
+/// `ty` holds something with an owner count (a string, Vec, HashMap or
+/// Box, also inside a struct, enum or tuple).
+fn TypeChecker_has_owned(self: &TypeChecker, ty: Type, depth: i64) -> bool {
+    if depth > 16 { return false; }
+    match ty {
+        Type::Str => { return true; }
+        Type::Generic(name, args) => {
+            if name == "Vec" || name == "HashMap" || name == "Box" || name == "String" { return true; }
+            if tc_is_sync_handle(name) { return false; }
+            var i: i64 = 0;
+            while i < args.len() {
+                if TypeChecker_has_owned(self, args.get(i), depth + 1) { return true; }
+                i = i + 1;
+            }
+            return false;
+        }
+        Type::Named(name) => {
+            if name == "Vec" || name == "HashMap" || name == "String" || name == "StringBuilder" { return true; }
+            if tc_is_sync_handle(name) { return false; }
+            match TypeChecker_lookup_struct_cache(self, name) {
+                OptVecStructField::Some(fields) => {
+                    var fi: i64 = 0;
+                    while fi < fields.len() {
+                        if TypeChecker_has_owned(self, fields.get(fi).ty, depth + 1) { return true; }
+                        fi = fi + 1;
+                    }
+                    return false;
+                }
+                OptVecStructField::None => {}
+            }
+            var ei: i64 = 0;
+            while ei < self.enum_variants.len() {
+                if self.enum_variants.get(ei).key == name {
+                    var vs: Vec<EnumVariantEntry> = self.enum_variants.get(ei).val;
+                    var vi: i64 = 0;
+                    while vi < vs.len() {
+                        var pts: Vec<Type> = vs.get(vi).payload_types;
+                        var pi: i64 = 0;
+                        while pi < pts.len() {
+                            if TypeChecker_has_owned(self, pts.get(pi), depth + 1) { return true; }
+                            pi = pi + 1;
+                        }
+                        vi = vi + 1;
+                    }
+                    return false;
+                }
+                ei = ei + 1;
+            }
+            return false;
+        }
+        Type::Tuple(types) => {
+            var ti: i64 = 0;
+            while ti < types.len() {
+                if TypeChecker_has_owned(self, types.get(ti), depth + 1) { return true; }
+                ti = ti + 1;
+            }
+            return false;
+        }
+        Type::Array(elem, _) => { return TypeChecker_has_owned(self, box_type_unbox(elem), depth + 1); }
+        Type::ArrayConst(elem, _) => { return TypeChecker_has_owned(self, box_type_unbox(elem), depth + 1); }
+        _ => {}
+    }
+    return false;
+}
+
+/// "" when a value of `ty` can be handed to a spawned thread: it is then
+/// copied whole for the thread (core p_send_copy), so the two threads share
+/// nothing. Otherwise why not. A string, a Vec or HashMap whose elements
+/// are such values, or a value with no owned part at all can be copied;
+/// a Box, or a struct, enum or tuple that holds owned parts, cannot.
+fn TypeChecker_thread_copy_err(self: &TypeChecker, ty: Type, depth: i64) -> str {
+    if depth > 16 { return ""; }
+    match ty {
+        Type::Str => { return ""; }
+        Type::Generic(name, args) => {
+            if tc_is_sync_handle(name) { return ""; }
+            if name == "Vec" && args.len() == 1 { return TypeChecker_thread_copy_err(self, args.get(0), depth + 1); }
+            if name == "HashMap" && args.len() == 2 {
+                var ke: str = TypeChecker_thread_copy_err(self, args.get(0), depth + 1);
+                if ke != "" { return ke; }
+                return TypeChecker_thread_copy_err(self, args.get(1), depth + 1);
+            }
+            if name == "Box" { return "a Box is shared by its copies"; }
+        }
+        Type::Named(name) => {
+            if tc_is_sync_handle(name) { return ""; }
+            if name == "Vec" || name == "HashMap" { return ""; }
+        }
+        _ => {}
+    }
+    if TypeChecker_has_owned(self, ty, 0) {
+        return type_to_str(ty) + " holds strings or collections inside a struct, enum or tuple, which are shared by its copies";
+    }
+    return "";
 }
 
 pub fn TypeChecker_is_send_type(self: &TypeChecker, ty: Type) -> bool {
@@ -10045,6 +10251,30 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                     _ => {}
                 }
             }
+            // A field of a generic struct instance: its declared type with
+            // the instance's type arguments (known-bugs 2f.11)
+            match effective_ty {
+                Type::Generic(gsn, gsargs) => {
+                    var gtps: Vec<str> = TypeChecker_struct_type_params(self, gsn);
+                    if gtps.len() > 0 {
+                        match TypeChecker_lookup_struct_cache(self, gsn) {
+                            OptVecStructField::Some(gfields) => {
+                                var gfi: i64 = 0;
+                                while gfi < gfields.len() {
+                                    if gfields.get(gfi).name == field {
+                                        return tc_subst_type_params(gfields.get(gfi).ty, gtps, gsargs);
+                                    }
+                                    gfi = gfi + 1;
+                                }
+                                self.errors.push("Type error (line " + int_to_str(self.current_line) + "): struct '" + gsn + "' has no field '" + field + "'");
+                                return Type::Never;
+                            }
+                            OptVecStructField::None => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
             match effective_ty {
                 Type::Named(name) => {
                     // Find struct fields
@@ -10122,6 +10352,22 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             while si < si_lim {
                 if self.structs.get(si).key == real_name {
                     var struct_fields: Vec<StructField> = self.structs.get(si).val;
+                    // A generic struct (known-bugs 2f.11): its type
+                    // arguments are those of the field values, as for a
+                    // generic function's arguments; the literal has type
+                    // Pair<A, B> with them
+                    var stps: Vec<str> = TypeChecker_struct_type_params(self, real_name);
+                    var sargs: Vec<Type> = Vec::new();
+                    var sk: i64 = 0;
+                    while sk < stps.len() {
+                        var given: Type = Type::Infer;
+                        match hint {
+                            Type::Generic(hn, hargs) => { if hn == real_name && sk < hargs.len() { given = hargs.get(sk); } }
+                            _ => {}
+                        }
+                        sargs.push(given);
+                        sk = sk + 1;
+                    }
                     // Check spread source type
                     match spread {
                         OptBoxExpr::Some(spread_expr) => {
@@ -10142,8 +10388,24 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                         var sfi: i64 = 0;
                         while sfi < struct_fields.len() {
                             if struct_fields.get(sfi).name == fname {
-                                if !TypeChecker_types_compatible(self, struct_fields.get(sfi).ty, fty) {
-                                    self.errors.push("Type error: field '" + fname + "' expected " + type_to_str(struct_fields.get(sfi).ty) + ", got " + type_to_str(fty));
+                                var want: Type = struct_fields.get(sfi).ty;
+                                if stps.len() > 0 {
+                                    match want {
+                                        Type::Named(wn) => {
+                                            var tk: i64 = 0;
+                                            while tk < stps.len() {
+                                                if stps.get(tk) == wn && tc_type_has_infer(sargs.get(tk)) {
+                                                    sargs.set(tk, tc_bind_type(fexpr, fty));
+                                                }
+                                                tk = tk + 1;
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                    want = tc_subst_type_params(want, stps, sargs);
+                                }
+                                if !tc_type_has_infer(want) && !TypeChecker_types_compatible(self, want, fty) {
+                                    self.errors.push("Type error: field '" + fname + "' expected " + type_to_str(want) + ", got " + type_to_str(fty));
                                 }
                                 found = true;
                                 sfi = struct_fields.len();
@@ -10154,6 +10416,17 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                             self.errors.push("Type error (line " + int_to_str(self.current_line) + "): struct '" + name + "' has no field '" + fname + "'");
                         }
                         fi = fi + 1;
+                    }
+                    if stps.len() > 0 {
+                        var ak: i64 = 0;
+                        while ak < sargs.len() {
+                            if tc_type_has_infer(sargs.get(ak)) {
+                                self.errors.push("Type error (line " + int_to_str(self.current_line) + "): cannot infer type parameter '" + stps.get(ak) + "' of struct '" + real_name + "' from the literal. Fix: give the variable a type, e.g. `var p: " + real_name + "<...> = ...`");
+                                sargs.set(ak, Type::I64);
+                            }
+                            ak = ak + 1;
+                        }
+                        return Type::Generic(real_name, sargs);
                     }
                     return Type::Named(real_name);
                 }
@@ -10597,6 +10870,17 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                                 + int_to_str(ai + 1) + " of the spawned call has type " + type_to_str(aty)
                                 + ", which is not @send.
     Fix: pass a value (numbers, strings, structs of such values) or mark the struct @send.");
+                        } else {
+                            // The thread gets a whole copy of the argument;
+                            // what cannot be copied that way would be
+                            // shared, and its owner counts are not atomic
+                            var ce: str = TypeChecker_thread_copy_err(self, aty, 0);
+                            if ce != "" {
+                                self.errors.push("Thread safety error (line " + int_to_str(self.current_line) + "): argument "
+                                    + int_to_str(ai + 1) + " of the spawned call cannot be copied for the new thread: " + ce + "."
+                                    + "\n    A spawned thread gets its own copy of each argument, so the two threads never share memory."
+                                    + "\n    Fix: pass the strings and Vecs as arguments of their own, send the value over a Channel, or share it through a Mutex.");
+                            }
                         }
                         ai = ai + 1;
                     }

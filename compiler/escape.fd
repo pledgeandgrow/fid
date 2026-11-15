@@ -69,6 +69,11 @@ pub struct EscapeChecker {
     pub report: bool,
     pub errors: Vec<str>,
     pub type_names: i64,       // HashMap: declared struct or enum name -> 1
+    // Facts about each function of `all`, computed once (release D8: the
+    // method-call check copied a whole Func per candidate method)
+    pub ret_has_ref: Vec<bool>,      // esc_contains_ref(ret_ty)
+    pub ret_is_ref: Vec<bool>,       // esc_is_ref_type(ret_ty)
+    pub param_has_ref: Vec<Vec<bool>>, // esc_contains_ref(params[j].ty)
 }
 
 // --- Root sets ------------------------------------------------------------
@@ -280,7 +285,27 @@ pub fn EscapeChecker_new(program: Program) -> EscapeChecker {
         HashMap_insert(type_names, program.enums.get(ei).name, 1);
         ei = ei + 1;
     }
+    var ret_has_ref: Vec<bool> = Vec::new();
+    var ret_is_ref: Vec<bool> = Vec::new();
+    var param_has_ref: Vec<Vec<bool>> = Vec::new();
+    var fk: i64 = 0;
+    while fk < all.len() {
+        var ff: Func = all.get(fk).func;
+        ret_has_ref.push(esc_contains_ref(ff.ret_ty));
+        ret_is_ref.push(esc_is_ref_type(ff.ret_ty));
+        var pr: Vec<bool> = Vec::new();
+        var pj: i64 = 0;
+        while pj < ff.params.len() {
+            pr.push(esc_contains_ref(ff.params.get(pj).ty));
+            pj = pj + 1;
+        }
+        param_has_ref.push(pr);
+        fk = fk + 1;
+    }
     return EscapeChecker {
+        ret_has_ref: ret_has_ref,
+        ret_is_ref: ret_is_ref,
+        param_has_ref: param_has_ref,
         all: all,
         func_index: func_index,
         method_index: method_index,
@@ -546,8 +571,7 @@ fn esc_is_reference(self: &EscapeChecker, e: Expr) -> bool {
             if keys.len() == 0 { return false; }
             var k: i64 = 0;
             while k < keys.len() {
-                var f: Func = self.all.get(HashMap_get(self.func_index, keys.get(k)) - 1).func;
-                if !esc_is_ref_type(f.ret_ty) { return false; }
+                if !self.ret_is_ref.get(HashMap_get(self.func_index, keys.get(k)) - 1) { return false; }
                 k = k + 1;
             }
             return true;
@@ -1289,9 +1313,9 @@ fn esc_method_call(self: &mut EscapeChecker, receiver: Expr, method: str, args: 
             // Argument j is the method's parameter j + 1 (after `self`).
             var borrows: bool = false;
             var ki: i64 = 0;
-            while ki < keys.len() {
-                var cand: Func = self.all.get(HashMap_get(self.func_index, keys.get(ki)) - 1).func;
-                if j + 1 < cand.params.len() && esc_contains_ref(cand.params.get(j + 1).ty) { borrows = true; }
+            while ki < keys.len() && !borrows {
+                var pr: Vec<bool> = self.param_has_ref.get(HashMap_get(self.func_index, keys.get(ki)) - 1);
+                if j + 1 < pr.len() && pr.get(j + 1) { borrows = true; }
                 ki = ki + 1;
             }
             if !borrows && !esc_read_only_method(method) {
@@ -1304,8 +1328,7 @@ fn esc_method_call(self: &mut EscapeChecker, receiver: Expr, method: str, args: 
     var k: i64 = 0;
     while k < keys.len() {
         var key: str = keys.get(k);
-        var f: Func = self.all.get(HashMap_get(self.func_index, key) - 1).func;
-        if esc_contains_ref(f.ret_ty) {
+        if self.ret_has_ref.get(HashMap_get(self.func_index, key) - 1) {
             var flows: Vec<i64> = esc_summary(self, key);
             var fi: i64 = 0;
             while fi < flows.len() {

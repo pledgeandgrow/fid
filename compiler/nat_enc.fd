@@ -21,6 +21,11 @@ pub const NAT_RV64: i64 = 2;
 /// it, the ELF header is in front, one segment maps the file at 0x400000.
 pub const NAT_IMAGE_BASE: i64 = 0x401000;
 
+/// The address NATFIX_ABS64 adds to an image offset: NAT_IMAGE_BASE for
+/// ELF and PE; the Mach-O writer (F7) sets the unslid address of its image
+/// (NAT_MACHO_IMAGE) and dyld rebases each such word by the slide.
+pub var g_nat_abs_base: i64 = 0x401000;
+
 // Fixup kinds
 pub const NATFIX_A64_B26: i64 = 1;      // B, BL: imm26 words
 pub const NATFIX_A64_B19: i64 = 2;      // B.cond, CBZ, CBNZ: imm19 at bit 5
@@ -162,7 +167,7 @@ fn nat_or32(e: &mut NatEnc, pos: i64, bits: i64) {
                 kr = kr + 1;
             }
         } else if f.kind == NATFIX_ABS64 {
-            var abs: i64 = NAT_IMAGE_BASE + target;
+            var abs: i64 = g_nat_abs_base + target;
             var k: i64 = 0;
             while k < 8 {
                 e.code.set(f.pos + k, (abs >> (k * 8)) & 0xFF);
@@ -1372,4 +1377,379 @@ pub fn x64_lock_xadd(e: &mut NatEnc, base: i64, r: i64) {
 /// lock cmpxchg [base], r (compares with rax)
 pub fn x64_lock_cmpxchg(e: &mut NatEnc, base: i64, r: i64) {
     NatEnc_byte(e, 0xF0); x64_rex(e, true, r, 0, base, false); NatEnc_byte(e, 0x0F); NatEnc_byte(e, 0xB1); x64_modrm_mem(e, r, base, 0);
+}
+
+// ===========================================================================
+// Mach-O (macOS x86-64 / arm64), release F7. `fid emit --target
+// x86_64-macos|aarch64-macos`.
+//
+// The same contiguous image as ELF/PE (code then data), mapped identity:
+// vmaddr = NAT_MACHO_BASE + file offset, so NATFIX_ABS64 words (resolved
+// against g_nat_abs_base = NAT_MACHO_BASE + NAT_MACHO_HDR) hold the right
+// unslid address wherever they point; dyld rebases each by the slide. The
+// file is __PAGEZERO (4 GB, no file), __TEXT (r-x: header, load commands,
+// code), __DATA (rw: the data region — globals, tables, strings and the
+// import GOT), __LINKEDIT (dyld rebase/bind opcodes, symbol table, the
+// ad-hoc code signature). Imports are bound into GOT slots and called
+// through them (nat_mac_call), as the Windows IAT is. On arm64 the kernel
+// refuses an unsigned binary, so a CodeDirectory of SHA-256 page hashes is
+// written (ad-hoc, no certificate).
+// ===========================================================================
+
+pub const NAT_MACHO_BASE: i64 = 0x100000000;
+/// The header + load commands take one page; the code follows.
+pub const NAT_MACHO_HDR: i64 = 0x4000;
+
+// ── SHA-256 (for the ad-hoc code signature's page hashes) ───────────────
+
+fn sha_rotr(x: i64, n: i64) -> i64 {
+    return ((x >> n) | (x << (32 - n))) & 0xFFFFFFFF;
+}
+
+fn sha_k(i: i64) -> i64 {
+    var k: Vec<i64> = Vec::new();
+    k.push(0x428a2f98); k.push(0x71374491); k.push(0xb5c0fbcf); k.push(0xe9b5dba5);
+    k.push(0x3956c25b); k.push(0x59f111f1); k.push(0x923f82a4); k.push(0xab1c5ed5);
+    k.push(0xd807aa98); k.push(0x12835b01); k.push(0x243185be); k.push(0x550c7dc3);
+    k.push(0x72be5d74); k.push(0x80deb1fe); k.push(0x9bdc06a7); k.push(0xc19bf174);
+    k.push(0xe49b69c1); k.push(0xefbe4786); k.push(0x0fc19dc6); k.push(0x240ca1cc);
+    k.push(0x2de92c6f); k.push(0x4a7484aa); k.push(0x5cb0a9dc); k.push(0x76f988da);
+    k.push(0x983e5152); k.push(0xa831c66d); k.push(0xb00327c8); k.push(0xbf597fc7);
+    k.push(0xc6e00bf3); k.push(0xd5a79147); k.push(0x06ca6351); k.push(0x14292967);
+    k.push(0x27b70a85); k.push(0x2e1b2138); k.push(0x4d2c6dfc); k.push(0x53380d13);
+    k.push(0x650a7354); k.push(0x766a0abb); k.push(0x81c2c92e); k.push(0x92722c85);
+    k.push(0xa2bfe8a1); k.push(0xa81a664b); k.push(0xc24b8b70); k.push(0xc76c51a3);
+    k.push(0xd192e819); k.push(0xd6990624); k.push(0xf40e3585); k.push(0x106aa070);
+    k.push(0x19a4c116); k.push(0x1e376c08); k.push(0x2748774c); k.push(0x34b0bcb5);
+    k.push(0x391c0cb3); k.push(0x4ed8aa4a); k.push(0x5b9cca4f); k.push(0x682e6ff3);
+    k.push(0x748f82ee); k.push(0x78a5636f); k.push(0x84c87814); k.push(0x8cc70208);
+    k.push(0x90befffa); k.push(0xa4506ceb); k.push(0xbef9a3f7); k.push(0xc67178f2);
+    return k.get(i);
+}
+
+/// SHA-256 of bytes `data[from, to)`, as 32 big-endian bytes appended to
+/// `out`. 32-bit modular arithmetic throughout.
+@wrapping fn sha256_into(out: &mut Vec<i64>, data: &Vec<i64>, from: i64, to: i64) {
+    var h0: i64 = 0x6a09e667; var h1: i64 = 0xbb67ae85; var h2: i64 = 0x3c6ef372; var h3: i64 = 0xa54ff53a;
+    var h4: i64 = 0x510e527f; var h5: i64 = 0x9b05688c; var h6: i64 = 0x1f83d9ab; var h7: i64 = 0x5be0cd19;
+    var len: i64 = to - from;
+    var bits: i64 = len * 8;
+    // padded message as a byte Vec
+    var msg: Vec<i64> = Vec::new();
+    var i: i64 = from;
+    while i < to { msg.push(data.get(i) & 0xFF); i = i + 1; }
+    msg.push(0x80);
+    while (msg.len() % 64) != 56 { msg.push(0); }
+    var b: i64 = 7;
+    while b >= 0 { msg.push((bits >> (b * 8)) & 0xFF); b = b - 1; }
+    var w: Vec<i64> = Vec::new();
+    var wi: i64 = 0;
+    while wi < 64 { w.push(0); wi = wi + 1; }
+    var blk: i64 = 0;
+    while blk < msg.len() {
+        var t: i64 = 0;
+        while t < 16 {
+            var o: i64 = blk + t * 4;
+            w.set(t, ((msg.get(o) << 24) | (msg.get(o + 1) << 16) | (msg.get(o + 2) << 8) | msg.get(o + 3)) & 0xFFFFFFFF);
+            t = t + 1;
+        }
+        t = 16;
+        while t < 64 {
+            var x15: i64 = w.get(t - 15);
+            var s0: i64 = sha_rotr(x15, 7) ^ sha_rotr(x15, 18) ^ (x15 >> 3);
+            var x2: i64 = w.get(t - 2);
+            var s1: i64 = sha_rotr(x2, 17) ^ sha_rotr(x2, 19) ^ (x2 >> 10);
+            w.set(t, (w.get(t - 16) + s0 + w.get(t - 7) + s1) & 0xFFFFFFFF);
+            t = t + 1;
+        }
+        var a: i64 = h0; var bb: i64 = h1; var c: i64 = h2; var d: i64 = h3;
+        var e: i64 = h4; var f: i64 = h5; var gg: i64 = h6; var hh: i64 = h7;
+        t = 0;
+        while t < 64 {
+            var S1: i64 = sha_rotr(e, 6) ^ sha_rotr(e, 11) ^ sha_rotr(e, 25);
+            var ch: i64 = (e & f) ^ ((e ^ 0xFFFFFFFF) & gg);
+            var t1: i64 = (hh + S1 + ch + sha_k(t) + w.get(t)) & 0xFFFFFFFF;
+            var S0: i64 = sha_rotr(a, 2) ^ sha_rotr(a, 13) ^ sha_rotr(a, 22);
+            var maj: i64 = (a & bb) ^ (a & c) ^ (bb & c);
+            var t2: i64 = (S0 + maj) & 0xFFFFFFFF;
+            hh = gg; gg = f; f = e; e = (d + t1) & 0xFFFFFFFF;
+            d = c; c = bb; bb = a; a = (t1 + t2) & 0xFFFFFFFF;
+            t = t + 1;
+        }
+        h0 = (h0 + a) & 0xFFFFFFFF; h1 = (h1 + bb) & 0xFFFFFFFF; h2 = (h2 + c) & 0xFFFFFFFF; h3 = (h3 + d) & 0xFFFFFFFF;
+        h4 = (h4 + e) & 0xFFFFFFFF; h5 = (h5 + f) & 0xFFFFFFFF; h6 = (h6 + gg) & 0xFFFFFFFF; h7 = (h7 + hh) & 0xFFFFFFFF;
+        blk = blk + 64;
+    }
+    var hs: Vec<i64> = Vec::new();
+    hs.push(h0); hs.push(h1); hs.push(h2); hs.push(h3); hs.push(h4); hs.push(h5); hs.push(h6); hs.push(h7);
+    var j: i64 = 0;
+    while j < 8 {
+        var v: i64 = hs.get(j);
+        out.push((v >> 24) & 0xFF); out.push((v >> 16) & 0xFF); out.push((v >> 8) & 0xFF); out.push(v & 0xFF);
+        j = j + 1;
+    }
+}
+
+fn nat_be_u32(out: &mut Vec<i64>, v: i64) {
+    out.push((v >> 24) & 0xFF); out.push((v >> 16) & 0xFF); out.push((v >> 8) & 0xFF); out.push(v & 0xFF);
+}
+
+/// Round `v` up to a multiple of `n`.
+fn nat_round(v: i64, n: i64) -> i64 {
+    return (v + n - 1) / n * n;
+}
+
+fn nat_put_u64_be(out: &mut Vec<i64>, v: i64) {
+    var b: i64 = 7;
+    while b >= 0 { out.push((v >> (b * 8)) & 0xFF); b = b - 1; }
+}
+
+fn nat_macho_name16(out: &mut Vec<i64>, name: str) {
+    var i: i64 = 0;
+    while i < 16 {
+        if i < str_len(name) { out.push(str_byte_at(name, i)); } else { out.push(0); }
+        i = i + 1;
+    }
+}
+
+/// One LC_SEGMENT_64 header (nsects section headers follow).
+fn nat_macho_seg(out: &mut Vec<i64>, name: str, vmaddr: i64, vmsize: i64, fileoff: i64,
+                 filesize: i64, maxprot: i64, initprot: i64, nsects: i64) {
+    nat_put_u32(out, 0x19);                                    // LC_SEGMENT_64
+    nat_put_u32(out, 72 + 80 * nsects);
+    nat_macho_name16(out, name);
+    nat_put_u64(out, vmaddr);
+    nat_put_u64(out, vmsize);
+    nat_put_u64(out, fileoff);
+    nat_put_u64(out, filesize);
+    nat_put_u32(out, maxprot);
+    nat_put_u32(out, initprot);
+    nat_put_u32(out, nsects);
+    nat_put_u32(out, 0);                                       // flags
+}
+
+fn nat_macho_sect(out: &mut Vec<i64>, sect: str, seg: str, addr: i64, size: i64, offset: i64,
+                  align: i64, flags: i64) {
+    nat_macho_name16(out, sect);
+    nat_macho_name16(out, seg);
+    nat_put_u64(out, addr);
+    nat_put_u64(out, size);
+    nat_put_u32(out, offset);
+    nat_put_u32(out, align);
+    nat_put_u32(out, 0);                                       // reloff
+    nat_put_u32(out, 0);                                       // nreloc
+    nat_put_u32(out, flags);
+    nat_put_u32(out, 0);                                       // reserved1
+    nat_put_u32(out, 0);                                       // reserved2
+    nat_put_u32(out, 0);                                       // reserved3
+}
+
+fn nat_macho_dylinker(out: &mut Vec<i64>) {
+    var path: str = "/usr/lib/dyld";
+    var cmdsize: i64 = nat_round(12 + str_len(path) + 1, 8);
+    nat_put_u32(out, 0xE);                                     // LC_LOAD_DYLINKER
+    nat_put_u32(out, cmdsize);
+    nat_put_u32(out, 12);                                      // name offset
+    var i: i64 = 0;
+    while i < str_len(path) { out.push(str_byte_at(path, i)); i = i + 1; }
+    i = 12 + str_len(path);
+    while i < cmdsize { out.push(0); i = i + 1; }
+}
+
+fn nat_macho_dylib(out: &mut Vec<i64>) {
+    var path: str = "/usr/lib/libSystem.B.dylib";
+    var cmdsize: i64 = nat_round(24 + str_len(path) + 1, 8);
+    nat_put_u32(out, 0xC);                                     // LC_LOAD_DYLIB
+    nat_put_u32(out, cmdsize);
+    nat_put_u32(out, 24);                                      // name offset
+    nat_put_u32(out, 2);                                       // timestamp
+    nat_put_u32(out, 0x10000);                                 // current version
+    nat_put_u32(out, 0x10000);                                 // compat version
+    var i: i64 = 0;
+    while i < str_len(path) { out.push(str_byte_at(path, i)); i = i + 1; }
+    i = 24 + str_len(path);
+    while i < cmdsize { out.push(0); i = i + 1; }
+}
+
+/// A 64-bit Mach-O executable. `image` is the contiguous code+data blob
+/// (code at [0, data_off), data at [data_off, end)); `entry` the entry
+/// offset in the code; `rebase_offs` the image offsets of the NATFIX_ABS64
+/// words (each >= data_off); `imp_names` the libSystem symbols and
+/// `imp_offs` their GOT slot offsets in the image (each >= data_off).
+/// g_nat_abs_base must already be NAT_MACHO_BASE + NAT_MACHO_HDR.
+pub fn nat_macho(arch: i64, image: Vec<i64>, entry: i64, data_off: i64,
+                 rebase_offs: Vec<i64>, imp_names: Vec<str>, imp_offs: Vec<i64>) -> Vec<i64> {
+    var page: i64 = 0x1000;
+    if arch == NAT_A64 { page = 0x4000; }
+    var H: i64 = NAT_MACHO_HDR;
+    var base: i64 = NAT_MACHO_BASE;
+    var imglen: i64 = image.len();
+    var text_fileend: i64 = nat_round(H + data_off, page);
+    var datalen: i64 = imglen - data_off;
+    var data_fileoff: i64 = text_fileend;
+    var data_filelen: i64 = nat_round(datalen, page);
+    var le_fileoff: i64 = data_fileoff + data_filelen;
+
+    // ── dyld info: rebase then bind opcodes ──
+    var rebase: Vec<i64> = Vec::new();
+    if rebase_offs.len() > 0 {
+        rebase.push(0x10 | 1);                                 // SET_TYPE_IMM pointer
+        var ri: i64 = 0;
+        while ri < rebase_offs.len() {
+            rebase.push(0x20 | 2);                             // SET_SEG_AND_OFFSET __DATA(2)
+            nat_put_uleb(&mut rebase, rebase_offs.get(ri) - data_off);
+            rebase.push(0x60);                                 // DO_REBASE_ULEB_TIMES
+            nat_put_uleb(&mut rebase, 1);
+            ri = ri + 1;
+        }
+        rebase.push(0x00);                                     // DONE
+    }
+    var bind: Vec<i64> = Vec::new();
+    if imp_names.len() > 0 {
+        bind.push(0x10 | 1);                                   // SET_DYLIB_ORDINAL_IMM 1
+        bind.push(0x50 | 1);                                   // SET_TYPE_IMM pointer
+        var bi: i64 = 0;
+        while bi < imp_names.len() {
+            bind.push(0x40 | 0);                               // SET_SYMBOL_TRAILING_FLAGS_IMM
+            var nm: str = imp_names.get(bi);
+            var ci: i64 = 0;
+            while ci < str_len(nm) { bind.push(str_byte_at(nm, ci)); ci = ci + 1; }
+            bind.push(0);
+            bind.push(0x70 | 2);                               // SET_SEG_AND_OFFSET __DATA(2)
+            nat_put_uleb(&mut bind, imp_offs.get(bi) - data_off);
+            bind.push(0x90);                                   // DO_BIND
+            bi = bi + 1;
+        }
+        bind.push(0x00);                                       // DONE
+    }
+    while (rebase.len() % 8) != 0 { rebase.push(0); }
+    while (bind.len() % 8) != 0 { bind.push(0); }
+
+    var rebase_off: i64 = le_fileoff;
+    var bind_off: i64 = rebase_off + rebase.len();
+    var symoff: i64 = bind_off + bind.len();
+    var nsyms: i64 = 0;
+    var stroff: i64 = symoff;
+    var strtab: Vec<i64> = Vec::new();
+    strtab.push(0);
+    while (strtab.len() % 8) != 0 { strtab.push(0); }
+    var strsize: i64 = strtab.len();
+    var sig_off: i64 = nat_round(stroff + strsize, 16);
+
+    // ── the ad-hoc code signature size (codeLimit = sig_off) ──
+    var ident: str = "a.out";
+    var ident_len: i64 = str_len(ident) + 1;
+    var ncode: i64 = (sig_off + 4095) / 4096;
+    var cd_len: i64 = 88 + ident_len + ncode * 32;
+    var sig_len: i64 = 12 + cd_len;
+    var file_end: i64 = sig_off + sig_len;
+    var le_filelen: i64 = file_end - le_fileoff;
+
+    // ── load commands ──
+    var lc: Vec<i64> = Vec::new();
+    nat_macho_seg(&mut lc, "__PAGEZERO", 0, base, 0, 0, 0, 0, 0);
+    var tsz: i64 = nat_round(text_fileend, page);
+    nat_macho_seg(&mut lc, "__TEXT", base, tsz, 0, text_fileend, 5, 5, 1);
+    nat_macho_sect(&mut lc, "__text", "__TEXT", base + H, data_off, H, 2, 0x80000400);
+    var dvm: i64 = base + data_fileoff;
+    nat_macho_seg(&mut lc, "__DATA", dvm, nat_round(datalen, page), data_fileoff, data_filelen, 3, 3, 1);
+    nat_macho_sect(&mut lc, "__data", "__DATA", dvm, datalen, data_fileoff, 3, 0);
+    var levm: i64 = base + le_fileoff;
+    nat_macho_seg(&mut lc, "__LINKEDIT", levm, nat_round(le_filelen, page), le_fileoff, le_filelen, 1, 1, 0);
+    // LC_DYLD_INFO_ONLY
+    nat_put_u32(&mut lc, 0x80000022); nat_put_u32(&mut lc, 48);
+    nat_put_u32(&mut lc, rebase_off); nat_put_u32(&mut lc, rebase.len());
+    nat_put_u32(&mut lc, bind_off); nat_put_u32(&mut lc, bind.len());
+    nat_put_u32(&mut lc, 0); nat_put_u32(&mut lc, 0);
+    nat_put_u32(&mut lc, 0); nat_put_u32(&mut lc, 0);
+    nat_put_u32(&mut lc, 0); nat_put_u32(&mut lc, 0);
+    // LC_SYMTAB
+    nat_put_u32(&mut lc, 0x2); nat_put_u32(&mut lc, 24);
+    nat_put_u32(&mut lc, symoff); nat_put_u32(&mut lc, nsyms);
+    nat_put_u32(&mut lc, stroff); nat_put_u32(&mut lc, strsize);
+    // LC_DYSYMTAB
+    nat_put_u32(&mut lc, 0xB); nat_put_u32(&mut lc, 80);
+    var dz: i64 = 0;
+    while dz < 18 { nat_put_u32(&mut lc, 0); dz = dz + 1; }
+    nat_macho_dylinker(&mut lc);
+    // LC_BUILD_VERSION: macOS, minos 11.0, sdk 13.0, 0 tools
+    nat_put_u32(&mut lc, 0x32); nat_put_u32(&mut lc, 24);
+    nat_put_u32(&mut lc, 1); nat_put_u32(&mut lc, 0x000B0000); nat_put_u32(&mut lc, 0x000D0000); nat_put_u32(&mut lc, 0);
+    // LC_MAIN
+    nat_put_u32(&mut lc, 0x80000028); nat_put_u32(&mut lc, 24);
+    nat_put_u64(&mut lc, H + entry); nat_put_u64(&mut lc, 0);
+    nat_macho_dylib(&mut lc);
+    // LC_CODE_SIGNATURE
+    nat_put_u32(&mut lc, 0x1D); nat_put_u32(&mut lc, 16);
+    nat_put_u32(&mut lc, sig_off); nat_put_u32(&mut lc, sig_len);
+
+    var ncmds: i64 = 11;
+    var sizeofcmds: i64 = lc.len();
+    if 32 + sizeofcmds > H { return Vec::new(); }
+
+    // ── assemble ──
+    var out: Vec<i64> = Vec::new();
+    nat_put_u32(&mut out, 0xFEEDFACF);
+    if arch == NAT_A64 { nat_put_u32(&mut out, 0x0100000C); nat_put_u32(&mut out, 0); }
+    else { nat_put_u32(&mut out, 0x01000007); nat_put_u32(&mut out, 3); }
+    nat_put_u32(&mut out, 2);                                   // MH_EXECUTE
+    nat_put_u32(&mut out, ncmds);
+    nat_put_u32(&mut out, sizeofcmds);
+    nat_put_u32(&mut out, 0x00200085);                         // NOUNDEFS|DYLDLINK|TWOLEVEL|PIE
+    nat_put_u32(&mut out, 0);
+    var li: i64 = 0;
+    while li < lc.len() { out.push(lc.get(li)); li = li + 1; }
+    while out.len() < H { out.push(0); }
+    var ii: i64 = 0;
+    while ii < imglen { out.push(image.get(ii)); ii = ii + 1; }
+    while out.len() < le_fileoff { out.push(0); }
+    var k: i64 = 0;
+    while k < rebase.len() { out.push(rebase.get(k)); k = k + 1; }
+    k = 0;
+    while k < bind.len() { out.push(bind.get(k)); k = k + 1; }
+    k = 0;
+    while k < strtab.len() { out.push(strtab.get(k)); k = k + 1; }
+    while out.len() < sig_off { out.push(0); }
+
+    // ── ad-hoc code signature (big-endian) over file [0, sig_off) ──
+    nat_be_u32(&mut out, 0xFADE0CC0);
+    nat_be_u32(&mut out, sig_len);
+    nat_be_u32(&mut out, 1);
+    nat_be_u32(&mut out, 0);
+    nat_be_u32(&mut out, 12);
+    nat_be_u32(&mut out, 0xFADE0C02);
+    nat_be_u32(&mut out, cd_len);
+    nat_be_u32(&mut out, 0x00020400);
+    nat_be_u32(&mut out, 2);                                   // flags adhoc
+    nat_be_u32(&mut out, 88 + ident_len);                      // hashOffset
+    nat_be_u32(&mut out, 88);                                  // identOffset
+    nat_be_u32(&mut out, 0);                                   // nSpecialSlots
+    nat_be_u32(&mut out, ncode);                               // nCodeSlots
+    nat_be_u32(&mut out, sig_off);                             // codeLimit
+    out.push(32); out.push(2); out.push(0); out.push(12);      // hashSize, SHA256, platform, pageShift
+    nat_be_u32(&mut out, 0);                                   // spare2
+    nat_be_u32(&mut out, 0);                                   // scatterOffset
+    nat_be_u32(&mut out, 0);                                   // teamOffset
+    nat_be_u32(&mut out, 0);                                   // spare3
+    nat_put_u64_be(&mut out, 0);                               // codeLimit64
+    nat_put_u64_be(&mut out, 0);                               // execSegBase
+    nat_put_u64_be(&mut out, text_fileend);                    // execSegLimit
+    nat_put_u64_be(&mut out, 1);                               // execSegFlags MAIN_BINARY
+    var idc: i64 = 0;
+    while idc < str_len(ident) { out.push(str_byte_at(ident, idc)); idc = idc + 1; }
+    out.push(0);
+    // Hash from a copy of the signed prefix (the signature cannot borrow
+    // `out` mutably and immutably at once).
+    var body: Vec<i64> = Vec::new();
+    var bj: i64 = 0;
+    while bj < sig_off { body.push(out.get(bj)); bj = bj + 1; }
+    var pg: i64 = 0;
+    while pg < ncode {
+        var lo: i64 = pg * 4096;
+        var hi: i64 = lo + 4096;
+        if hi > sig_off { hi = sig_off; }
+        sha256_into(&mut out, &body, lo, hi);
+        pg = pg + 1;
+    }
+    return out;
 }

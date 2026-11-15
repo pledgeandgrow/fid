@@ -822,6 +822,11 @@ pub struct Interpreter {
     pub kv_caches: Vec<KvCache>,
     pub verbose: bool,
     pub debug_mode: bool,
+    /// Coverage (fid veil): each instruction run, once, in the order first run
+    pub cov_on: bool,
+    pub cov_seen: i64,
+    pub cov_fns: Vec<str>,
+    pub cov_ids: Vec<i64>,
     pub array_bounds: Vec<ArrayBoundEntry>,
     pub current_func_name: str,
     pub call_stack: Vec<str>,
@@ -894,6 +899,10 @@ pub fn Interpreter_new(module: IrModule) -> Interpreter {
         kv_caches: Vec::new(),
         verbose: false,
         debug_mode: true,
+        cov_on: false,
+        cov_seen: HashMap_new(),
+        cov_fns: Vec::new(),
+        cov_ids: Vec::new(),
         array_bounds: Vec::new(),
         current_func_name: "",
         call_stack: Vec::new(),
@@ -1463,6 +1472,15 @@ pub fn Interpreter_run_function(self: &mut Interpreter, func: IrFunction, args: 
                     result = RunResult::Panic("Step limit exceeded: " + int_to_str(self.step_count) + " instructions executed (limit: " + int_to_str(self.max_steps) + ")");
                     done = true;
                     break;
+                }
+            }
+
+            if self.cov_on {
+                var ck: str = func.name + "#" + int_to_str(inst_id);
+                if HashMap_get(self.cov_seen, ck) == 0 {
+                    HashMap_insert(self.cov_seen, ck, 1);
+                    self.cov_fns.push(func.name);
+                    self.cov_ids.push(inst_id);
                 }
             }
 
@@ -5589,10 +5607,16 @@ pub fn Interpreter_get_trace(self: &Interpreter) -> Vec<str> {
     return Vec::new();
 }
 
-/// set_debug_hook — set a debug hook (simplified: no-op in self-hosted).
+/// set_debug_hook — record coverage: every instruction run, once
+/// (Interpreter_cov_count / _cov_fn / _cov_id read it back; fid veil).
 pub fn Interpreter_set_debug_hook(self: &mut Interpreter) {
     self.debug_mode = true;
+    self.cov_on = true;
 }
+
+pub fn Interpreter_cov_count(self: &Interpreter) -> i64 { return self.cov_ids.len(); }
+pub fn Interpreter_cov_fn(self: &Interpreter, i: i64) -> str { return self.cov_fns.get(i); }
+pub fn Interpreter_cov_id(self: &Interpreter, i: i64) -> i64 { return self.cov_ids.get(i); }
 
 /// save_persist_state — save persistent state (simplified: no-op).
 pub fn Interpreter_save_persist_state(self: &Interpreter) {

@@ -1,0 +1,365 @@
+// stdlib/linux_runtime/wasi.fd — the Linux runtime under WASI (release F9)
+//
+// `fid wasm` (compiler/wasm.fd): the Fides runtime of this directory in a
+// WebAssembly module, unchanged. Its system calls (nat_syscall) come here,
+// to pe_wasi_syscall, which does each with WASI preview 1
+// (wasi_snapshot_preview1): the extern "C" functions named wasi_<name> are
+// those imports, compiler/wasm.fd passes each argument as the import's
+// type (pointers and sizes as i32). The process's arguments and
+// environment are laid out as Linux starts a process (nat_start_sp: argc,
+// argv, NULL, envp, NULL). Memory: mmap grows the linear memory, munmap
+// keeps it. Paths are relative to the first preopened directory (fd 3),
+// an absolute one to the second (fd 4; scripts/wasm-run.mjs preopens "."
+// and "/"). Errors are -errno as on Linux. Threads, processes, signals and
+// sockets fail with ENOSYS. Merged only for this target.
+
+extern "C" {
+    fn wasi_fd_write(fd: i64, iovs: i64, n: i64, nwritten: i64) -> i64;
+    fn wasi_fd_read(fd: i64, iovs: i64, n: i64, nread: i64) -> i64;
+    fn wasi_fd_close(fd: i64) -> i64;
+    fn wasi_fd_seek(fd: i64, offset: i64, whence: i64, newoffset: i64) -> i64;
+    fn wasi_fd_readdir(fd: i64, buf: i64, len: i64, cookie: i64, used: i64) -> i64;
+    fn wasi_path_open(dirfd: i64, dirflags: i64, path: i64, path_len: i64, oflags: i64, base: i64, inheriting: i64, fdflags: i64, fd_out: i64) -> i64;
+    fn wasi_path_filestat_get(fd: i64, flags: i64, path: i64, path_len: i64, buf: i64) -> i64;
+    fn wasi_path_unlink_file(fd: i64, path: i64, path_len: i64) -> i64;
+    fn wasi_path_remove_directory(fd: i64, path: i64, path_len: i64) -> i64;
+    fn wasi_path_create_directory(fd: i64, path: i64, path_len: i64) -> i64;
+    fn wasi_path_rename(fd: i64, old: i64, old_len: i64, fd2: i64, new_path: i64, new_len: i64) -> i64;
+    fn wasi_proc_exit(code: i64);
+    fn wasi_clock_time_get(id: i64, precision: i64, out: i64) -> i64;
+    fn wasi_random_get(buf: i64, len: i64) -> i64;
+    fn wasi_args_sizes_get(argc: i64, size: i64) -> i64;
+    fn wasi_args_get(argv: i64, buf: i64) -> i64;
+    fn wasi_environ_sizes_get(n: i64, size: i64) -> i64;
+    fn wasi_environ_get(env: i64, buf: i64) -> i64;
+    fn wasi_sched_yield() -> i64;
+    fn wasi_poll_oneoff(subs: i64, events: i64, n: i64, nevents: i64) -> i64;
+    fn nat_wasm_grow(pages: i64) -> i64;
+}
+
+// Scratch words for the calls (iovecs, results), the process image, the
+// path of the last call, and the cursor of a directory being read
+var pe_wasi_tmp: i64 = 0;
+var pe_wasi_sp: i64 = 0;
+var pe_wasi_pfd: i64 = 3;
+var pe_wasi_pptr: i64 = 0;
+var pe_wasi_plen: i64 = 0;
+var pe_wasi_dir_fd: i64 = 0 - 1;
+var pe_wasi_dir_cookie: i64 = 0;
+var pe_wasi_dir_buf: i64 = 0;
+
+fn pe_wasi_scratch() -> i64 {
+    if pe_wasi_tmp == 0 {
+        pe_wasi_tmp = pert_malloc(128);
+    }
+    return pe_wasi_tmp;
+}
+
+fn pe_wasi_ld32(addr: i64) -> i64 {
+    return pe_ld(addr) & 4294967295;
+}
+
+/// A WASI errno as -errno of Linux
+fn pe_wasi_err(e: i64) -> i64 {
+    if e == 0 { return 0; }
+    if e == 2 { return 0 - 13; }      // EACCES
+    if e == 6 { return 0 - 11; }      // EAGAIN
+    if e == 8 { return 0 - 9; }       // EBADF
+    if e == 20 { return 0 - 17; }     // EEXIST
+    if e == 27 { return 0 - 4; }      // EINTR
+    if e == 28 { return 0 - 22; }     // EINVAL
+    if e == 29 { return 0 - 5; }      // EIO
+    if e == 31 { return 0 - 21; }     // EISDIR
+    if e == 44 { return 0 - 2; }      // ENOENT
+    if e == 48 { return 0 - 12; }     // ENOMEM
+    if e == 51 { return 0 - 28; }     // ENOSPC
+    if e == 52 { return 0 - 38; }     // ENOSYS
+    if e == 54 { return 0 - 20; }     // ENOTDIR
+    if e == 55 { return 0 - 39; }     // ENOTEMPTY
+    if e == 63 { return 0 - 1; }      // EPERM
+    if e == 76 { return 0 - 13; }     // ENOTCAPABLE
+    return 0 - 5;
+}
+
+/// The directory and relative path of `path` for the path calls:
+/// pe_wasi_pfd, pe_wasi_pptr, pe_wasi_plen ("./" and a leading "/" off)
+fn pe_wasi_path(path: i64) {
+    var p: i64 = path;
+    var fd: i64 = 3;
+    if pe_ldb(p) == 47 {
+        fd = 4;
+        while pe_ldb(p) == 47 { p = p + 1; }
+    }
+    while pe_ldb(p) == 46 && pe_ldb(p + 1) == 47 {
+        p = p + 2;
+        while pe_ldb(p) == 47 { p = p + 1; }
+    }
+    var n: i64 = 0;
+    while pe_ldb(p + n) != 0 { n = n + 1; }
+    if n == 0 {
+        p = "." as i64;
+        n = 1;
+    }
+    pe_wasi_pfd = fd;
+    pe_wasi_pptr = p;
+    pe_wasi_plen = n;
+}
+
+/// The WASI filetype of path (0 when it does not exist)
+fn pe_wasi_filetype(path: i64) -> i64 {
+    pe_wasi_path(path);
+    var buf: i64 = pert_malloc(64);
+    var e: i64 = wasi_path_filestat_get(pe_wasi_pfd, 1, pe_wasi_pptr, pe_wasi_plen, buf);
+    var t: i64 = 0;
+    if e == 0 { t = pe_ldb(buf + 16); }
+    pert_free(buf);
+    return t;
+}
+
+fn pe_wasi_openat(path: i64, flags: i64) -> i64 {
+    // O_DIRECTORY (generic 0x4000), or a directory opened to be read
+    var oflags: i64 = 0;
+    if (flags & 64) != 0 { oflags = oflags | 1; }        // O_CREAT
+    if (flags & 128) != 0 { oflags = oflags | 4; }       // O_EXCL
+    if (flags & 512) != 0 { oflags = oflags | 8; }       // O_TRUNC
+    if (flags & 16384) != 0 || ((flags & 3) == 0 && pe_wasi_filetype(path) == 3) {
+        oflags = oflags | 2;
+    }
+    var fdflags: i64 = 0;
+    if (flags & 1024) != 0 { fdflags = 1; }               // O_APPEND
+    pe_wasi_path(path);
+    var out: i64 = pe_wasi_scratch();
+    var e: i64 = wasi_path_open(pe_wasi_pfd, 1, pe_wasi_pptr, pe_wasi_plen, oflags,
+        536870911, 536870911, fdflags, out);
+    if e != 0 { return pe_wasi_err(e); }
+    return pe_wasi_ld32(out);
+}
+
+/// The generic Linux struct stat of path (st_mode at 16, st_size at 48,
+/// st_mtime at 88)
+fn pe_wasi_stat(path: i64, st: i64, flags: i64) -> i64 {
+    pe_wasi_path(path);
+    var buf: i64 = pert_malloc(64);
+    var follow: i64 = 1;
+    if (flags & 256) != 0 { follow = 0; }                // AT_SYMLINK_NOFOLLOW
+    var e: i64 = wasi_path_filestat_get(pe_wasi_pfd, follow, pe_wasi_pptr, pe_wasi_plen, buf);
+    if e != 0 {
+        pert_free(buf);
+        return pe_wasi_err(e);
+    }
+    pe_zero(st, 128);
+    var t: i64 = pe_ldb(buf + 16);
+    var mode: i64 = 33188;                                // S_IFREG | 0644
+    if t == 3 { mode = 16877; }                           // S_IFDIR | 0755
+    if t == 7 { mode = 41471; }                           // S_IFLNK | 0777
+    pe_st(st, pe_ld(buf));
+    pe_st(st + 8, pe_ld(buf + 8));
+    pe_st(st + 16, mode | (1 << 32));
+    pe_st(st + 48, pe_ld(buf + 32));
+    pe_st(st + 56, 4096);
+    pe_st(st + 64, (pe_ld(buf + 32) + 511) / 512);
+    var at: i64 = pe_ld(buf + 40);
+    var mt: i64 = pe_ld(buf + 48);
+    var ct: i64 = pe_ld(buf + 56);
+    pe_st(st + 72, at / 1000000000);
+    pe_st(st + 80, at % 1000000000);
+    pe_st(st + 88, mt / 1000000000);
+    pe_st(st + 96, mt % 1000000000);
+    pe_st(st + 104, ct / 1000000000);
+    pe_st(st + 112, ct % 1000000000);
+    pert_free(buf);
+    return 0;
+}
+
+/// getdents64 over fd_readdir: Linux records (d_ino, d_off, d_reclen,
+/// d_type, d_name NUL) from WASI's (d_next, d_ino, d_namlen, d_type, name)
+fn pe_wasi_getdents(fd: i64, out: i64, count: i64) -> i64 {
+    if pe_wasi_dir_fd != fd {
+        pe_wasi_dir_fd = fd;
+        pe_wasi_dir_cookie = 0;
+    }
+    if pe_wasi_dir_buf == 0 { pe_wasi_dir_buf = pert_malloc(4096); }
+    var buf: i64 = pe_wasi_dir_buf;
+    var used_at: i64 = pe_wasi_scratch();
+    var e: i64 = wasi_fd_readdir(fd, buf, 4096, pe_wasi_dir_cookie, used_at);
+    if e != 0 { return pe_wasi_err(e); }
+    var used: i64 = pe_wasi_ld32(used_at);
+    var off: i64 = 0;
+    var wrote: i64 = 0;
+    while off + 24 <= used {
+        var namlen: i64 = pe_wasi_ld32(buf + off + 16);
+        if off + 24 + namlen > used { break; }
+        var reclen: i64 = (19 + namlen + 1 + 7) & (0 - 8);
+        if wrote + reclen > count { break; }
+        var rec: i64 = out + wrote;
+        pe_st(rec, pe_ld(buf + off + 8));
+        pe_st(rec + 8, pe_ld(buf + off));
+        pe_stb(rec + 16, reclen & 255);
+        pe_stb(rec + 17, (reclen >> 8) & 255);
+        var t: i64 = pe_ldb(buf + off + 20);
+        var dt: i64 = 0;
+        if t == 3 { dt = 4; }
+        if t == 4 { dt = 8; }
+        if t == 7 { dt = 10; }
+        pe_stb(rec + 18, dt);
+        var i: i64 = 0;
+        while i < namlen {
+            pe_stb(rec + 19 + i, pe_ldb(buf + off + 24 + i));
+            i = i + 1;
+        }
+        var j: i64 = 19 + namlen;
+        while j < reclen {
+            pe_stb(rec + j, 0);
+            j = j + 1;
+        }
+        pe_wasi_dir_cookie = pe_ld(buf + off);
+        wrote = wrote + reclen;
+        off = off + 24 + namlen;
+    }
+    return wrote;
+}
+
+/// nanosleep: poll_oneoff on a relative monotonic clock
+fn pe_wasi_sleep(ts: i64) -> i64 {
+    var ns: i64 = pe_ld(ts) * 1000000000 + pe_ld(ts + 8);
+    if ns <= 0 { return 0; }
+    var sub: i64 = pert_malloc(48);
+    pe_zero(sub, 48);
+    pe_st(sub + 16, 1);
+    pe_st(sub + 24, ns);
+    var ev: i64 = pert_malloc(32);
+    var n: i64 = pe_wasi_scratch();
+    wasi_poll_oneoff(sub, ev, 1, n);
+    pert_free(ev);
+    pert_free(sub);
+    return 0;
+}
+
+/// argc, argv[0..argc], NULL, envp..., NULL: as Linux starts a process
+pub fn pe_wasi_start_sp() -> i64 {
+    if pe_wasi_sp != 0 { return pe_wasi_sp; }
+    var tmp: i64 = pert_malloc(16);
+    pe_zero(tmp, 16);
+    wasi_args_sizes_get(tmp, tmp + 8);
+    var argc: i64 = pe_wasi_ld32(tmp);
+    var asize: i64 = pe_wasi_ld32(tmp + 8);
+    pe_zero(tmp, 16);
+    wasi_environ_sizes_get(tmp, tmp + 8);
+    var envc: i64 = pe_wasi_ld32(tmp);
+    var esize: i64 = pe_wasi_ld32(tmp + 8);
+    pert_free(tmp);
+    var abuf: i64 = pert_malloc(asize + 1);
+    var aptrs: i64 = pert_malloc(argc * 4 + 8);
+    wasi_args_get(aptrs, abuf);
+    var ebuf: i64 = pert_malloc(esize + 1);
+    var eptrs: i64 = pert_malloc(envc * 4 + 8);
+    wasi_environ_get(eptrs, ebuf);
+    var sp: i64 = pert_malloc(8 * (argc + envc + 4));
+    pe_st(sp, argc);
+    var i: i64 = 0;
+    while i < argc {
+        pe_st(sp + 8 + i * 8, pe_wasi_ld32(aptrs + i * 4));
+        i = i + 1;
+    }
+    pe_st(sp + 8 + argc * 8, 0);
+    var at: i64 = sp + 16 + argc * 8;
+    i = 0;
+    while i < envc {
+        pe_st(at + i * 8, pe_wasi_ld32(eptrs + i * 4));
+        i = i + 1;
+    }
+    pe_st(at + envc * 8, 0);
+    pe_wasi_sp = sp;
+    return sp;
+}
+
+/// One iovec {buf, len} at the scratch words; fd_write / fd_read of it
+fn pe_wasi_rw(write: bool, fd: i64, buf: i64, n: i64) -> i64 {
+    var t: i64 = pe_wasi_scratch();
+    pe_st(t, (buf & 4294967295) | (n << 32));
+    pe_st(t + 8, 0);
+    var e: i64 = 0;
+    if write { e = wasi_fd_write(fd, t, 1, t + 8); } else { e = wasi_fd_read(fd, t, 1, t + 8); }
+    if e != 0 { return pe_wasi_err(e); }
+    return pe_wasi_ld32(t + 8);
+}
+
+/// Linux system call n (asm-generic numbering) done with WASI
+pub fn pe_wasi_syscall(n: i64, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) -> i64 {
+    if n == 64 { return pe_wasi_rw(true, a, b, c); }                 // write
+    if n == 63 { return pe_wasi_rw(false, a, b, c); }                // read
+    if n == 222 {                                                     // mmap
+        if e >= 0 { return 0 - 38; }
+        var pages: i64 = (b + 65535) / 65536;
+        var old: i64 = nat_wasm_grow(pages);
+        if old < 0 { return 0 - 12; }
+        return old * 65536;
+    }
+    if n == 215 || n == 226 { return 0; }                            // munmap, mprotect
+    if n == 94 || n == 93 {                                           // exit_group, exit
+        wasi_proc_exit(a);
+        return 0;
+    }
+    if n == 56 { return pe_wasi_openat(b, c); }                      // openat
+    if n == 57 {                                                      // close
+        if a == pe_wasi_dir_fd { pe_wasi_dir_fd = 0 - 1; }
+        return pe_wasi_err(wasi_fd_close(a));
+    }
+    if n == 62 {                                                      // lseek
+        var t: i64 = pe_wasi_scratch();
+        var r: i64 = wasi_fd_seek(a, b, c, t);
+        if r != 0 { return pe_wasi_err(r); }
+        return pe_ld(t);
+    }
+    if n == 113 {                                                     // clock_gettime
+        var clk: i64 = 1;
+        if a == 0 { clk = 0; }
+        if a == 2 { clk = 2; }
+        if a == 3 { clk = 3; }
+        var t2: i64 = pe_wasi_scratch();
+        var r2: i64 = wasi_clock_time_get(clk, 1, t2);
+        if r2 != 0 { return pe_wasi_err(r2); }
+        var ns: i64 = pe_ld(t2);
+        pe_st(b, ns / 1000000000);
+        pe_st(b + 8, ns % 1000000000);
+        return 0;
+    }
+    if n == 278 {                                                     // getrandom
+        var r3: i64 = wasi_random_get(a, b);
+        if r3 != 0 { return pe_wasi_err(r3); }
+        return b;
+    }
+    if n == 79 { return pe_wasi_stat(b, c, d); }                     // newfstatat
+    if n == 35 {                                                      // unlinkat
+        pe_wasi_path(b);
+        if (c & 512) != 0 {
+            return pe_wasi_err(wasi_path_remove_directory(pe_wasi_pfd, pe_wasi_pptr, pe_wasi_plen));
+        }
+        return pe_wasi_err(wasi_path_unlink_file(pe_wasi_pfd, pe_wasi_pptr, pe_wasi_plen));
+    }
+    if n == 34 {                                                      // mkdirat
+        pe_wasi_path(b);
+        return pe_wasi_err(wasi_path_create_directory(pe_wasi_pfd, pe_wasi_pptr, pe_wasi_plen));
+    }
+    if n == 276 {                                                     // renameat2
+        pe_wasi_path(b);
+        var ofd: i64 = pe_wasi_pfd;
+        var optr: i64 = pe_wasi_pptr;
+        var olen: i64 = pe_wasi_plen;
+        pe_wasi_path(d);
+        return pe_wasi_err(wasi_path_rename(ofd, optr, olen, pe_wasi_pfd, pe_wasi_pptr, pe_wasi_plen));
+    }
+    if n == 61 { return pe_wasi_getdents(a, b, c); }                 // getdents64
+    if n == 101 { return pe_wasi_sleep(a); }                         // nanosleep
+    if n == 124 { wasi_sched_yield(); return 0; }                    // sched_yield
+    if n == 123 {                                                     // sched_getaffinity
+        pe_zero(c, 8);
+        pe_stb(c, 1);
+        return 8;
+    }
+    if n == 172 || n == 178 { return 1; }                            // getpid, gettid
+    if n == 173 || n == 174 || n == 176 { return 0; }                // getppid, getuid, getgid
+    // rt_sigaction, sigaltstack, futex: nothing to do in one thread
+    if n == 134 || n == 132 || n == 98 { return 0; }
+    return 0 - 38;
+}

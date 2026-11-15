@@ -646,6 +646,60 @@ fn is_def_body_brace_at(tokens: Vec<FTok>, idx: i64) -> bool {
     }
 }
 
+/// Whether the `<` at `idx` is closed by a matching `>` (or `>>`, which
+/// closes two) with only what a type can hold in between: names, numbers,
+/// `,` `:` `::` `&` `*` `->`, brackets and parentheses (a `;` only inside
+/// `[T; N]`), and is then not followed by a name or a literal. `a < b`,
+/// `a < b && c > d` and `f(a < b)` are comparisons; `Vec<Vec<i64>>` is a
+/// generic.
+fn generic_closes(tokens: Vec<FTok>, idx: i64) -> bool {
+    var depth: i64 = 1;
+    var brackets: i64 = 0;
+    var parens: i64 = 0;
+    var i: i64 = idx + 1;
+    var n: i64 = tokens.len();
+    var seen: i64 = 0;
+    while i < n && seen < 128 {
+        var t: FTok = tokens.get(i);
+        if is_significant(t) {
+            seen = seen + 1;
+            match t {
+                FTok::Word(_) => {}
+                FTok::Number(_) => {}
+                FTok::Punct(p) => {
+                    var closed: bool = false;
+                    if p == "<" { depth = depth + 1; }
+                    else if p == ">" { depth = depth - 1; closed = depth == 0; }
+                    else if p == ">>" {
+                        depth = depth - 2;
+                        if depth < 0 { return false; }
+                        closed = depth == 0;
+                    }
+                    else if p == "[" { brackets = brackets + 1; }
+                    else if p == "]" { if brackets == 0 { return false; } brackets = brackets - 1; }
+                    else if p == "(" { parens = parens + 1; }
+                    else if p == ")" { if parens == 0 { return false; } parens = parens - 1; }
+                    else if p == ";" { if brackets == 0 { return false; } }
+                    else if p == "," || p == ":" || p == "::" || p == "&" || p == "*" || p == "->" {}
+                    else { return false; }
+                    if closed {
+                        match next_significant(tokens, i + 1) {
+                            FTok::Word(_) => { return false; }
+                            FTok::Number(_) => { return false; }
+                            FTok::Str(_) => { return false; }
+                            FTok::FStr(_) => { return false; }
+                            _ => { return true; }
+                        }
+                    }
+                }
+                _ => { return false; }
+            }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
 /// Check if `<` at position `idx` is a generic bracket (type parameters) vs
 /// a comparison operator.
 fn is_generic_open(tokens: Vec<FTok>, idx: i64) -> bool {
@@ -656,9 +710,10 @@ fn is_generic_open(tokens: Vec<FTok>, idx: i64) -> bool {
             if is_cond_or_match_kw(p) { return false; }
             if is_type_word(p) { return false; }
             match nxt {
-                FTok::Word(_) => { return true; }
+                FTok::Word(_) => { return generic_closes(tokens, idx); }
                 FTok::Punct(gp) => {
                     if gp == ">" { return true; }
+                    if gp == "(" || gp == "[" || gp == "&" || gp == "*" { return generic_closes(tokens, idx); }
                     return false;
                 }
                 _ => { return false; }
@@ -850,6 +905,7 @@ pub fn format_source(src: str) -> str {
     var at_line_start: bool = true;
     var pending_blanks: i64 = 0;
     var prev_sig: str = "";
+    var prev_closed_generic: bool = false;  // the token before closed a generic
     var just_closed_top_level: bool = false;
     var brace_depth: i64 = 0;
     var paren_depth: i64 = 0;
@@ -979,12 +1035,26 @@ pub fn format_source(src: str) -> str {
         }
 
         var cur_is_generic_close: bool = false;
+        var close_count: i64 = 1;
         match tok {
             FTok::Punct(p) => {
                 if p == ">" {
                     if generic_depth > 0 {
                         cur_is_generic_close = true;
                     }
+                }
+                // `>>` closes two generics (`Vec<Vec<i64>>`); outside a
+                // generic it is a shift
+                if p == ">>" {
+                    if generic_depth > 0 {
+                        cur_is_generic_close = true;
+                        close_count = 2;
+                    }
+                }
+                // A generic never spans a statement or a block: whatever
+                // opened one by mistake ends here
+                if p == ";" || p == "{" || p == "}" || p == "=" {
+                    generic_depth = 0;
                 }
             }
             _ => {}
@@ -1011,12 +1081,11 @@ pub fn format_source(src: str) -> str {
         }
         if cur_is_generic_close {
             need_space_before = false;
-            if generic_depth > 0 {
-                generic_depth = generic_depth - 1;
-            }
+            generic_depth = generic_depth - close_count;
+            if generic_depth < 0 { generic_depth = 0; }
         }
         // After generic close >, no space before ( (function params)
-        if prev_sig == ">" {
+        if prev_closed_generic {
             match tok {
                 FTok::Punct(p) => {
                     if p == "(" {
@@ -1076,6 +1145,7 @@ pub fn format_source(src: str) -> str {
 
         // Update prev_sig
         prev_sig = text;
+        prev_closed_generic = cur_is_generic_close;
 
         // Update brace tracking and newline decisions
         match tok {
@@ -1174,6 +1244,35 @@ pub fn format_source(src: str) -> str {
 
 /// Check if source is already formatted. Returns true if formatting would
 /// NOT change it.
+/// Whether `a` and `b` hold the same tokens and comments in the same order
+/// (only spacing and blank lines may differ): what formatting may change.
+/// `fid fmt` writes nothing when this fails, so a formatter bug cannot
+/// corrupt the file.
+pub fn fmt_same_tokens(a: str, b: str) -> bool {
+    var ta: Vec<FTok> = fmt_tokenize(a);
+    var tb: Vec<FTok> = fmt_tokenize(b);
+    var i: i64 = 0;
+    var j: i64 = 0;
+    while true {
+        while i < ta.len() && fmt_ignorable(ta.get(i)) { i = i + 1; }
+        while j < tb.len() && fmt_ignorable(tb.get(j)) { j = j + 1; }
+        if i >= ta.len() || j >= tb.len() { return i >= ta.len() && j >= tb.len(); }
+        if str_trim(ftok_text(ta.get(i))) != str_trim(ftok_text(tb.get(j))) { return false; }
+        i = i + 1;
+        j = j + 1;
+    }
+    return true;
+}
+
+fn fmt_ignorable(t: FTok) -> bool {
+    match t {
+        FTok::BlankLines(_) => { return true; }
+        FTok::Eof => { return true; }
+        _ => {}
+    }
+    return false;
+}
+
 pub fn is_formatted(src: str) -> bool {
     return format_source(src) == src;
 }

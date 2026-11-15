@@ -242,8 +242,10 @@ RUST BOOTSTRAP (reference + test harness):
 
 WINDOWS INSTALLER (v1.0.0):
   installer/:     NSIS script + build helper
-  CI:            .github/workflows/build-installer.yml is not in this
-                 checkout (no .github/ directory); the user runs CI
+  CI:            .github/workflows/ci.yml (Nov 15): Rust build + unit tests
+                 on Linux/Windows, a one-stage fid build, hello and the
+                 leak gate. The full suite and cross targets run before a
+                 release (docs/reference/releasing.md, scripts/ci/cross.yml)
   Output:        Fides-Setup-1.0.0.exe (2.5 MB, tested on Windows)
   Ships:         fid.exe = self-hosted (release/fid.exe), fidesc.exe =
                  Rust compiler, stdlib/ and examples/ beside them

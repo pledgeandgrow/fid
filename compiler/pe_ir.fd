@@ -511,6 +511,14 @@ pub fn PeirGen_generate(self: &mut PeirGen, module: &IrModule) -> Vec {
     if self.bare_mode {
         all_strings.push("panic: ");
         all_strings.push("Panic: ");
+        if pe_bare_boot_on() {
+            // the default CPU exception handler's message (release G1)
+            all_strings.push("CPU exception");
+            all_strings.push("panic: CPU exception ");
+            all_strings.push(", error ");
+            all_strings.push(", rip ");
+            all_strings.push(", address ");
+        }
         PeirRdata_build_strings(&mut rdata, all_strings);
     } else {
         PeirRdata_build(&mut rdata, all_strings);
@@ -836,6 +844,32 @@ pub fn PeirGen_generate(self: &mut PeirGen, module: &IrModule) -> Vec {
 
     // 6. Generate entry point (_main)
     if self.bare_mode {
+        // A bootable image wires each @interrupt(N) function to its IDT
+        // vector, and a void main exits with 0
+        g_pe_bare_irqs = Vec::new();
+        g_pe_bare_main_void = false;
+        if pe_bare_boot_on() {
+            var ivi: i64 = 0;
+            while ivi < func_names.len() {
+                match IrModule_get_function(module, func_names.get(ivi)) {
+                    OptIrFunction::Some(ivf) => {
+                        if ivf.interrupt_vector >= 0 && ivf.interrupt_vector < 256
+                            && HashMap_contains(self.func_labels, ivf.name) {
+                            g_pe_bare_irqs.push(ivf.interrupt_vector);
+                            g_pe_bare_irqs.push(HashMap_get(self.func_labels, ivf.name));
+                        }
+                        if ivf.name == "main" {
+                            match ivf.ret_ty {
+                                IrType::Void => { g_pe_bare_main_void = true; }
+                                _ => {}
+                            }
+                        }
+                    }
+                    OptIrFunction::None => {}
+                }
+                ivi = ivi + 1;
+            }
+        }
         PeirEnc_align_to(&mut self.enc, 16);
         PeirEnc_place_label(&mut self.enc, bare_entry);
     }
@@ -849,9 +883,13 @@ pub fn PeirGen_generate(self: &mut PeirGen, module: &IrModule) -> Vec {
 
     // A flat binary (release G2): [code][int3 to a 4 KB boundary][data],
     // loaded at g_pe_bare_load, entered at its first byte
+    // A bootable image (release G1) puts PEIR_BOOT_PREFIX bytes of boot
+    // headers and mode switch in front: the code starts after them.
     if self.bare_mode {
-        var flat_data: i64 = g_pe_bare_load + pe_align_up(self.enc.code.len(), PE_SECTION_ALIGN);
-        PeirEnc_resolve_rip_refs(&mut self.enc, g_pe_bare_load, flat_data);
+        var code_base: i64 = g_pe_bare_load;
+        if pe_bare_boot_on() { code_base = g_pe_bare_load + PEIR_BOOT_PREFIX; }
+        var flat_data: i64 = code_base + pe_align_up(self.enc.code.len(), PE_SECTION_ALIGN);
+        PeirEnc_resolve_rip_refs(&mut self.enc, code_base, flat_data);
         var fpi: i64 = 0;
         while fpi < global_str_patches.len() {
             var fslot: i64 = global_str_patches.get(fpi);
@@ -864,6 +902,10 @@ pub fn PeirGen_generate(self: &mut PeirGen, module: &IrModule) -> Vec {
             fpi = fpi + 2;
         }
         var flat: Vec = Vec::new();
+        if pe_bare_boot_on() {
+            flat = pe_bare_boot_prefix(g_pe_bare_load,
+                code_base + self.enc.labels.get(g_pe_bare_boot_label));
+        }
         var ci: i64 = 0;
         while ci < self.enc.code.len() {
             flat.push(self.enc.code.get(ci));
@@ -940,7 +982,16 @@ pub fn PeirGen_gen_function(self: &mut PeirGen, name: str, func: &IrFunction, mo
         // epilogue's iretq works correctly.
 
         // Check if this vector pushes an error code
-        if pe_interrupt_has_err(func.interrupt_vector) {
+        if pe_interrupt_has_err(func.interrupt_vector) && self.bare_mode && PEIR_BARE_BOOT {
+            // The error code to 0x510 and off the stack, rax kept (release
+            // G1: rax used to come back as the error code)
+            PeirEnc_push(&mut self.enc, PEIR_RAX);
+            peir_emit8(&mut self.enc, 0x48, 0x8B, 0x44, 0x24, 0x08, 0x90, 0x90, 0x90); // mov rax, [rsp+8]
+            peir_emit8(&mut self.enc, 0x48, 0x89, 0x04, 0x25, 0x10, 0x05, 0x00, 0x00); // mov [0x510], rax
+            PeirEnc_pop(&mut self.enc, PEIR_RAX);
+            peir_emit2(&mut self.enc, 0x48, 0x83);
+            peir_emit2(&mut self.enc, 0xC4, 0x08);                                       // add rsp, 8
+        } else if pe_interrupt_has_err(func.interrupt_vector) {
             // Pop error code into RAX, save to 0x510, then push RAX back
             PeirEnc_pop(&mut self.enc, PEIR_RAX);
             // mov [0x510], rax
@@ -3089,8 +3140,10 @@ pub fn PeirGen_gen_inst(
                 PeirEnc_pop(&mut self.enc, PEIR_RBX);
                 PeirEnc_pop(&mut self.enc, PEIR_RAX);
                 // For exceptions with error codes, push dummy error code
-                // so iretq sees the correct stack layout
-                if pe_interrupt_has_err(func.interrupt_vector) {
+                // so iretq sees the correct stack layout (it does not: the
+                // prologue removed the error code, iretq would take the 0
+                // for rip; the bootable bare image leaves it out)
+                if pe_interrupt_has_err(func.interrupt_vector) && !(self.bare_mode && PEIR_BARE_BOOT) {
                     // push 0 (dummy error code)
                     peir_emit2(&mut self.enc, 0x6A, 0x00);
                 }
@@ -4555,7 +4608,23 @@ pub fn pe_ir_generate_flat(module: IrModule, panic_handler: str) -> ResultBytes 
     g_pe_asm_errors = Vec::new();
     var gen: PeirGen = PeirGen_new();
     gen.bare_mode = true;
+    // A bootable image is loaded at g_pe_bare_boot_load (release G1)
+    var saved_load: i64 = g_pe_bare_load;
+    if pe_bare_boot_on() {
+        if g_pe_bare_boot_load < 0x100000 || g_pe_bare_boot_load % PE_SECTION_ALIGN != 0
+            || g_pe_bare_boot_load + 0x1000000 > 0xFFFFFFFF {
+            return ResultBytes::Err(c_vec1("bare-metal build: the load address must be 4 KB aligned, at or above 0x100000 (below it are the boot tables) and below 0xFF000000"));
+        }
+        g_pe_bare_load = g_pe_bare_boot_load;
+    }
     var bytes: Vec = PeirGen_generate(&mut gen, &module);
+    g_pe_bare_load = saved_load;
+    if pe_bare_boot_on() && g_pe_bare_boot_load < g_pe_bare_heap
+        && g_pe_bare_boot_load + bytes.len() > g_pe_bare_heap {
+        return ResultBytes::Err(c_vec1("bare-metal build: the image (" + int_to_str(bytes.len())
+            + " bytes) loaded at " + "0x" + int_to_hex(g_pe_bare_boot_load) + " runs into the heap at "
+            + "0x" + int_to_hex(g_pe_bare_heap) + ": give a higher --load address"));
+    }
     if g_pe_asm_errors.len() > 0 {
         return ResultBytes::Err(g_pe_asm_errors);
     }

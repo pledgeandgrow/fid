@@ -120,7 +120,19 @@ in memory. This track is where most of the speed is.
       Done (Nov 4): `fid emit` runs `compiler/iropt.fd` before code generation.
 - [ ] OP2. Real SSA: promote stack slots to values (mem2reg) before any other pass
       (L).
-- [ ] OP3. Dominator tree, loop tree and use lists shared by every pass (M).
+- [~] OP3. Dominator tree, loop tree and use lists shared by every pass (M).
+      Partial (this session): `IroCfg` already carried `idom`; added a
+      dominator-tree DFS interval numbering (`tin`/`tout`) built once per
+      `iro_cfg`, so `iro_dominates` is O(1) instead of walking the idom
+      chain per query — the passes that query it in O(n^2) loops (gvn,
+      branchfacts) get the win. `iro_simplify` rebuilt `iro_uses(f)`
+      (O(n)) after every edit; it now maintains `count`/`block_of`
+      incrementally (`iro_uses_drop`/`iro_uses_add_ops`/`iro_uses_reg`).
+      Verified: emitted binary byte-identical and pass-change counts
+      identical before/after on the native path. Left: a `loop` tree
+      object shared across passes (each loop pass still finds its own),
+      and analyses shared between passes rather than rebuilt per pass —
+      that needs per-pass invalidation tracking.
 - [ ] OP4. One pass manager, with per-pass timing and a switch to turn each off (M).
 
 **Classic passes**
@@ -144,14 +156,37 @@ in memory. This track is where most of the speed is.
       operations on such values move to the block before the loop. Left: the
       Vec's data pointer (needs the header loads in the IR), arithmetic that
       may trap.
-- [ ] OP10. Strength reduction and induction variables (M).
+- [~] OP10. Strength reduction and induction variables (M).
+      Partial (this session, `iro_iv`, gate `FID_IROPT_OFF=iv`,
+      debug `FID_IV_DBG=1`): finds a plain local stored once per
+      iteration as `L = L +/- d` (constant step), and for a multiply
+      `w = Load(L) * c` in the same block as its feeding load with no
+      `Store(L)` between, swaps in a shadow local initialized `L*c` in
+      the preheader and bumped `c*d` right after `L`'s store. Natural
+      loops found by dominator back-edges (OP3's O(1) check). Verified
+      on `@wrapping` loops: results identical to `FID_IROPT_OFF=iv`.
+      **The gate is `f.is_wrapping`, and that is the honest limit, not
+      laziness**: the shadow computes `next_i*c` one iteration ahead —
+      under defined panic-on-overflow the early product can trap where
+      the original multiply never ran (even a proved-unchecked multiply
+      only bounds iterations that execute). Widening needs range
+      analysis that covers the IV's exit value — OP24's "ranges of
+      locals across iterations" is the prerequisite.
 - [~] OP11. Loop unrolling, peeling and rotation (M). Rotation done Nov 7
       (native): a block that jumps back to a header made only of the loop's test
       (loads, constants, integer operations, `len`) runs that test itself, so an
       iteration takes one branch. Left: unrolling, peeling.
 - [ ] OP12. Scalar replacement of structs, and returning small structs in registers
       (L).
-- [ ] OP13. Tail calls, tail recursion into loops (M).
+- [~] OP13. Tail calls, tail recursion into loops (M).
+      Verified (this session): `iro_tailcalls` (native path, on) already
+      converts self-recursive tail calls (`return f(args)` where the
+      call's only use is the return) into a loop — param slots in a new
+      entry block, args stored, jump to the old entry. A 1M-deep
+      recursive `loop_sum` runs without stack growth. Left (the real
+      `tail calls` half): sibling proper tail calls `return g(x)` need
+      ABI-level `jmp` + frame teardown in `nat_ir` — different work,
+      not an IR transform.
 - [ ] OP14. Devirtualization of trait calls and closures (M).
 - [~] OP15. Block layout for hot paths, using likely branches (M). Native: no jump to
       the block laid out next; a branch inverts its condition to fall through.

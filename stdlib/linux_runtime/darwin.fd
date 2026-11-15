@@ -1,0 +1,337 @@
+// stdlib/linux_runtime/darwin.fd — the Linux runtime on macOS (x86-64 and
+// arm64), release F7.
+//
+// `fid emit --target aarch64-macos|x86_64-macos` (compiler/nat_ir.fd,
+// nat_generate_macho): the machine layer's code in a Mach-O, the Linux
+// runtime of this directory unchanged over it. Its system calls
+// (nat_syscall) come here, to pe_mac_syscall, which does each by calling a
+// libSystem function through nat_mac_call(k, ...): k is the import's index
+// in ng_mac_imports (the PE_M_* constants below, in the same order).
+// macOS kernel syscall numbers are private, so everything goes through
+// libSystem. Merged only for the macOS targets.
+//
+// struct stat differs from Linux: pe_mac_stat fills the Linux layout the
+// shared runtime (sys.fd) reads, as win.fd does. Threads are pthreads;
+// the thread pointer is a pthread key; futexes are __ulock_wait/wake.
+
+extern "C" {
+    fn nat_mac_call(k: i64, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) -> i64;
+    fn nat_mac_thread_tramp() -> i64;
+    fn nat_os() -> i64;
+    fn nat_arch() -> i64;
+}
+
+// The imports (compiler/nat_ir.fd ng_mac_imports): keep the same order.
+const PE_M_WRITE: i64 = 0;
+const PE_M_READ: i64 = 1;
+const PE_M_CLOSE: i64 = 2;
+const PE_M_EXIT: i64 = 3;
+const PE_M_MMAP: i64 = 4;
+const PE_M_MUNMAP: i64 = 5;
+const PE_M_MPROTECT: i64 = 6;
+const PE_M_OPEN: i64 = 7;
+const PE_M_LSEEK: i64 = 8;
+const PE_M_FSTATAT: i64 = 9;
+const PE_M_CLOCK_GETTIME: i64 = 10;
+const PE_M_NANOSLEEP: i64 = 11;
+const PE_M_SCHED_YIELD: i64 = 12;
+const PE_M_GETPID: i64 = 13;
+const PE_M_ARC4RANDOM: i64 = 14;
+const PE_M_PTHREAD_CREATE: i64 = 15;
+const PE_M_PTHREAD_JOIN: i64 = 16;
+const PE_M_PTHREAD_SELF: i64 = 17;
+const PE_M_KEY_CREATE: i64 = 18;
+const PE_M_GETSPECIFIC: i64 = 19;
+const PE_M_SETSPECIFIC: i64 = 20;
+const PE_M_ULOCK_WAIT: i64 = 21;
+const PE_M_ULOCK_WAKE: i64 = 22;
+const PE_M_SIGACTION: i64 = 23;
+const PE_M_SYSCTLBYNAME: i64 = 24;
+const PE_M_UNLINKAT: i64 = 25;
+const PE_M_MKDIRAT: i64 = 26;
+const PE_M_RENAMEAT: i64 = 27;
+const PE_M_GETDIRENTRIES: i64 = 28;
+const PE_M_FTRUNCATE: i64 = 29;
+const PE_M_KILL: i64 = 30;
+const PE_M_SIGALTSTACK: i64 = 31;
+const PE_M_PTHREAD_ATTR_INIT: i64 = 32;
+const PE_M_PTHREAD_ATTR_SETSTACK: i64 = 33;
+const PE_M_PTHREAD_ATTR_SETDETACH: i64 = 34;
+const PE_M_ABORT: i64 = 35;
+
+fn pe_m(k: i64, a: i64, b: i64, c: i64) -> i64 {
+    return nat_mac_call(k, a, b, c, 0, 0, 0);
+}
+
+var pe_mac_top: i64 = 0;        // the start block (nat_start_sp reads it)
+var pe_mac_info: i64 = 0;       // the siginfo handed to pe_on_signal
+var pe_mac_tls_key: i64 = 0;    // *i64: the pthread key for the thread block
+var pe_mac_key_ready: bool = false;
+
+// ─── Start ──────────────────────────────────────────────────────────────
+
+/// Build the Linux-style start block (argc, argv, 0, envp, 0, 0) the shared
+/// runtime reads at nat_start_sp, from the argc/argv/envp the Mach-O entry
+/// received. Returns the block.
+pub fn pe_mac_start(argc: i64, argv: i64, envp: i64) -> i64 {
+    var nenv: i64 = 0;
+    if envp != 0 {
+        while pe_ld(envp + nenv * 8) != 0 { nenv = nenv + 1; }
+    }
+    var words: i64 = 1 + argc + 1 + nenv + 3;
+    var block: i64 = pert_malloc(words * 8);
+    pe_st(block, argc);
+    var w: i64 = block + 8;
+    var i: i64 = 0;
+    while i < argc {
+        pe_st(w, pe_ld(argv + i * 8));
+        w = w + 8;
+        i = i + 1;
+    }
+    pe_st(w, 0);
+    w = w + 8;
+    i = 0;
+    while i < nenv {
+        pe_st(w, pe_ld(envp + i * 8));
+        w = w + 8;
+        i = i + 1;
+    }
+    pe_st(w, 0);
+    pe_st(w + 8, 0);
+    pe_st(w + 16, 0);
+    pe_mac_info = pert_malloc(128);
+    pe_zero(pe_mac_info, 128);
+    pe_mac_top = block;
+    return block;
+}
+
+// ─── Thread pointer: a pthread key ──────────────────────────────────────
+
+fn pe_mac_key() -> i64 {
+    if !pe_mac_key_ready {
+        pe_mac_key_ready = true;
+        pe_mac_tls_key = pert_malloc(8);
+        pe_st(pe_mac_tls_key, 0);
+        pe_m(PE_M_KEY_CREATE, pe_mac_tls_key, 0, 0);
+    }
+    return pe_ld(pe_mac_tls_key);
+}
+
+pub fn nat_tls_get_mac() -> i64 {
+    return pe_m(PE_M_GETSPECIFIC, pe_mac_key(), 0, 0);
+}
+
+pub fn nat_tls_set_mac(v: i64) {
+    pe_m(PE_M_SETSPECIFIC, pe_mac_key(), v, 0);
+}
+
+// ─── Threads: pthreads ──────────────────────────────────────────────────
+
+/// nat_clone_thread: entry(env 0, arg) on a new pthread with the thread
+/// block tls; *ctid cleared (and woken) when it is done. The stack the
+/// shared runtime made (stack_top) is not used — pthreads have their own.
+pub fn pe_mac_clone(entry: i64, arg: i64, stack_top: i64, ctid: i64, tls: i64) -> i64 {
+    var p: i64 = pert_malloc(32);
+    pe_st(p, entry);
+    pe_st(p + 8, arg);
+    pe_st(p + 16, ctid);
+    pe_st(p + 24, tls);
+    var th: i64 = pert_malloc(8);
+    pe_st(th, 0);
+    // pthread_create(&thread, NULL, tramp, p)
+    var r: i64 = nat_mac_call(PE_M_PTHREAD_CREATE, th, 0, nat_mac_thread_tramp(), p, 0, 0);
+    pert_free(th);
+    if r != 0 {
+        pert_free(p);
+        return 0 - 11;
+    }
+    pe_st(ctid, 1);
+    return 1;
+}
+
+/// A thread's first function (nat_mac_thread_tramp): never returns normally.
+pub fn pe_mac_thread_main(p: i64) -> i64 {
+    var entry: i64 = pe_ld(p);
+    var ctid: i64 = pe_ld(p + 16);
+    nat_tls_set_mac(pe_ld(p + 24));
+    var argv: i64 = pert_malloc(64);
+    pe_zero(argv, 64);
+    pe_st(argv, pe_ld(p + 8));
+    pert_free(p);
+    nat_call_fn(entry, 1, argv);
+    pert_free(argv);
+    nat_atomic_store(ctid, 0);
+    pe_m(PE_M_ULOCK_WAKE, 1, ctid, 0);        // UL_COMPARE_AND_WAIT | wake
+    return 0;
+}
+
+// ─── Memory ─────────────────────────────────────────────────────────────
+
+fn pe_mac_mmap(n: i64) -> i64 {
+    // mmap(0, n, PROT_READ|WRITE, MAP_PRIVATE|MAP_ANON, -1, 0); macOS
+    // MAP_ANON = 0x1000, MAP_PRIVATE = 0x2
+    var a: i64 = nat_mac_call(PE_M_MMAP, 0, n, 3, 0x1002, 0 - 1, 0);
+    if a == 0 - 1 { return 0; }
+    return a;
+}
+
+fn pe_mac_mprotect(addr: i64, len: i64, prot: i64) -> i64 {
+    if pe_m(PE_M_MPROTECT, addr, len, prot) < 0 { return 0 - 22; }
+    return 0;
+}
+
+// ─── Files ──────────────────────────────────────────────────────────────
+
+/// Fill the Linux struct stat the shared runtime reads from a macOS
+/// fstatat into a temporary. macOS `struct stat`: st_mode at 4 (u16),
+/// st_size at 96 (off_t), st_mtime (timespec) at 48. The shared runtime
+/// reads st_mode at 16 (generic) or 24 (x86-64), st_size at 48, st_mtime
+/// at 88.
+fn pe_mac_stat(path: i64, st: i64) -> i64 {
+    var buf: i64 = pert_malloc(160);
+    pe_zero(buf, 160);
+    // fstatat(AT_FDCWD = -2, path, buf, 0)
+    var r: i64 = nat_mac_call(PE_M_FSTATAT, 0 - 2, path, buf, 0, 0, 0);
+    if r < 0 {
+        pert_free(buf);
+        return 0 - 2;
+    }
+    var mode: i64 = pe_ld(buf + 4) & 0xFFFF;
+    var size: i64 = pe_ld(buf + 96);
+    var mtime: i64 = pe_ld(buf + 48);
+    var mtime_ns: i64 = pe_ld(buf + 56);
+    pe_zero(st, 144);
+    var mode_at: i64 = 16;
+    if nat_arch() == 3 { mode_at = 24; }
+    pe_st(st + mode_at, mode);
+    pe_st(st + 48, size);
+    pe_st(st + 88, mtime);
+    pe_st(st + 96, mtime_ns);
+    pert_free(buf);
+    return 0;
+}
+
+fn pe_mac_errno_ret(r: i64) -> i64 {
+    // libc returns -1 and sets errno; we cannot read errno easily, so map
+    // a failure to a generic -EIO (the shared runtime only checks < 0).
+    if r < 0 { return 0 - 5; }
+    return r;
+}
+
+// ─── Signals ────────────────────────────────────────────────────────────
+
+fn pe_mac_sigaction(sig: i64, act: i64) -> i64 {
+    // sigaction(sig, act, NULL)
+    return pe_m(PE_M_SIGACTION, sig, act, 0);
+}
+
+// ─── Clocks ─────────────────────────────────────────────────────────────
+
+fn pe_mac_clock(clk: i64, ts: i64) -> i64 {
+    // clock_gettime is in libSystem on macOS 10.12+. clk: 0 REALTIME, else
+    // MONOTONIC (6 on macOS).
+    var c: i64 = 0;
+    if clk != 0 && clk != 5 && clk != 8 { c = 6; }
+    return pe_m(PE_M_CLOCK_GETTIME, c, ts, 0);
+}
+
+// ─── Futex via __ulock ──────────────────────────────────────────────────
+// __ulock_wait(operation, addr, value, timeout_us); operation
+// UL_COMPARE_AND_WAIT = 1. __ulock_wake(operation, addr, 0).
+
+fn pe_mac_futex(addr: i64, op: i64, val: i64, ts: i64) -> i64 {
+    var cmd: i64 = op & 127;
+    if cmd == 0 || cmd == 9 {                                 // WAIT
+        var us: i64 = 0;                                      // 0 = no timeout
+        if ts != 0 { us = pe_ld(ts) * 1000000 + pe_ld(ts + 8) / 1000; }
+        nat_mac_call(PE_M_ULOCK_WAIT, 1, addr, val & 0xFFFFFFFF, us, 0, 0);
+        return 0;
+    }
+    if cmd == 1 || cmd == 10 {                                // WAKE
+        var o: i64 = 1;
+        if val != 1 { o = 1 | 0x100; }                        // ULF_WAKE_ALL
+        nat_mac_call(PE_M_ULOCK_WAKE, o, addr, 0, 0, 0, 0);
+        return 0;
+    }
+    return 0 - 38;
+}
+
+fn pe_mac_cpus() -> i64 {
+    var out: i64 = pert_malloc(8);
+    pe_st(out, 0);
+    var sz: i64 = pert_malloc(8);
+    pe_st(sz, 8);
+    // sysctlbyname("hw.ncpu", out, &len, NULL, 0)
+    nat_mac_call(PE_M_SYSCTLBYNAME, "hw.ncpu" as i64, out, sz, 0, 0, 0);
+    var n: i64 = pe_ld(out) & 0xFFFFFFFF;
+    pert_free(out);
+    pert_free(sz);
+    if n < 1 { n = 1; }
+    return n;
+}
+
+fn pe_mac_affinity(size: i64, mask: i64) -> i64 {
+    var n: i64 = pe_mac_cpus();
+    pe_zero(mask, size);
+    var i: i64 = 0;
+    while i < n && i < size * 8 {
+        pe_stb(mask + i / 8, pe_ldb(mask + i / 8) | (1 << (i % 8)));
+        i = i + 1;
+    }
+    return ((n + 63) / 64) * 8;
+}
+
+/// Every system call of the shared runtime (generic Linux numbers), on
+/// macOS through libSystem.
+pub fn pe_mac_syscall(n: i64, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) -> i64 {
+    if n == 63 { return pe_mac_errno_ret(pe_m(PE_M_READ, a, b, c)); }         // read
+    if n == 64 { return pe_mac_errno_ret(pe_m(PE_M_WRITE, a, b, c)); }        // write
+    if n == 56 {                                                             // openat
+        // openat(AT_FDCWD=-2, path, flags, mode)
+        var fd: i64 = nat_mac_call(PE_M_OPEN, 0 - 2, b, c, d, 0, 0);
+        return pe_mac_errno_ret(fd);
+    }
+    if n == 57 { return pe_mac_errno_ret(pe_m(PE_M_CLOSE, a, 0, 0)); }        // close
+    if n == 62 { return pe_mac_errno_ret(pe_m(PE_M_LSEEK, a, b, c)); }        // lseek
+    if n == 79 { return pe_mac_stat(b, c); }                                 // newfstatat
+    if n == 61 { return pe_mac_errno_ret(pe_m(PE_M_GETDIRENTRIES, a, b, c)); } // getdents64 ~ getdirentries
+    if n == 35 {                                                             // unlinkat
+        return pe_mac_errno_ret(nat_mac_call(PE_M_UNLINKAT, 0 - 2, b, c, 0, 0, 0));
+    }
+    if n == 34 {                                                             // mkdirat
+        return pe_mac_errno_ret(nat_mac_call(PE_M_MKDIRAT, 0 - 2, b, c, 0, 0, 0));
+    }
+    if n == 276 || n == 38 {                                                 // renameat2 / renameat
+        return pe_mac_errno_ret(nat_mac_call(PE_M_RENAMEAT, 0 - 2, b, 0 - 2, d, 0, 0));
+    }
+    if n == 222 { return pe_mac_mmap(b); }                                   // mmap
+    if n == 215 { return pe_m(PE_M_MUNMAP, a, b, 0); }                       // munmap
+    if n == 226 { return pe_mac_mprotect(a, b, c); }                        // mprotect
+    if n == 113 { return pe_mac_clock(a, b); }                              // clock_gettime
+    if n == 101 { return pe_m(PE_M_NANOSLEEP, a, b, 0); }                   // nanosleep
+    if n == 124 { pe_m(PE_M_SCHED_YIELD, 0, 0, 0); return 0; }              // sched_yield
+    if n == 123 { return pe_mac_affinity(b, c); }                          // sched_getaffinity
+    if n == 172 { return pe_m(PE_M_GETPID, 0, 0, 0); }                     // getpid
+    if n == 178 { return pe_m(PE_M_GETPID, 0, 0, 0); }                     // gettid ~ pid
+    if n == 173 || n == 174 || n == 175 || n == 176 || n == 177 { return 0; }
+    if n == 278 {                                                           // getrandom
+        pe_m(PE_M_ARC4RANDOM, a, b, 0);                                     // arc4random_buf(buf, n)
+        return b;
+    }
+    if n == 93 || n == 94 {                                                 // exit / exit_group
+        pe_m(PE_M_EXIT, a, 0, 0);
+        return 0;
+    }
+    if n == 98 { return pe_mac_futex(a, b, c, d); }                        // futex
+    if n == 134 {                                                           // rt_sigaction
+        if b != 0 { pe_mac_sigaction(a, b); }
+        return 0;
+    }
+    if n == 132 { return 0; }                                              // sigaltstack: pthreads handle this
+    if n == 129 || n == 131 {                                              // kill / tgkill
+        return pe_m(PE_M_KILL, pe_m(PE_M_GETPID, 0, 0, 0), c, 0);
+    }
+    if n == 179 { return 0 - 38; }                                         // sysinfo: none
+    if n == 25 { return 0; }                                               // fcntl: non-blocking handled elsewhere
+    return 0 - 38;                                                          // ENOSYS
+}

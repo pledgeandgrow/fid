@@ -158,6 +158,10 @@ pub struct NatGen {
     // table's slot per import (ng_win_imports), a table of their
     // addresses, the TLS index, the import directory and IAT bounds
     pub win: bool,
+    // macOS (x86_64-macos / aarch64-macos on this layer): the import GOT
+    // base label (one 8-byte slot per libSystem symbol, ng_mac_imports)
+    pub mac: bool,
+    pub mac_got_label: i64,
     pub win_slot_labels: Vec<i64>,
     pub win_slots_label: i64,
     pub win_tls_label: i64,
@@ -260,6 +264,8 @@ pub fn NatGen_new(arch: i64) -> NatGen {
         next_block_label: -1,
         t0: 9, t1: 10, t2: 11, t3: 12, ad: 16, ad2: 17, zr: 31, arg0: 0,
         win: false,
+        mac: false,
+        mac_got_label: 0,
         win_slot_labels: Vec::new(),
         win_slots_label: 0,
         win_tls_label: 0,
@@ -3234,6 +3240,8 @@ fn ng_x64_sysmap() -> Vec<i64> {
 fn ng_gen_primitives_x64(g: &mut NatGen) {
     if g.win {
         ng_gen_primitives_win(g);
+    } else if g.mac {
+        ng_gen_primitives_mac(g);
     } else {
         ng_gen_primitives_x64_linux(g);
     }
@@ -3453,10 +3461,12 @@ fn ng_gen_primitives_x64_common(g: &mut NatGen) {
 
     ng_prim(g, "nat_arch");
     x64_li(&mut g.e, 7, NAT_X64); x64_ret(&mut g.e);
-    // nat_os() -> 0 Linux, 1 Windows
-    ng_prim(g, "nat_os");
-    if g.win { x64_li(&mut g.e, 7, 1); } else { x64_li(&mut g.e, 7, 0); }
-    x64_ret(&mut g.e);
+    // nat_os() -> 0 Linux, 1 Windows (macOS defines its own: 2)
+    if !g.mac {
+        ng_prim(g, "nat_os");
+        if g.win { x64_li(&mut g.e, 7, 1); } else { x64_li(&mut g.e, 7, 0); }
+        x64_ret(&mut g.e);
+    }
 
     // nat_fma(a, b, c): FMA3 (x86-64-v3)
     ng_prim(g, "nat_fma");
@@ -4605,6 +4615,21 @@ fn ng_gen_function(g: &mut NatGen, name: str, func: &IrFunction, module: &IrModu
 
 fn ng_gen_primitives(g: &mut NatGen) {
     if ng_x64(g) { ng_gen_primitives_x64(g); return; }
+    if g.mac {
+        // macOS arm64: the Mach-O entry, nat_syscall and the rest; the
+        // shared primitives (ng_gen_primitives2) skip their Linux-only
+        // versions when g.mac is set.
+        ng_gen_primitives_mac(g);
+        ng_gen_primitives2(g);
+        var ssp_m: i64 = NatEnc_label(&mut g.e);
+        HashMap_insert(g.fn_labels, "nat_start_sp", ssp_m);
+        g.fn_label_names.push("nat_start_sp");
+        NatEnc_place(&mut g.e, ssp_m);
+        a64_addr(&mut g.e, g.t0, g.start_sp_label);
+        a64_ldr(&mut g.e, 0, g.t0, 0);
+        a64_ret(&mut g.e);
+        return;
+    }
     // _start: keep the initial sp (argc, argv, envp), call main(env = 0),
     // exit_group(its result)
     g.entry_label = NatEnc_label(&mut g.e);
@@ -4798,6 +4823,9 @@ fn ng_gen_primitives2(g: &mut NatGen) {
     ng_addr(g, ng_argreg(g, 0), g.tramp_label);
     if a64 { a64_ret(&mut g.e); } else { rv_ret(&mut g.e); }
 
+    // nat_clone_thread, nat_tls_get/set: macOS defines its own
+    // (ng_gen_primitives_mac); here they are the Linux ones.
+    if !g.mac {
     // nat_clone_thread(entry, arg, stack_top, ctid, tls) -> tid: a thread
     // sharing the address space, files and signal handlers, its thread
     // pointer `tls`, that runs entry(env 0, arg) on its own stack and exits.
@@ -4868,6 +4896,7 @@ fn ng_gen_primitives2(g: &mut NatGen) {
     ng_prim(g, "nat_tls_set");
     if a64 { NatEnc_word(&mut g.e, 0xD51BD040); a64_ret(&mut g.e); }      // msr tpidr_el0, x0
     else { rv_addi(&mut g.e, 4, RV_A0, 0); rv_ret(&mut g.e); }
+    }
 
     // nat_frame_fp() -> the caller's frame pointer (a trace starts there)
     ng_prim(g, "nat_frame_fp");
@@ -4890,7 +4919,9 @@ fn ng_gen_primitives2(g: &mut NatGen) {
     if a64 { a64_ret(&mut g.e); } else { rv_ret(&mut g.e); }
 
     // The signal handler (sig, info, ucontext): the runtime's
-    // pe_on_signal(sig, info); nat_sig_handler() -> its address
+    // pe_on_signal(sig, info); nat_sig_handler() -> its address. macOS
+    // defines its own (ng_gen_primitives_mac).
+    if !g.mac {
     var sig_entry: i64 = NatEnc_label(&mut g.e);
     NatEnc_align(&mut g.e, 4);
     NatEnc_place(&mut g.e, sig_entry);
@@ -4925,6 +4956,7 @@ fn ng_gen_primitives2(g: &mut NatGen) {
     ng_prim(g, "nat_sig_handler");
     ng_addr(g, ng_argreg(g, 0), sig_entry);
     if a64 { a64_ret(&mut g.e); } else { rv_ret(&mut g.e); }
+    }
 
     // nat_arch() -> the target (1 AArch64, 2 RISC-V 64): for the few
     // structures whose layout differs between them and x86-64
@@ -4932,6 +4964,7 @@ fn ng_gen_primitives2(g: &mut NatGen) {
     ng_li(g, ng_argreg(g, 0), g.arch);
     if a64 { a64_ret(&mut g.e); } else { rv_ret(&mut g.e); }
 
+    if !g.mac {
     // nat_sig_restorer() -> 0: the kernel returns from handlers itself here
     ng_prim(g, "nat_sig_restorer");
     ng_li(g, ng_argreg(g, 0), 0);
@@ -4940,6 +4973,7 @@ fn ng_gen_primitives2(g: &mut NatGen) {
     ng_prim(g, "nat_os");
     ng_li(g, ng_argreg(g, 0), 0);
     if a64 { a64_ret(&mut g.e); } else { rv_ret(&mut g.e); }
+    }
 
     // nat_fma(a, b, c) -> a * b + c rounded once (bits)
     ng_prim(g, "nat_fma");
@@ -6587,4 +6621,262 @@ fn nc_start(g: &mut NatGen, m: &IrModule) {
     g.nc_on = true;
     g.nc_path = path;
     if p_file_exists(path) { nc_load(g); }
+}
+
+// ===========================================================================
+// macOS (`--target aarch64-macos|x86_64-macos`, F7): the machine layer's
+// code in a Mach-O (nat_macho), the Linux runtime over libSystem. The
+// runtime's system calls go to pe_mac_syscall (stdlib/linux_runtime/
+// darwin.fd), which calls libSystem through nat_mac_call(k, ...): k indexes
+// the import list below, in the same order as PE_M_* in darwin.fd.
+// ===========================================================================
+
+/// "symbol" per libSystem import; the index is the PE_M_* constant of
+/// darwin.fd. Symbols carry the Mach-O leading underscore.
+fn ng_mac_imports() -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    v.push("_write"); v.push("_read"); v.push("_close"); v.push("_exit");
+    v.push("_mmap"); v.push("_munmap"); v.push("_mprotect"); v.push("_openat");
+    v.push("_lseek"); v.push("_fstatat"); v.push("_clock_gettime"); v.push("_nanosleep");
+    v.push("_sched_yield"); v.push("_getpid"); v.push("_arc4random_buf"); v.push("_pthread_create");
+    v.push("_pthread_join"); v.push("_pthread_self"); v.push("_pthread_key_create");
+    v.push("_pthread_getspecific"); v.push("_pthread_setspecific"); v.push("___ulock_wait");
+    v.push("___ulock_wake"); v.push("_sigaction"); v.push("_sysctlbyname"); v.push("_unlinkat");
+    v.push("_mkdirat"); v.push("_renameat"); v.push("_getdirentries"); v.push("_ftruncate");
+    v.push("_kill"); v.push("_sigaltstack"); v.push("_pthread_attr_init");
+    v.push("_pthread_attr_setstacksize"); v.push("_pthread_attr_setdetachstate"); v.push("_abort");
+    return v;
+}
+
+/// Shift `nargs` internal argument registers up by one and call the Fides
+/// function `target` with a null __env first (arm64: all in x0..x7; x64:
+/// reuse ng_win_forward, whose internal shuffle is the System V one).
+fn ng_mac_forward(g: &mut NatGen, target: str, nargs: i64, nstack_x64: i64) {
+    if ng_x64(g) {
+        ng_win_forward(g, target, nstack_x64);
+        return;
+    }
+    // arm64: xN = x(N-1) for N = nargs..1, then x0 = 0
+    var i: i64 = nargs;
+    while i > 0 {
+        a64_mov(&mut g.e, i, i - 1);
+        i = i - 1;
+    }
+    a64_li(&mut g.e, 0, 0);
+    a64_b(&mut g.e, ng_fn_label(g, target));     // tail call
+}
+
+/// Load GOT slot `k` (argument register 0) and call it with the platform
+/// ABI (System V / AAPCS). The result goes to return register 0. Up to six
+/// arguments (a..f); mmap needs all six. The runtime calls nat_mac_call
+/// with the internal convention: k, a, b, c in registers and d, e, f on the
+/// stack (x64) or all in registers (arm64).
+fn ng_mac_call_body(g: &mut NatGen) {
+    if ng_x64(g) {
+        // k=rdi(7) a=rsi(6) b=rdx(2) c=rcx(1); d,e,f at [rsp+8/16/24]
+        x64_load(&mut g.e, 9, 4, 24, 8, true);       // r9 = f
+        x64_load(&mut g.e, 8, 4, 16, 8, true);       // r8 = e
+        x64_load(&mut g.e, 10, 4, 8, 8, true);       // r10 = d
+        x64_mov(&mut g.e, 0, 7);                     // rax = k
+        x64_shift_imm(&mut g.e, 4, 0, 3);            // shl rax, 3
+        x64_lea_label(&mut g.e, 11, g.mac_got_label);
+        x64_alu(&mut g.e, 0x01, 11, 0);              // add r11, rax
+        x64_load(&mut g.e, 11, 11, 0, 8, true);      // r11 = GOT[k]
+        x64_mov(&mut g.e, 7, 6);                     // rdi = a
+        x64_mov(&mut g.e, 6, 2);                     // rsi = b
+        x64_mov(&mut g.e, 2, 1);                     // rdx = c
+        x64_mov(&mut g.e, 1, 10);                    // rcx = d
+        x64_li(&mut g.e, 0, 0);                      // varargs: al = 0
+        x64_sub_imm(&mut g.e, 4, 8);                 // align rsp to 16
+        x64_call_r(&mut g.e, 11);
+        x64_add_imm(&mut g.e, 4, 8);
+        x64_mov(&mut g.e, 7, 0);                     // return value -> rdi
+        x64_ret(&mut g.e);
+        return;
+    }
+    // arm64: k=x0 a=x1 b=x2 c=x3 d=x4 e=x5 f=x6
+    NatEnc_word(&mut g.e, 0xA9BF7BFD);               // stp x29, x30, [sp, #-16]!
+    a64_addr(&mut g.e, 9, g.mac_got_label);
+    a64_add(&mut g.e, 10, 0, 0);                     // x10 = 2k
+    a64_add(&mut g.e, 10, 10, 10);                   // 4k
+    a64_add(&mut g.e, 10, 10, 10);                   // 8k
+    a64_add(&mut g.e, 9, 9, 10);                     // x9 = got + 8k
+    a64_ldr(&mut g.e, 11, 9, 0);                     // x11 = GOT[k]
+    a64_mov(&mut g.e, 0, 1);
+    a64_mov(&mut g.e, 1, 2);
+    a64_mov(&mut g.e, 2, 3);
+    a64_mov(&mut g.e, 3, 4);
+    a64_mov(&mut g.e, 4, 5);
+    a64_mov(&mut g.e, 5, 6);
+    a64_blr(&mut g.e, 11);
+    NatEnc_word(&mut g.e, 0xA8C17BFD);               // ldp x29, x30, [sp], #16
+    a64_ret(&mut g.e);
+}
+
+/// The macOS primitives of both arches: the Mach-O entry (dyld calls it as
+/// main(argc, argv, envp)), nat_syscall (to pe_mac_syscall), nat_mac_call,
+/// the thread trampoline, nat_clone_thread, nat_tls_get/set, nat_os and the
+/// signal handler. The shared primitives come from ng_gen_primitives2 /
+/// ng_gen_primitives_x64_common, which skip their Linux-only versions when
+/// g.mac is set.
+fn ng_gen_primitives_mac(g: &mut NatGen) {
+    g.entry_label = NatEnc_label(&mut g.e);
+    NatEnc_place(&mut g.e, g.entry_label);
+    var main_label: i64 = ng_fn_label(g, "main");
+    if ng_x64(g) {
+        // dyld: argc=rdi, argv=rsi, envp=rdx; result (exit code) in rax
+        x64_push(&mut g.e, 5);
+        x64_mov(&mut g.e, 5, 4);
+        x64_mov(&mut g.e, 1, 2);                     // rcx = envp
+        x64_mov(&mut g.e, 2, 6);                     // rdx = argv
+        x64_mov(&mut g.e, 6, 7);                     // rsi = argc
+        x64_li(&mut g.e, 7, 0);                      // rdi = env0
+        x64_call(&mut g.e, ng_fn_label(g, "pe_mac_start"));
+        x64_store_label(&mut g.e, 7, g.start_sp_label);   // block in return reg rdi(7)
+        if ng_has_fn(g, "pe_rt_init") {
+            x64_li(&mut g.e, 7, 0);
+            x64_call(&mut g.e, ng_fn_label(g, "pe_rt_init"));
+        }
+        x64_li(&mut g.e, 7, 0);
+        x64_call(&mut g.e, main_label);
+        x64_mov(&mut g.e, 0, 7);                     // rax = result for dyld exit()
+        x64_mov(&mut g.e, 4, 5);
+        x64_pop(&mut g.e, 5);
+        x64_ret(&mut g.e);
+    } else {
+        // dyld: argc=x0, argv=x1, envp=x2; result in x0
+        NatEnc_word(&mut g.e, 0xA9BF7BFD);           // stp x29, x30, [sp, #-16]!
+        a64_add_imm(&mut g.e, A64_FP, A64_SP, 0);
+        a64_mov(&mut g.e, 3, 2);                     // x3 = envp
+        a64_mov(&mut g.e, 2, 1);                     // x2 = argv
+        a64_mov(&mut g.e, 1, 0);                     // x1 = argc
+        a64_li(&mut g.e, 0, 0);                      // x0 = env0
+        a64_bl(&mut g.e, ng_fn_label(g, "pe_mac_start"));
+        a64_addr(&mut g.e, g.t1, g.start_sp_label);
+        a64_str(&mut g.e, 0, g.t1, 0);               // block in x0
+        a64_li(&mut g.e, A64_FP, 0);
+        if ng_has_fn(g, "pe_rt_init") {
+            a64_li(&mut g.e, 0, 0);
+            a64_bl(&mut g.e, ng_fn_label(g, "pe_rt_init"));
+        }
+        a64_li(&mut g.e, 0, 0);
+        a64_bl(&mut g.e, main_label);                // result in x0 for dyld
+        NatEnc_word(&mut g.e, 0xA8C17BFD);           // ldp x29, x30, [sp], #16
+        a64_ret(&mut g.e);
+    }
+
+    // nat_syscall(n, a..f) -> pe_mac_syscall(env, n, a..f)
+    ng_prim(g, "nat_syscall");
+    ng_mac_forward(g, "pe_mac_syscall", 7, 3);
+
+    // nat_mac_call(k, a..j): a libSystem call through GOT slot k
+    ng_prim(g, "nat_mac_call");
+    ng_mac_call_body(g);
+
+    // The pthread trampoline: pe_mac_thread_main(env0, arg)
+    var tramp: i64 = NatEnc_label(&mut g.e);
+    NatEnc_align(&mut g.e, 4);
+    NatEnc_place(&mut g.e, tramp);
+    if ng_x64(g) {
+        x64_push(&mut g.e, 5);
+        x64_mov(&mut g.e, 5, 4);
+        x64_mov(&mut g.e, 6, 7);                     // rsi = arg
+        x64_li(&mut g.e, 7, 0);                      // rdi = env0
+        x64_call(&mut g.e, ng_fn_label(g, "pe_mac_thread_main"));
+        x64_mov(&mut g.e, 0, 7);
+        x64_mov(&mut g.e, 4, 5);
+        x64_pop(&mut g.e, 5);
+        x64_ret(&mut g.e);
+    } else {
+        NatEnc_word(&mut g.e, 0xA9BF7BFD);
+        a64_mov(&mut g.e, 1, 0);                     // x1 = arg
+        a64_li(&mut g.e, 0, 0);                      // x0 = env0
+        a64_bl(&mut g.e, ng_fn_label(g, "pe_mac_thread_main"));
+        NatEnc_word(&mut g.e, 0xA8C17BFD);
+        a64_ret(&mut g.e);
+    }
+    ng_prim(g, "nat_mac_thread_tramp");
+    ng_addr(g, ng_argreg(g, 0), tramp);
+    if ng_x64(g) { x64_ret(&mut g.e); } else { a64_ret(&mut g.e); }
+
+    // nat_clone_thread(entry, arg, stack_top, ctid, tls) -> pe_mac_clone
+    ng_prim(g, "nat_clone_thread");
+    ng_mac_forward(g, "pe_mac_clone", 5, 1);
+
+    // nat_tls_get() / nat_tls_set(v): a pthread key (Fides helpers)
+    ng_prim(g, "nat_tls_get");
+    if ng_x64(g) {
+        x64_li(&mut g.e, 7, 0);
+        x64_call(&mut g.e, ng_fn_label(g, "nat_tls_get_mac"));
+        x64_ret(&mut g.e);
+    } else {
+        NatEnc_word(&mut g.e, 0xA9BF7BFD);
+        a64_li(&mut g.e, 0, 0);
+        a64_bl(&mut g.e, ng_fn_label(g, "nat_tls_get_mac"));
+        NatEnc_word(&mut g.e, 0xA8C17BFD);
+        a64_ret(&mut g.e);
+    }
+    ng_prim(g, "nat_tls_set");
+    if ng_x64(g) {
+        x64_mov(&mut g.e, 6, 7);                     // rsi = v
+        x64_li(&mut g.e, 7, 0);                      // rdi = env0
+        x64_call(&mut g.e, ng_fn_label(g, "nat_tls_set_mac"));
+        x64_ret(&mut g.e);
+    } else {
+        NatEnc_word(&mut g.e, 0xA9BF7BFD);
+        a64_mov(&mut g.e, 1, 0);                     // x1 = v
+        a64_li(&mut g.e, 0, 0);                      // x0 = env0
+        a64_bl(&mut g.e, ng_fn_label(g, "nat_tls_set_mac"));
+        NatEnc_word(&mut g.e, 0xA8C17BFD);
+        a64_ret(&mut g.e);
+    }
+
+    // nat_os() -> 2 (macOS)
+    ng_prim(g, "nat_os");
+    ng_li(g, ng_argreg(g, 0), 2);
+    if ng_x64(g) { x64_ret(&mut g.e); } else { a64_ret(&mut g.e); }
+
+    // The signal handler (sig, info, uctx) -> pe_on_signal(env0, sig, info);
+    // the restorer is unused on macOS (0).
+    var sig_entry: i64 = NatEnc_label(&mut g.e);
+    NatEnc_align(&mut g.e, 4);
+    NatEnc_place(&mut g.e, sig_entry);
+    if ng_has_fn(g, "pe_on_signal") {
+        if ng_x64(g) {
+            x64_push(&mut g.e, 5);
+            x64_mov(&mut g.e, 5, 4);
+            x64_mov(&mut g.e, 2, 6);                 // rdx = info
+            x64_mov(&mut g.e, 6, 7);                 // rsi = sig
+            x64_li(&mut g.e, 7, 0);                  // rdi = env0
+            x64_call(&mut g.e, ng_fn_label(g, "pe_on_signal"));
+            x64_pop(&mut g.e, 5);
+            x64_ret(&mut g.e);
+        } else {
+            NatEnc_word(&mut g.e, 0xA9BF7BFD);
+            a64_add_imm(&mut g.e, A64_FP, A64_SP, 0);
+            a64_mov(&mut g.e, 2, 1);                 // x2 = info
+            a64_mov(&mut g.e, 1, 0);                 // x1 = sig
+            a64_li(&mut g.e, 0, 0);                  // x0 = env0
+            a64_bl(&mut g.e, ng_fn_label(g, "pe_on_signal"));
+            NatEnc_word(&mut g.e, 0xA8C17BFD);
+            a64_ret(&mut g.e);
+        }
+    } else {
+        if ng_x64(g) { x64_ret(&mut g.e); } else { a64_ret(&mut g.e); }
+    }
+    ng_prim(g, "nat_sig_handler");
+    ng_addr(g, ng_argreg(g, 0), sig_entry);
+    if ng_x64(g) { x64_ret(&mut g.e); } else { a64_ret(&mut g.e); }
+    ng_prim(g, "nat_sig_restorer");
+    ng_li(g, ng_argreg(g, 0), 0);
+    if ng_x64(g) { x64_ret(&mut g.e); } else { a64_ret(&mut g.e); }
+}
+
+/// The import GOT: one 8-byte slot per libSystem symbol, bound by dyld.
+fn ng_gen_mac_got(g: &mut NatGen) {
+    NatEnc_align(&mut g.e, 8);
+    NatEnc_place(&mut g.e, g.mac_got_label);
+    var n: i64 = ng_mac_imports().len();
+    var i: i64 = 0;
+    while i < n { NatEnc_quad(&mut g.e, 0); i = i + 1; }
 }

@@ -763,7 +763,7 @@ runs it, also when the `defer` was in a branch that did not execute.
 | `unsafe { }` | allows raw-pointer and raw-memory operations (§8.5); skips borrow checks |
 | `sandbox { }` | revokes all capabilities (§9.3) |
 | `region r [with budget(N)] { }`, `region gpu r …`, `region kv_cache r with budget(N) [window(W)] { }` | §8.6 |
-| `txn { }` | a transaction: `fid run` snapshots memory at entry; the C and native backends run the body with no rollback |
+| `txn { }`, `abort;` | a transaction over the function's local variables: at entry each live local is snapshotted (a string, Vec or HashMap shared copy-on-write, a struct copied with its owned fields); `abort;` (a contextual keyword, allowed only inside `txn`) puts every one back and leaves the innermost txn; reaching the end keeps the changes. The same on every backend (lowering, `Lowerer_txn_open`). Assigning a global inside a txn is an error, since it would not be rolled back; data reached through `&mut` parameters or pointers, and IO, are not rolled back (`test_txn_abort.fd`) |
 | `handle { } with { … }`, `do E.op(args)`, `resume(cont, v)` | effect handlers (§9.4) |
 | `select { }`, `parallel { }`, `spawn scope { }`, `cancel scope;` | §10 |
 | `grad(x) { }`, `backward(loss)` | automatic differentiation; `backward` needs an `f64` or tensor |
@@ -1101,8 +1101,13 @@ been granted (`Sandbox error: 'print()' requires 'IO' capability`,
 `!{}`) include one, a method of a user type that does, a higher-order
 function given such a function, and a call through a function value
 (`Sandbox error: 'logit()' has effect '!IO'`, `TypeChecker_check_sandbox_call`;
-`test_sandbox_helper_io_fail.fd`, `test_sandbox_file_read_fail.fd`). Pure
-functions may be called.
+`test_sandbox_helper_io_fail.fd`, `test_sandbox_file_read_fail.fd`). So is
+code whose effects are not known: a C function declared `extern "C"`, a
+function loaded at run time (`p_dl_*`), a raw system call, inline assembly,
+and any function or method that reaches one of them through its callees
+(`TypeChecker_compute_ffi_reach`; a call `x.m()` whose receiver type is not
+known counts when any method named `m` reaches C code;
+`test_sandbox_ffi_fail.fd`). Pure functions may be called.
 
 ### 9.4 Effect handlers
 

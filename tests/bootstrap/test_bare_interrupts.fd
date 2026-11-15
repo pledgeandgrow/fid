@@ -1,0 +1,48 @@
+// Release G1: a `fid emit --bare` image boots under QEMU (Multiboot) into
+// long mode with an IDT whose every vector has a default handler, each
+// `@interrupt(N)` function wired to vector N, the PIC remapped (IRQ0, the
+// timer, at 0x20) and interrupts on. Run it with scripts/bare-qemu-test.sh:
+//   fid emit tests/bootstrap/test_bare_interrupts.fd --bare -o i.bin
+//   qemu-system-x86_64 -kernel i.bin -serial stdio -display none \
+//       -no-reboot -device isa-debug-exit
+// A breakpoint (int3) comes back to the next instruction, the timer ticks
+// wake `hlt`. Hosted backends print the same lines without the hardware.
+//
+// Expected output:
+// breakpoints: 2
+// timer ticks: 3
+// done
+
+var g_breaks: i64 = 0;
+var g_ticks: i64 = 0;
+
+@interrupt(3) fn on_breakpoint() {
+    g_breaks = g_breaks + 1;
+}
+
+@interrupt(0x20) fn on_timer() {
+    g_ticks = g_ticks + 1;
+    // end of interrupt to the master PIC
+    asm!("mov dx, 0x20; mov al, 0x20; out dx, al");
+}
+
+fn main() -> i64 {
+    if p_argc() == 0 {
+        // bare metal
+        asm!("int3");
+        asm!("int3");
+        // interrupts only inside `sti; hlt` (sti holds them off for one
+        // instruction): exactly 3 ticks are counted
+        p_cli();
+        while g_ticks < 3 {
+            asm!("sti; hlt; cli");
+        }
+    } else {
+        g_breaks = 2;
+        g_ticks = 3;
+    }
+    print("breakpoints: "); print(g_breaks); print("\n");
+    print("timer ticks: "); print(g_ticks); print("\n");
+    print("done\n");
+    return 0;
+}

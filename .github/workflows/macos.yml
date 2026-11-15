@@ -1,0 +1,59 @@
+# macOS through the C back end (release F5): fid is built on macOS with clang,
+# then every test is compiled through C on the Mac itself and compared, output
+# and exit code, with the interpreter (scripts/cross-test.sh).
+#
+# GitHub's macOS images: macos-15 (Apple silicon) and macos-15-intel (x86_64;
+# the last Intel image, retired in 2027). macOS 13 and 14 are gone.
+# Native macOS executables without a C compiler (F7) are checked by
+# macos-native.yml.
+
+name: macOS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1"   # Mondays 03:17 UTC
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  suite:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-macos
+          - os: macos-15-intel
+            target: x86_64-macos
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    env:
+      CC: clang
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build the Rust bootstrap compiler
+        run: cargo build --release
+      - name: Build fid (one stage, clang)
+        run: ./scripts/build-selfhost.sh
+      - name: hello through C
+        run: |
+          ./release/fid-dev ccompile tests/bootstrap/hello.fd -o hello
+          ./hello
+      - name: Suite through C, compared with the interpreter
+        run: FID=release/fid-dev JOBS=3 bash scripts/cross-test.sh ${{ matrix.target }}
+      - name: Keep the per-test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.target }}
+          path: build/cross/${{ matrix.target }}/results.txt
+          if-no-files-found: ignore

@@ -18,7 +18,8 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-VERSION="1.0.0"
+# FIDES_VERSION overrides the default version written in installer/fides.nsi
+VERSION="${FIDES_VERSION:-$(sed -n 's/^ *!define VERSION "\(.*\)"/\1/p' "$SCRIPT_DIR/fides.nsi" | head -1)}"
 
 cd "$ROOT_DIR"
 
@@ -106,7 +107,7 @@ fi
 
 # Build the installer
 cd installer
-makensis -V2 "$BUILD_SCRIPT"
+makensis -V2 "-DVERSION=${VERSION}" "$(basename "$BUILD_SCRIPT")"
 
 # Clean up temp script
 if [ -f "fides-build.nsi" ]; then
@@ -116,6 +117,28 @@ fi
 echo ""
 INSTALLER="Fides-Setup-${VERSION}.exe"
 if [ -f "$INSTALLER" ]; then
+    # Optional Authenticode signature (unsigned installers make Windows
+    # SmartScreen warn). Set FIDES_SIGN_PFX to a .pfx code-signing
+    # certificate and FIDES_SIGN_PASS to its password; signtool (Windows SDK)
+    # or osslsigncode (Linux/macOS) is used, whichever is on PATH.
+    if [ -n "${FIDES_SIGN_PFX:-}" ]; then
+        TS_URL="${FIDES_SIGN_TS:-http://timestamp.digicert.com}"
+        echo "[sign] $INSTALLER"
+        if command -v signtool &> /dev/null; then
+            signtool sign /fd sha256 /tr "$TS_URL" /td sha256                 /f "$FIDES_SIGN_PFX" /p "${FIDES_SIGN_PASS:-}" "$INSTALLER"
+        elif command -v osslsigncode &> /dev/null; then
+            osslsigncode sign -pkcs12 "$FIDES_SIGN_PFX" -pass "${FIDES_SIGN_PASS:-}"                 -h sha256 -ts "$TS_URL" -in "$INSTALLER" -out "$INSTALLER.signed"
+            mv "$INSTALLER.signed" "$INSTALLER"
+        else
+            echo "ERROR: FIDES_SIGN_PFX is set but neither signtool nor osslsigncode is on PATH."
+            exit 1
+        fi
+    else
+        echo "  NOTE: not signed (set FIDES_SIGN_PFX to sign)."
+    fi
+    # SHA-256 checksums to publish beside the installer
+    (cd "$ROOT_DIR" && bash scripts/release-checksums.sh "installer/$INSTALLER")
+
     echo "=== SUCCESS ==="
     echo "  Installer:  installer/$INSTALLER"
     echo "  Size:       $(ls -lh $INSTALLER | awk '{print $5}')"

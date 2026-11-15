@@ -118,6 +118,9 @@ fn sec_is_output_sink(name: str) -> bool {
         || name == "p_eprint_str" || name == "p_print_vec"
         || name == "p_socket_send" || name == "p_socket_send_str" || name == "p_http_send_response"
         || name == "p_file_write" || name == "p_file_append" || name == "p_file_write_bin"
+        || name == "p_file_write_vec" || name == "write_file" || name == "append_file"
+        || str_starts_with(name, "p_write") || str_starts_with(name, "p_fs_write")
+        || str_starts_with(name, "p_socket_write") || str_starts_with(name, "p_net_send") || str_starts_with(name, "p_net_write")
         || name == "log_info" || name == "log_warn" || name == "log_error" || name == "log_debug"
         || name == "p_chan_send";
 }
@@ -475,6 +478,9 @@ fn sec_arms(self: &mut SecrecyChecker, arms: Vec<MatchArm>, scrutinee: Vec<i64>)
     sec_push_pc(self, scrutinee);
     var pc: Vec<i64> = sec_pc(self);
     var out: Vec<i64> = Vec::new();
+    // Which arm runs also depends on the guards before it: a guard on a
+    // secret taints its own arm and every later one (known-bugs 2g.10)
+    var guards: Vec<i64> = Vec::new();
     var ai: i64 = 0;
     while ai < arms.len() {
         var arm: MatchArm = arms.get(ai);
@@ -491,10 +497,12 @@ fn sec_arms(self: &mut SecrecyChecker, arms: Vec<MatchArm>, scrutinee: Vec<i64>)
             _ => {}
         }
         match arm.guard {
-            OptBoxExpr::Some(g) => { sec_expr(self, box_expr_deref(g)); }
+            OptBoxExpr::Some(g) => { guards = sec_union(guards, sec_expr(self, box_expr_deref(g))); }
             OptBoxExpr::None => {}
         }
-        out = sec_union(out, sec_stmts_value(self, arm.body));
+        sec_push_pc(self, guards);
+        out = sec_union(out, sec_union(guards, sec_stmts_value(self, arm.body)));
+        sec_pop_pc(self);
         ai = ai + 1;
     }
     sec_pop_pc(self);

@@ -1,0 +1,89 @@
+// LG8: nested enum patterns desugar to inner matches in the parser.
+use vec;
+
+enum Shape {
+    Circle(i64),
+    Rect(i64, i64),
+}
+
+enum Outer {
+    One(Shape),
+    Pair(Shape, Shape),
+    Empty,
+}
+
+enum Res {
+    Ok(i64),
+    Err(i64),
+}
+
+enum Opt {
+    Some(Res),
+    None,
+}
+
+fn describe(o: Outer) -> i64 {
+    match o {
+        Outer::One(Shape::Circle(r)) => { return r; }
+        Outer::One(Shape::Rect(w, _h)) => { return w; }
+        Outer::Pair(Shape::Circle(a), Shape::Circle(b)) => { return a + b; }
+        Outer::Pair(Shape::Rect(w, h), Shape::Circle(c)) => { return w * h + c; }
+        Outer::Empty => { return 0; }
+        _ => { return -1; }
+    }
+}
+
+fn main() -> i64 {
+    var a: Outer = Outer::One(Shape::Circle(7));
+    print(describe(a));                                    // 7
+    var b: Outer = Outer::One(Shape::Rect(4, 9));
+    print(describe(b));                                    // 4
+    var c: Outer = Outer::Pair(Shape::Circle(2), Shape::Circle(3));
+    print(describe(c));                                    // 5
+    var d: Outer = Outer::Pair(Shape::Rect(2, 5), Shape::Circle(1));
+    print(describe(d));                                    // 11
+    var e: Outer = Outer::Pair(Shape::Circle(1), Shape::Rect(2, 2));
+    print(describe(e));                                    // -1 (wildcard)
+    var f: Outer = Outer::Empty;
+    print(describe(f));                                    // 0
+
+    // guarded nested pattern
+    var g: Outer = Outer::One(Shape::Circle(42));
+    match g {
+        Outer::One(Shape::Circle(r)) if r > 100 => { print(999); }
+        Outer::One(Shape::Circle(r)) if r > 10 => { print(r); }  // 42
+        _ => { print(0); }
+    }
+
+    // match as an expression (variable scrutinee)
+    var code: i64 = match d {
+        Outer::Pair(Shape::Rect(w, h), Shape::Circle(c)) => w * h + c,
+        Outer::Empty => 0,
+        _ => -1,
+    };
+    print(code);                                              // 11
+
+    // the canonical Some(Ok(x)) shape
+    var ok: Opt = Opt::Some(Res::Ok(8));
+    var err: Opt = Opt::Some(Res::Err(3));
+    var no: Opt = Opt::None;
+    match ok {
+        Opt::Some(Res::Ok(v)) => { print(v); }                // 8
+        Opt::Some(Res::Err(_)) => { print(-5); }
+        Opt::None => { print(-9); }
+        _ => { print(-1); }
+    }
+    match err {
+        Opt::Some(Res::Ok(v)) => { print(v); }
+        Opt::Some(Res::Err(_)) => { print(-5); }              // -5
+        Opt::None => { print(-9); }
+        _ => { print(-1); }
+    }
+    match no {
+        Opt::Some(Res::Ok(v)) => { print(v); }
+        Opt::Some(Res::Err(_)) => { print(-5); }
+        Opt::None => { print(-9); }                           // -9
+        _ => { print(-1); }
+    }
+    return 0;
+}

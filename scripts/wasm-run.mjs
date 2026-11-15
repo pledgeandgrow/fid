@@ -1,5 +1,6 @@
 // wasm-run.mjs — run a Fides program built for WebAssembly (release F9):
-//   fid ccompile prog.fd --target wasm32-wasi -o prog.wasm
+//   fid ccompile prog.fd --target wasm32-wasi -o prog.wasm   (through C)
+//   fid wasm prog.fd -o prog.wasm                            (native backend)
 //   node scripts/wasm-run.mjs prog.wasm [args...]
 // The program runs under Node's WASI (preview 1) with the current folder
 // as its file system root, its arguments and environment. Exit code: the
@@ -24,4 +25,17 @@ const wasi = new WASI({
 });
 const module = await WebAssembly.compile(await readFile(file));
 const instance = await WebAssembly.instantiate(module, wasi.getImportObject());
-process.exitCode = wasi.start(instance);
+try {
+  process.exitCode = wasi.start(instance);
+} catch (e) {
+  // A trap ends the program as a panic does on the other targets (exit
+  // status 1, "Panic: ..." on stderr): the host's stack overflowing, a
+  // memory access outside the linear memory, `unreachable`
+  let msg = String(e && e.message || e);
+  if (e instanceof RangeError && /call stack/i.test(msg)) msg = 'Stack overflow';
+  else if (/out of bounds/i.test(msg)) msg = 'Invalid memory access (null or dangling pointer)';
+  else msg = 'WebAssembly trap: ' + msg;
+  process.stderr.write('Panic: ' + msg + '
+');
+  process.exitCode = 1;
+}

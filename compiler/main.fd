@@ -91,6 +91,9 @@ pub fn main() -> i64 {
     var gi: i64 = start;
     while gi < n {
         var garg: str = p_argv(gi);
+        // --debug: a debug build, where @cfg(debug) holds (the command
+        // reads the flag too, for its own options)
+        if garg == "--debug" { g_cfg_debug = true; }
         // --borrowck=off|warn|on
         if str_starts_with(garg, "--borrowck=") {
             var bval: str = str_substring_from(garg, 11);
@@ -179,7 +182,7 @@ pub fn main() -> i64 {
     }
     if command == "check" { return cmd_check(n, start); }
     if command == "doc" { return cmd_scribe(n, start); }
-    if command == "wasm" { return cmd_wasm(n, start); }
+    if command == "wasm" { return cmd_wasm(n, start, g_borrowck); }
     if command == "watch" { return cmd_bench(n, start); }
     if command == "lsp" { return lsp_run(); }
     if command == "scribe" { return cmd_scribe(n, start); }
@@ -658,6 +661,15 @@ fn cmd_fmt(n: i64, start: i64) -> i64 {
         return 1;
     }
     var formatted: str = format_source(source);
+    // Formatting changes spacing only; anything else is a formatter bug,
+    // and the file is left as it is
+    if !fmt_same_tokens(source, formatted) {
+        p_eprint_str("Error: fid fmt would change the tokens of ");
+        p_eprint_str(input);
+        p_eprint_str(", not only their spacing (a formatter bug); the file was not changed
+");
+        return 1;
+    }
     if check_mode {
         if formatted == source {
             p_eprint_str(input);
@@ -1639,7 +1651,7 @@ fn cmd_explain(n: i64, start: i64) -> i64 {
 
 // --- wasm ----------------------------------------------------------------
 // G8.5: Compile a Fides source file to WASM binary (or WAT text with --wat).
-fn cmd_wasm(n: i64, start: i64) -> i64 {
+fn cmd_wasm(n: i64, start: i64, g_borrowck: str) -> i64 {
     if start + 2 > n {
         p_eprint_str("Usage: fid wasm <file.fd> [-o output.wasm] [--wat]\n");
         return 1;
@@ -1683,7 +1695,34 @@ fn cmd_wasm(n: i64, start: i64) -> i64 {
         p_eprint_str("\n");
         return 1;
     }
-    var result: ResultBytes = compile_to_wasm(source, input, wat_mode);
+    // The Linux runtime and its WASI layer (stdlib/linux_runtime/wasi.fd)
+    // merged; only what main reaches lowered (compiler/reach.fd)
+    set_native_runtime("linux_runtime");
+    g_native_rt_wasi = true;
+    g_cfg_os = "wasi";
+    g_cfg_arch = "wasm32";
+    var result: ResultBytes = ResultBytes::Err(Vec::new());
+    var wprog: ResultProgram = build_program_with_path_borrowck(source, OptStr::Some(input), g_borrowck);
+    match wprog {
+        ResultProgram::Err(werrs) => { result = ResultBytes::Err(werrs); }
+        ResultProgram::Ok(wprogram) => {
+            g_lower_keep = lw_keep_set(wprogram);
+            var wmod: IrModule = lower(wprogram);
+            g_lower_keep = 0;
+            if wat_mode {
+                var wat_text: str = dump_wat(wmod);
+                var wat_bytes: Vec<i64> = Vec::new();
+                var wi: i64 = 0;
+                while wi < str_len(wat_text) {
+                    wat_bytes.push(str_byte_at(wat_text, wi));
+                    wi = wi + 1;
+                }
+                result = ResultBytes::Ok(wat_bytes);
+            } else {
+                result = wasm_generate(wmod);
+            }
+        }
+    }
     match result {
         ResultBytes::Ok(bytes) => {
             p_file_write_vec(output, bytes);
@@ -2896,6 +2935,25 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
     if has_flag(n, start, "--checked-alloc") { g_pe_checked_alloc = true; }
     // --boot: multiboot2 boot mode (skip stdlib, generate boot binary)
     var boot_mode: bool = has_flag(n, start, "--boot");
+    // Release G1/G4: `--boot` is the bootable bare image (Multiboot 1 and 2,
+    // long mode, IDT), the same as `--bare`; `--load <address>` moves it
+    // (default 0x100000). PEIR_BARE_BOOT off: the old pe.fd kernel.
+    if boot_mode && PEIR_BARE_BOOT {
+        boot_mode = false;
+        bare_mode = true;
+    }
+    if bare_mode {
+        var load_arg: str = get_flag_value(n, start, "--load", "");
+        if str_len(load_arg) > 0 {
+            var load_val: i64 = 0;
+            if str_starts_with(load_arg, "0x") || str_starts_with(load_arg, "0X") {
+                load_val = str_parse_hex(load_arg);
+            } else {
+                load_val = str_parse_int(load_arg);
+            }
+            g_pe_bare_boot_load = load_val;
+        }
+    }
     // --caps <list>: capability restrictions
     var caps: str = get_flag_value(n, start, "--caps", "");
     // Split "IO,Net" -> ["IO","Net"] for build_executable's granted_caps
@@ -3077,7 +3135,11 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                 print(bare_out);
                 print(" (");
                 print(int_to_str(bin.len()));
-                print(" bytes, no stdlib, no PE headers, load at 0x10000)\n");
+                if pe_bare_boot_on() {
+                    print(" bytes, no stdlib, Multiboot kernel, load at 0x" + int_to_hex(g_pe_bare_boot_load) + ")\n");
+                } else {
+                    print(" bytes, no stdlib, no PE headers, load at 0x10000)\n");
+                }
                 return 0;
             }
         }
@@ -3355,7 +3417,7 @@ fn print_usage() {
     p_eprint_str("  fid emit     <file.fd> -o <output>    Alias for build\n");
     p_eprint_str("  fid build-x86 <file.fd> [-o <out>]    Linux ELF via x86 stack-machine backend\n");
     p_eprint_str("  fid emit     <file.fd> --boot -o <out>  Multiboot2 kernel binary\n");
-    p_eprint_str("  fid emit     <file.fd> --bare -o <out>  Bare-metal flat binary\n");
+    p_eprint_str("  fid emit     <file.fd> --bare -o <out>  Bare-metal kernel (Multiboot; QEMU -kernel) [--load <addr>]\n");
     p_eprint_str("  fid emit     <file.fd> --elf -o <out>   Static Linux x86-64 executable (no stdlib yet)\n");
     p_eprint_str("  fid run      <file.fd>                Compile + execute\n");
     p_eprint_str("  fid tokens   <file.fd>                Show tokens\n");

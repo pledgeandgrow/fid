@@ -6,6 +6,9 @@
 #   ./bench/check.sh --save     record the current times as the baseline
 #   LIMIT_PCT=5 ./bench/check.sh   a tighter threshold
 #   FID=path/to/fid             the compiler to measure (default: as run.sh)
+#   BENCH_BASE=file             baseline file (default bench/baseline.txt); CI
+#                               saves one with the base commit's compiler and
+#                               checks the head's against it on the same runner
 #
 # Measures every bench/fides/*.fd natively (`fid emit`) and through C
 # (`fid ccompile`), best of RUNS (default 5) runs each. Meant for CI and for a
@@ -15,9 +18,18 @@ set -u
 cd "$(dirname "$0")" || exit 1
 RUNS="${RUNS:-5}"
 LIMIT_PCT="${LIMIT_PCT:-10}"
-BASE=baseline.txt
+BASE="${BENCH_BASE:-baseline.txt}"
 X=""
-case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) X=".exe" ;; esac
+# `emit` is native: pe_ir on Windows, the machine layer on Linux (a plain
+# `emit` on Linux would go through C, the same as ccompile)
+EMIT_FLAGS=""
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) X=".exe" ;;
+  Linux) case "$(uname -m)" in
+           x86_64) EMIT_FLAGS="--target x86_64-linux" ;;
+           aarch64|arm64) EMIT_FLAGS="--target aarch64-linux" ;;
+         esac ;;
+esac
 if [ -z "${FID:-}" ]; then
   for c in ../release/stage0/fid$X ../release/fid$X ../release/fid-dev$X; do
     if [ -x "$c" ]; then FID="$c"; break; fi
@@ -48,7 +60,9 @@ for src in fides/*.fd; do
   b=$(basename "$src" .fd)
   for mode in emit ccompile; do
     exe="$OUT/check-$b-$mode$X"
-    if ! (cd .. && "$FID" $mode "bench/$src" -o "bench/$exe") > "$OUT/check-$b-$mode.log" 2>&1; then
+    flags=""; [ "$mode" = emit ] && flags="$EMIT_FLAGS"
+    # shellcheck disable=SC2086
+    if ! (cd .. && "$FID" $mode "bench/$src" $flags -o "bench/$exe") > "$OUT/check-$b-$mode.log" 2>&1; then
       echo "build failed: $b ($mode), see bench/$OUT/check-$b-$mode.log"; exit 2
     fi
     results+=("$b $mode $(best_ms "$exe")")

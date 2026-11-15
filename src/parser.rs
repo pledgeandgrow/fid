@@ -1823,8 +1823,12 @@ impl Parser {
         self.expect(TokenKind::LBrace, "{")?;
 
         let mut arms = Vec::new();
+        let mut nests: Vec<(String, Pattern)> = Vec::new();
+        let mut npctr: i64 = 0;
+        let mut marks: Vec<usize> = vec![0];
         while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
-            let pattern = self.parse_pattern()?;
+            let pattern = self.parse_pattern(&mut nests, &mut npctr)?;
+            marks.push(nests.len());
             // Optional guard: `pattern if cond =>`
             let guard = if self.check(&TokenKind::If) {
                 self.advance();
@@ -1841,6 +1845,32 @@ impl Parser {
         }
         self.expect(TokenKind::RBrace, "}")?;
 
+        if !nests.is_empty() {
+            // LG8: nested patterns desugar to inner matches. Bind the scrutinee
+            // once so the inner fallthrough matches never re-evaluate it.
+            let arms = pd_desugar_arms("__ms", arms, &nests, &marks, line, false);
+            return Ok(Stmt::If {
+                cond: Expr::BoolLit(true),
+                then_block: vec![
+                    Stmt::Let {
+                        name: "__ms".to_string(),
+                        ty: None,
+                        expr,
+                        is_mut: false,
+                        is_persist: false,
+                        annotations: Vec::new(),
+                        line,
+                    },
+                    Stmt::Match {
+                        expr: Expr::Ident("__ms".to_string()),
+                        arms,
+                        line,
+                    },
+                ],
+                else_block: None,
+                line,
+            });
+        }
         Ok(Stmt::Match { expr, arms, line })
     }
 
@@ -1954,13 +1984,18 @@ impl Parser {
     }
 
     fn parse_match_expr(&mut self) -> Result<Expr, String> {
+        let pat_line = self.peek_token().line;
         self.expect(TokenKind::Match, "match")?;
         let expr = self.parse_expr()?;
         self.expect(TokenKind::LBrace, "{")?;
 
         let mut arms = Vec::new();
+        let mut nests: Vec<(String, Pattern)> = Vec::new();
+        let mut npctr: i64 = 0;
+        let mut marks: Vec<usize> = vec![0];
         while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
-            let pattern = self.parse_pattern()?;
+            let pattern = self.parse_pattern(&mut nests, &mut npctr)?;
+            marks.push(nests.len());
             // Optional guard: `pattern if cond =>`
             let guard = if self.check(&TokenKind::If) {
                 self.advance();
@@ -1985,10 +2020,29 @@ impl Parser {
         }
         self.expect(TokenKind::RBrace, "}")?;
 
+        if !nests.is_empty() {
+            // Nested patterns in expression position: the scrutinee must be a
+            // plain variable — there is no statement context to hoist a
+            // one-time evaluation into.
+            let scrut2 = match &expr {
+                Expr::Ident(nm) => nm.clone(),
+                _ => {
+                    return Err(format!(
+                        "Parse error at {}: nested patterns in match expressions need a variable scrutinee",
+                        pat_line
+                    ))
+                }
+            };
+            let arms = pd_desugar_arms(&scrut2, arms, &nests, &marks, pat_line, true);
+            return Ok(Expr::Match {
+                expr: Box::new(Expr::Ident(scrut2)),
+                arms,
+            });
+        }
         Ok(Expr::Match { expr: Box::new(expr), arms })
     }
 
-    fn parse_pattern(&mut self) -> Result<Pattern, String> {
+    fn parse_pattern(&mut self, nests: &mut Vec<(String, Pattern)>, ctr: &mut i64) -> Result<Pattern, String> {
         let tok = self.peek_token().clone();
         match &tok.kind {
             TokenKind::IntLit(n) => {
@@ -2047,14 +2101,7 @@ impl Parser {
                     let mut bindings = Vec::new();
                     if self.match_tok(TokenKind::LParen) {
                         loop {
-                            let bname = self.expect_ident()?;
-                            // Type annotation is optional: `x: Type` or just `x`
-                            let bty = if self.match_tok(TokenKind::Colon) {
-                                self.read_type_name()?
-                            } else {
-                                String::new() // empty = infer type
-                            };
-                            bindings.push((bname, bty));
+                            self.parse_pat_arg(&mut bindings, nests, ctr)?;
                             if !self.match_tok(TokenKind::Comma) {
                                 break;
                             }
@@ -2071,14 +2118,7 @@ impl Parser {
                     self.advance(); // consume (
                     let mut bindings = Vec::new();
                     loop {
-                        let bname = self.expect_ident()?;
-                        // Type annotation is optional: `x: Type` or just `x`
-                        let bty = if self.match_tok(TokenKind::Colon) {
-                            self.read_type_name()?
-                        } else {
-                            String::new() // empty = infer type
-                        };
-                        bindings.push((bname, bty));
+                        self.parse_pat_arg(&mut bindings, nests, ctr)?;
                         if !self.match_tok(TokenKind::Comma) {
                             break;
                         }
@@ -2098,6 +2138,48 @@ impl Parser {
                 tok.line, tok.col, tok.kind
             )),
         }
+    }
+
+    /// One argument inside `Ctor(...)`: either a plain `name [: ty]` binding
+    /// or a nested pattern (`Ok(x)`, `E::V(y)`, `1`, `_`). A nested pattern is
+    /// bound to a fresh `__np` name and recorded in `nests`; the match arm's
+    /// desugar gives it an inner match of its own.
+    fn parse_pat_arg(
+        &mut self,
+        bindings: &mut Vec<(String, String)>,
+        nests: &mut Vec<(String, Pattern)>,
+        ctr: &mut i64,
+    ) -> Result<(), String> {
+        if !matches!(self.peek_token().kind, TokenKind::Ident(_)) {
+            let p = self.parse_pattern(nests, ctr)?;
+            let sn = format!("__np{}", *ctr);
+            *ctr += 1;
+            nests.push((sn.clone(), p));
+            bindings.push((sn, String::new()));
+            return Ok(());
+        }
+        let nested = self.pos + 1 < self.tokens.len()
+            && matches!(
+                self.tokens[self.pos + 1].kind,
+                TokenKind::LParen | TokenKind::DoubleColon
+            );
+        if nested {
+            let p = self.parse_pattern(nests, ctr)?;
+            let sn = format!("__np{}", *ctr);
+            *ctr += 1;
+            nests.push((sn.clone(), p));
+            bindings.push((sn, String::new()));
+            return Ok(());
+        }
+        let bname = self.expect_ident()?;
+        // Type annotation is optional: `x: Type` or just `x`
+        let bty = if self.match_tok(TokenKind::Colon) {
+            self.read_type_name()?
+        } else {
+            String::new() // empty = infer type
+        };
+        bindings.push((bname, bty));
+        Ok(())
     }
 
     fn parse_let(&mut self) -> Result<Stmt, String> {
@@ -3730,4 +3812,100 @@ impl Parser {
 
         Ok(Expr::FString { parts })
     }
+}
+
+/// Desugar a match's arms after parse: an arm whose pattern recorded nested
+/// positions gets a body of inner `match __np { pat => body, _ => <the
+/// remaining arms> }`, applied once per nested position. `marks` —
+/// nests[marks[i] .. marks[i+1]] are arm i's positions; marks.len() ==
+/// arms.len() + 1. Processes the arm list back to front so each arm's
+/// fallthrough is the already-desugared tail.
+fn pd_desugar_arms(
+    scrut: &str,
+    arms: Vec<MatchArm>,
+    nests: &[(String, Pattern)],
+    marks: &[usize],
+    line: usize,
+    as_expr: bool,
+) -> Vec<MatchArm> {
+    let mut rest: Vec<MatchArm> = Vec::new();
+    for i in (0..arms.len()).rev() {
+        let arm = &arms[i];
+        let s = marks[i];
+        let e = marks[i + 1];
+        if s == e {
+            let mut out = vec![arm.clone()];
+            out.extend(rest);
+            rest = out;
+            continue;
+        }
+        let rest_stmts: Vec<Stmt> = if rest.is_empty() {
+            vec![Stmt::Expr(
+                Expr::Call {
+                    callee: "panic".to_string(),
+                    args: vec![Expr::StringLit(
+                        "nested match: no arm matched".to_string(),
+                    )],
+                },
+                line,
+            )]
+        } else if as_expr {
+            vec![Stmt::Expr(
+                Expr::Match {
+                    expr: Box::new(Expr::Ident(scrut.to_string())),
+                    arms: rest.clone(),
+                },
+                line,
+            )]
+        } else {
+            vec![Stmt::Match {
+                expr: Expr::Ident(scrut.to_string()),
+                arms: rest.clone(),
+                line,
+            }]
+        };
+        let mut body = arm.body.clone();
+        // nests are pushed post-order — children before parents — so the
+        // earliest entry is the deepest: it becomes the innermost match
+        // (which carries the arm's guard).
+        for j in s..e {
+            let (name, pat) = &nests[j];
+            let g = if j == s { arm.guard.clone() } else { None };
+            let iarms = vec![
+                MatchArm {
+                    pattern: pat.clone(),
+                    guard: g,
+                    body,
+                },
+                MatchArm {
+                    pattern: Pattern::Wildcard,
+                    guard: None,
+                    body: rest_stmts.clone(),
+                },
+            ];
+            body = if as_expr {
+                vec![Stmt::Expr(
+                    Expr::Match {
+                        expr: Box::new(Expr::Ident(name.clone())),
+                        arms: iarms,
+                    },
+                    line,
+                )]
+            } else {
+                vec![Stmt::Match {
+                    expr: Expr::Ident(name.clone()),
+                    arms: iarms,
+                    line,
+                }]
+            };
+        }
+        let mut out = vec![MatchArm {
+            pattern: arm.pattern.clone(),
+            guard: None,
+            body,
+        }];
+        out.extend(rest);
+        rest = out;
+    }
+    rest
 }

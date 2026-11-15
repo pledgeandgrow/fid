@@ -1,18 +1,23 @@
-// bare-run: run a `fid emit --bare` flat binary on Linux x86-64, without QEMU.
+// bare-run: run a `fid emit --bare` binary on Linux x86-64, without QEMU.
 //
 //   gcc -O2 -o bare-run scripts/bare-run.c
 //   ./bare-run program.bin [load-address]
 //
-// The binary is mapped at its load address (0x10000 by default) with the
-// bare heap at 0x300000, and entered at its first byte in user mode. The
+// The binary is mapped at its load address (0x100000 by default: the
+// bootable image of release G1; 0x10000 for the old flat binary) with the
+// bare heap at 0x300000, and entered at its first byte in user mode (the
+// image's first bytes jump past the boot headers to the 64-bit code; the
+// boot path's mode switch, IDT and PIC set-up are not run). The
 // instructions a user process may not run fault into a SIGSEGV handler that
 // plays the hardware a bare program talks to:
 //   out to COM1 (0x3F8)      the byte goes to stdout
+//   out to 0xF4              QEMU's isa-debug-exit: exit with the byte
+//                            (main's result, or 1 after a panic)
 //   in from COM1+5 (LSR)     "transmitter empty" (other ports read 0)
 //   cli, sti, other in/out   skipped
-//   hlt                      the program is done: exit with main's result
+//   hlt                      the program is done: exit with rax
 // Anything else privileged (lgdt, mov cr3, ...) stops with a message: those
-// need QEMU. Release G1 is about running bare tests under QEMU in CI.
+// need QEMU (scripts/bare-qemu-test.sh).
 #define _GNU_SOURCE
 #include <signal.h>
 #include <stdint.h>
@@ -40,9 +45,12 @@ static void on_fault(int sig, siginfo_t *si, void *ctx) {
     switch (ip[0]) {
     case 0xEE: /* out dx, al */
         if (port == 0x3F8) put((int)(g[REG_RAX] & 0xFF));
+        if (port == 0xF4) _exit((int)(g[REG_RAX] & 0xFF));
         len += 1; break;
     case 0xEF: len += 1; break;                 /* out dx, ax/eax */
-    case 0xE6: case 0xE7: len += 2; break;      /* out imm8, al/eax */
+    case 0xE6: case 0xE7:                       /* out imm8, al/eax */
+        if (ip[1] == 0xF4) _exit((int)(g[REG_RAX] & 0xFF));
+        len += 2; break;
     case 0xEC: /* in al, dx */
         g[REG_RAX] = (g[REG_RAX] & ~(greg_t)0xFF) | (port == 0x3FD ? 0x60 : 0);
         len += 1; break;
@@ -64,13 +72,18 @@ static void on_fault(int sig, siginfo_t *si, void *ctx) {
 
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: bare-run <program.bin> [load-address]\n"); return 2; }
-    uintptr_t load = argc > 2 ? (uintptr_t)strtoull(argv[2], 0, 0) : 0x10000;
+    uintptr_t load = argc > 2 ? (uintptr_t)strtoull(argv[2], 0, 0) : 0x100000;
     FILE *f = fopen(argv[1], "rb");
     if (!f) { perror(argv[1]); return 2; }
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
     fseek(f, 0, SEEK_SET);
-    size_t span = ((size_t)size + (1u << 20) + 0xFFF) & ~(size_t)0xFFF;
+    size_t span = ((size_t)size + (1u << 16) + 0xFFF) & ~(size_t)0xFFF;
+    if (load < 0x300000 && load + span > 0x300000) {
+        fprintf(stderr, "bare-run: the image (%ld bytes at %#lx) runs into the heap at 0x300000\n",
+                size, (unsigned long)load);
+        return 2;
+    }
     void *img = mmap((void *)load, span, PROT_READ | PROT_WRITE | PROT_EXEC,
                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
     if (img == MAP_FAILED || (uintptr_t)img != load) {

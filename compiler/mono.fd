@@ -1943,6 +1943,63 @@ pub fn fixup_generic_calls_stmt(stmt: Stmt, generics: Vec<GenericFuncEntry>, gm:
         Stmt::Match(scrut, arms, line) => {
             return Stmt::Match(fixup_generic_calls_expr(scrut, generics, gm, current_func), fixup_match_arms(arms, generics, gm, current_func), line);
         }
+        // Every block statement too (known-bugs 2g.8: a generic call in
+        // sandbox, region, txn, select, parallel, ... kept its unmangled
+        // name and failed at run time)
+        Stmt::Sandbox(body, line) => { return Stmt::Sandbox(fixup_generic_calls(body, generics, gm, current_func), line); }
+        Stmt::Txn(body, line) => { return Stmt::Txn(fixup_generic_calls(body, generics, gm, current_func), line); }
+        Stmt::SpawnScope(body, line) => { return Stmt::SpawnScope(fixup_generic_calls(body, generics, gm, current_func), line); }
+        Stmt::RegionBlock(name, budget, is_gpu, is_kv, window, body, line) => {
+            return Stmt::RegionBlock(name, budget, is_gpu, is_kv, window, fixup_generic_calls(body, generics, gm, current_func), line);
+        }
+        Stmt::GradBlock(var_name, body, line) => { return Stmt::GradBlock(var_name, fixup_generic_calls(body, generics, gm, current_func), line); }
+        Stmt::Query(components, body, line) => { return Stmt::Query(components, fixup_generic_calls(body, generics, gm, current_func), line); }
+        Stmt::Backward(loss, line) => { return Stmt::Backward(fixup_generic_calls_expr(loss, generics, gm, current_func), line); }
+        Stmt::DerefAssign(ptr_expr, op, expr, line) => {
+            return Stmt::DerefAssign(fixup_generic_calls_expr(ptr_expr, generics, gm, current_func), op, fixup_generic_calls_expr(expr, generics, gm, current_func), line);
+        }
+        Stmt::Break(opt, line) => {
+            match opt {
+                OptBoxExpr::Some(be) => { return Stmt::Break(OptBoxExpr::Some(mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(be), generics, gm, current_func))), line); }
+                OptBoxExpr::None => {}
+            }
+            return Stmt::Break(OptBoxExpr::None, line);
+        }
+        Stmt::Do(effect, op, args, line) => { return Stmt::Do(effect, op, fixup_exprs(args, generics, gm, current_func), line); }
+        Stmt::Parallel(branches, line) => {
+            var nb: Vec<Vec<Stmt>> = Vec::new();
+            var bi: i64 = 0;
+            while bi < branches.len() {
+                nb.push(fixup_generic_calls(branches.get(bi), generics, gm, current_func));
+                bi = bi + 1;
+            }
+            return Stmt::Parallel(nb, line);
+        }
+        Stmt::Select(cases, default, line) => {
+            var nc: Vec<SelectCase> = Vec::new();
+            var ci: i64 = 0;
+            while ci < cases.len() {
+                var c: SelectCase = cases.get(ci);
+                nc.push(SelectCase { channel: fixup_generic_calls_expr(c.channel, generics, gm, current_func), var_name: c.var_name, body: fixup_generic_calls(c.body, generics, gm, current_func) });
+                ci = ci + 1;
+            }
+            var nd: OptStmts = OptStmts::None;
+            match default {
+                OptStmts::Some(db) => { nd = OptStmts::Some(fixup_generic_calls(db, generics, gm, current_func)); }
+                OptStmts::None => {}
+            }
+            return Stmt::Select(nc, nd, line);
+        }
+        Stmt::Handle(body, handlers, line) => {
+            var nh: Vec<EffectHandler> = Vec::new();
+            var hi: i64 = 0;
+            while hi < handlers.len() {
+                var h: EffectHandler = handlers.get(hi);
+                nh.push(EffectHandler { effect: h.effect, op: h.op, params: h.params, body: fixup_generic_calls(h.body, generics, gm, current_func) });
+                hi = hi + 1;
+            }
+            return Stmt::Handle(fixup_generic_calls(body, generics, gm, current_func), nh, line);
+        }
         other => { return other; }
     }
     return stmt;
@@ -2230,9 +2287,95 @@ pub fn fixup_generic_calls_expr(expr: Expr, generics: Vec<GenericFuncEntry>, gm:
             return Expr::Match(mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(scrut), generics, gm, current_func)), fixup_match_arms(arms, generics, gm, current_func));
         }
         Expr::TryBlock(tbody) => { return Expr::TryBlock(fixup_generic_calls(tbody, generics, gm, current_func)); }
+        // known-bugs 2g.8: closures, f-strings, pipes, await/spawn/yield,
+        // ranges, ... were left as they were
+        Expr::Closure(params, body, ret_ty) => {
+            var cf: Func = mono_closure_ctx(current_func, params, body);
+            return Expr::Closure(params, fixup_generic_calls(body, generics, gm, cf), ret_ty);
+        }
+        Expr::FString(parts) => {
+            var np: Vec<FStringPart> = Vec::new();
+            var pi: i64 = 0;
+            while pi < parts.len() {
+                match parts.get(pi) {
+                    FStringPart::Literal(lt) => { np.push(FStringPart::Literal(lt)); }
+                    FStringPart::Expr(pe) => { np.push(FStringPart::Expr(fixup_generic_calls_expr(pe, generics, gm, current_func))); }
+                }
+                pi = pi + 1;
+            }
+            return Expr::FString(np);
+        }
+        Expr::PipeForward(left, right) => {
+            // `a |> f` and `a |> f(b)` are calls f(a) and f(a, b): fixed up
+            // as such, so a generic f is renamed for a's type
+            var nl: Expr = fixup_generic_calls_expr(mn_box_expr_deref(left), generics, gm, current_func);
+            match mn_box_expr_deref(right) {
+                Expr::Ident(fname) => {
+                    if !g_mono_tf_only && generic_funcs_contains(generics, fname) {
+                        var one: Vec<Expr> = Vec::new();
+                        one.push(nl);
+                        return fixup_generic_calls_expr(Expr::Call(fname, one), generics, gm, current_func);
+                    }
+                }
+                Expr::Call(pcallee, pargs) => {
+                    if !g_mono_tf_only && generic_funcs_contains(generics, pcallee) {
+                        var all: Vec<Expr> = Vec::new();
+                        all.push(nl);
+                        var ai: i64 = 0;
+                        while ai < pargs.len() { all.push(pargs.get(ai)); ai = ai + 1; }
+                        return fixup_generic_calls_expr(Expr::Call(pcallee, all), generics, gm, current_func);
+                    }
+                }
+                _ => {}
+            }
+            return Expr::PipeForward(mn_box_expr_new(nl), mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(right), generics, gm, current_func)));
+        }
+        Expr::Await(inner) => { return Expr::Await(mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(inner), generics, gm, current_func))); }
+        Expr::Spawn(inner) => { return Expr::Spawn(mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(inner), generics, gm, current_func))); }
+        Expr::Yield(inner) => { return Expr::Yield(mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(inner), generics, gm, current_func))); }
+        Expr::Comptime(inner) => { return Expr::Comptime(mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(inner), generics, gm, current_func))); }
+        Expr::QuantCast(inner, qt) => { return Expr::QuantCast(mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(inner), generics, gm, current_func)), qt); }
+        Expr::IsCheck(inner, tn) => { return Expr::IsCheck(mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(inner), generics, gm, current_func)), tn); }
+        Expr::NamedArg(an, inner) => { return Expr::NamedArg(an, mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(inner), generics, gm, current_func))); }
+        Expr::OptionalFieldAccess(inner, of) => { return Expr::OptionalFieldAccess(mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(inner), generics, gm, current_func)), of); }
+        Expr::Range(rs, re, incl) => {
+            return Expr::Range(mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(rs), generics, gm, current_func)), mn_box_expr_new(fixup_generic_calls_expr(mn_box_expr_deref(re), generics, gm, current_func)), incl);
+        }
+        Expr::ComptimeBlock(cstmts) => { return Expr::ComptimeBlock(fixup_generic_calls(cstmts, generics, gm, current_func)); }
         other => { return other; }
     }
     return expr;
+}
+
+/// The function a closure's body is typed in: its own parameters first,
+/// then the enclosing function's, and its own body (whose `let`s give its
+/// locals' types). Typed against the enclosing function, a call `inc(v)` on
+/// a closure parameter was mangled `inc__v` and failed at run time.
+fn mono_closure_ctx(outer: Func, params: Vec<Param>, body: Vec<Stmt>) -> Func {
+    var f: Func = outer;
+    var ps: Vec<Param> = Vec::new();
+    var i: i64 = 0;
+    while i < params.len() { ps.push(params.get(i)); i = i + 1; }
+    i = 0;
+    while i < outer.params.len() { ps.push(outer.params.get(i)); i = i + 1; }
+    f.params = ps;
+    var b: Vec<Stmt> = Vec::new();
+    i = 0;
+    while i < body.len() { b.push(body.get(i)); i = i + 1; }
+    i = 0;
+    while i < outer.body.len() { b.push(outer.body.get(i)); i = i + 1; }
+    f.body = b;
+    return f;
+}
+
+fn fixup_exprs(es: Vec<Expr>, generics: Vec<GenericFuncEntry>, gm: Vec<GenericMethodEntry>, current_func: Func) -> Vec<Expr> {
+    var out: Vec<Expr> = Vec::new();
+    var i: i64 = 0;
+    while i < es.len() {
+        out.push(fixup_generic_calls_expr(es.get(i), generics, gm, current_func));
+        i = i + 1;
+    }
+    return out;
 }
 
 // --- Process a function: find calls to generics, instantiate, rewrite ----
@@ -2792,9 +2935,11 @@ pub fn collect_generic_calls_expr_with_hint(
             }
         }
         Expr::Closure(params, body, ret_ty) => {
+            // the closure's own parameters and locals type its calls
+            var cf: Func = mono_closure_ctx(current_func, params, body);
             var i: i64 = 0;
             while i < body.len() {
-                collect_generic_calls_stmt_with_hint(body.get(i), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+                collect_generic_calls_stmt_with_hint(body.get(i), generics, generic_methods, calls, method_calls, cf, OptType::None);
                 i = i + 1;
             }
         }
@@ -2856,8 +3001,33 @@ pub fn collect_generic_calls_expr_with_hint(
         }
         Expr::ComptimeReflect(op, ty) => {}
         Expr::PipeForward(left, right) => {
-            collect_generic_calls_expr_with_hint(mn_box_expr_deref(left), generics, generic_methods, calls, method_calls, current_func, OptType::None);
-            collect_generic_calls_expr_with_hint(mn_box_expr_deref(right), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+            // `a |> f(b)` calls f(a, b): collected as that call
+            var as_call: bool = false;
+            match mn_box_expr_deref(right) {
+                Expr::Ident(fname) => {
+                    if generic_funcs_contains(generics, fname) {
+                        var one: Vec<Expr> = Vec::new();
+                        one.push(mn_box_expr_deref(left));
+                        collect_generic_calls_expr_with_hint(Expr::Call(fname, one), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+                        as_call = true;
+                    }
+                }
+                Expr::Call(pcallee, pargs) => {
+                    if generic_funcs_contains(generics, pcallee) {
+                        var all: Vec<Expr> = Vec::new();
+                        all.push(mn_box_expr_deref(left));
+                        var ai: i64 = 0;
+                        while ai < pargs.len() { all.push(pargs.get(ai)); ai = ai + 1; }
+                        collect_generic_calls_expr_with_hint(Expr::Call(pcallee, all), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+                        as_call = true;
+                    }
+                }
+                _ => {}
+            }
+            if !as_call {
+                collect_generic_calls_expr_with_hint(mn_box_expr_deref(left), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+                collect_generic_calls_expr_with_hint(mn_box_expr_deref(right), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+            }
         }
         Expr::QuantCast(inner, target_ty) => {
             collect_generic_calls_expr_with_hint(mn_box_expr_deref(inner), generics, generic_methods, calls, method_calls, current_func, OptType::None);

@@ -202,6 +202,22 @@ pub fn StringStringFuncEntry_new(key1: str, key2: str, val: Func) -> StringStrin
     return StringStringFuncEntry { key1: key1, key2: key2, val: val };
 }
 
+/// A txn { } being lowered: a snapshot of each live local, restored by
+/// `abort;`, which then jumps to `end_block`. `owned[i]`: the local owns
+/// its value (the snapshot took an owner and is dropped on commit);
+/// otherwise both copies are raw words or bytes. `mark`: own_slots at
+/// entry, so abort drops what the body declared.
+pub struct LwTxn {
+    pub slots: Vec<i64>,
+    pub snaps: Vec<i64>,
+    pub tys: Vec<Type>,
+    pub irtys: Vec<IrType>,
+    pub aggs: Vec<bool>,
+    pub owned: Vec<bool>,
+    pub end_block: i64,
+    pub mark: i64,
+}
+
 // Loop context: (continue_target, break_target, result_slot)
 pub struct LoopContext {
     pub continue_target: i64,
@@ -534,6 +550,8 @@ pub struct Lowerer {
     pub own_loop_slots: Vec<i64>,
     pub own_loop_temps: Vec<i64>,
     pub own_prologue: Vec<i64>,
+    /// txn { } blocks around the statement being lowered
+    pub txn_stack: Vec<LwTxn>,
     /// Lowering a function body whose values are counted
     pub own_on: bool,
     /// Its AST return type
@@ -633,6 +651,7 @@ pub fn Lowerer_new() -> Lowerer {
         own_loop_slots: Vec::new(),
         own_loop_temps: Vec::new(),
         own_prologue: Vec::new(),
+        txn_stack: Vec::new(),
         own_on: false,
         own_ret_ty: Type::Void,
         own_raw_ret: false,
@@ -4002,6 +4021,8 @@ fn Lowerer_lower_func_uncached(self: &mut Lowerer, func: Func) {
     var saved_lslots: Vec<i64> = self.own_loop_slots;
     var saved_ltemps: Vec<i64> = self.own_loop_temps;
     var saved_prologue: Vec<i64> = self.own_prologue;
+    var saved_txn: Vec<LwTxn> = self.txn_stack;
+    self.txn_stack = Vec::new();
     var saved_nomove: Vec<str> = self.own_nomove;
     var saved_on: bool = self.own_on;
     var saved_ret: Type = self.own_ret_ty;
@@ -4023,6 +4044,7 @@ fn Lowerer_lower_func_uncached(self: &mut Lowerer, func: Func) {
     self.own_loop_slots = saved_lslots;
     self.own_loop_temps = saved_ltemps;
     self.own_prologue = saved_prologue;
+    self.txn_stack = saved_txn;
     self.own_nomove = saved_nomove;
     self.own_on = saved_on;
     self.own_ret_ty = saved_ret;
@@ -4928,15 +4950,315 @@ fn Lowerer_lift_parallel_branch(self: &mut Lowerer, branch: Vec<Stmt>) -> i64 {
     self.current_sret = saved_sret;
     self.current_captures = saved_captures;
 
-    var all_args: Vec<i64> = Vec::new();
-    all_args.push(Lowerer_emit_inst(self, Inst::ConstStr(fname)));
-    all_args.push(Lowerer_emit_inst(self, Inst::ConstInt(names.len(), IrType::I64)));
+    // Strings it reads are copied for its thread, as for spawn: two
+    // branches counting the same string's owners would race
+    var arg_exprs: Vec<Expr> = Vec::new();
     pi = 0;
-    while pi < arg_vals.len() {
-        all_args.push(arg_vals.get(pi));
+    while pi < names.len() {
+        arg_exprs.push(Expr::Ident(names.get(pi)));
         pi = pi + 1;
     }
+    return Lowerer_spawn_call(self, fname, arg_exprs, arg_vals);
+}
+
+// --- Values handed to another thread -------------------------------------
+
+/// Start `callee(args)` on a thread of its own (p_thread_spawn). A string,
+/// Vec or HashMap argument is first copied whole (core's p_send_copy: no
+/// buffer and no owner count shared with the caller's value, so neither
+/// thread writes what the other reads); the thread runs a wrapper that
+/// calls `callee` and then frees those copies. `vals` are the lowered args.
+fn Lowerer_spawn_call(self: &mut Lowerer, callee: str, args: Vec<Expr>, vals: Vec<i64>) -> i64 {
+    var tys: Vec<Type> = Vec::new();
+    var irtys: Vec<IrType> = Vec::new();
+    var copied: Vec<bool> = Vec::new();
+    var out: Vec<i64> = Vec::new();
+    var any: bool = false;
+    var i: i64 = 0;
+    while i < vals.len() {
+        var v: i64 = vals.get(i);
+        var t: Type = Type::Infer;
+        if i < args.len() { t = Lowerer_rc_value_type(self, args.get(i), v); }
+        var irty: IrType = Lowerer_get_value_type(self, v);
+        var k: i64 = Lowerer_rc_kind(self, t);
+        var tid: i64 = 0;
+        if k == RC_STR { tid = 1; }   // core P_TID_STR
+        if k == RC_VEC { tid = 2; }   // P_TID_VEC
+        if k == RC_MAP { tid = 3; }   // P_TID_MAP
+        var nv: i64 = v;
+        if tid != 0 {
+            var ca: Vec<i64> = Vec::new();
+            ca.push(Lowerer_rc_env(self));
+            ca.push(Lowerer_rc_as_i64(self, v));
+            ca.push(Lowerer_emit_inst(self, Inst::ConstInt(tid, IrType::I64)));
+            nv = Lowerer_emit_inst(self, Inst::Call("p_send_copy", ca, IrType::I64, lw_rc_eff()));
+            match irty {
+                IrType::I64 => {}
+                _ => { nv = Lowerer_emit_inst(self, Inst::BitCast(nv, IrType::I64, irty)); }
+            }
+            any = true;
+        }
+        match t {
+            Type::Infer => { t = ir_type_to_ast_type(irty); }
+            _ => {}
+        }
+        tys.push(t);
+        irtys.push(irty);
+        copied.push(tid != 0);
+        out.push(nv);
+        i = i + 1;
+    }
+    var entry: str = callee;
+    if any {
+        var w: str = Lowerer_spawn_wrapper(self, callee, tys, copied);
+        if w != "" { entry = w; }
+    }
+    var all_args: Vec<i64> = Vec::new();
+    all_args.push(Lowerer_emit_inst(self, Inst::ConstStr(entry)));
+    all_args.push(Lowerer_emit_inst(self, Inst::ConstInt(out.len(), IrType::I64)));
+    i = 0;
+    while i < out.len() {
+        all_args.push(out.get(i));
+        i = i + 1;
+    }
     return Lowerer_emit_inst(self, Inst::Call("p_thread_spawn", all_args, IrType::I64, EffectSet_new()));
+}
+
+/// `fn __spawn_N(a0: T0, ..) -> R { var r = callee(a0, ..); free the copied
+/// args; return r; }`, lowered now; its name, or "" when callee's result is
+/// not one word (a struct): the copies then live until the program ends.
+fn Lowerer_spawn_wrapper(self: &mut Lowerer, callee: str, tys: Vec<Type>, copied: Vec<bool>) -> str {
+    var ret: Type = Type::Void;
+    match Lowerer_lookup_func_ret_type(self, callee) {
+        OptType::Some(rt) => { ret = rt; }
+        OptType::None => { return ""; }
+    }
+    var is_void: bool = false;
+    match ret {
+        Type::Void => { is_void = true; }
+        _ => {}
+    }
+    if !is_void {
+        var rk: i64 = Lowerer_rc_kind(self, ret);
+        if rk == RC_MEM || rk == RC_BOX { return ""; }
+        if !lw_par_word(Lowerer_lower_type(self, ret)) { return ""; }
+    }
+    self.continuation_counter = self.continuation_counter + 1;
+    var fname: str = "__spawn_" + int_to_str(self.continuation_counter);
+    var params: Vec<Param> = Vec::new();
+    var cargs: Vec<Expr> = Vec::new();
+    var i: i64 = 0;
+    while i < tys.len() {
+        var pn: str = "__sa" + int_to_str(i);
+        params.push(Param_new(pn, tys.get(i), false));
+        cargs.push(Expr::Ident(pn));
+        i = i + 1;
+    }
+    var call: Expr = Expr::Call(callee, cargs);
+    var body: Vec<Stmt> = Vec::new();
+    if is_void {
+        body.push(Stmt::Expr(call, 0));
+    } else {
+        body.push(Stmt::Let("__sr", OptType::Some(ret), call, true, false, Vec::new(), 0));
+    }
+    i = 0;
+    while i < tys.len() {
+        if copied.get(i) {
+            var da: Vec<Expr> = Vec::new();
+            da.push(Expr::Ident("__sa" + int_to_str(i)));
+            body.push(Stmt::Expr(Expr::Call("__thread_drop", da), 0));
+        }
+        i = i + 1;
+    }
+    if !is_void { body.push(Stmt::Return(OptBoxExpr::Some(Box::new(Expr::Ident("__sr"))), 0)); }
+    var wf: Func = Func_new_full(fname, params, ret, body, false);
+
+    var saved_func: IrFunction = self.current_func;
+    var saved_has_func: bool = self.has_current_func;
+    var saved_allocas: Vec<StringValueIdEntry> = self.allocas;
+    var saved_alloca_types: Vec<I64IrTypeEntry> = self.alloca_types;
+    var saved_var_ast_types: Vec<StringTypeEntry> = self.var_ast_types;
+    var saved_block: i64 = self.current_block;
+    var saved_sret: OptValueId = self.current_sret;
+    var saved_captures: Vec<ClosureCapture> = self.current_captures;
+    self.current_captures = Vec::new();
+    Lowerer_insert_func_ret_type(self, fname, ret);
+    Lowerer_lower_func(self, wf);
+    self.current_func = saved_func;
+    self.has_current_func = saved_has_func;
+    self.allocas = saved_allocas;
+    self.alloca_types = saved_alloca_types;
+    self.var_ast_types = saved_var_ast_types;
+    self.current_block = saved_block;
+    self.current_sret = saved_sret;
+    self.current_captures = saved_captures;
+    return fname;
+}
+
+// --- txn { } and abort; ----------------------------------------------------
+
+/// A plain stack slot of type `ty` in the entry block (not owned).
+fn Lowerer_txn_raw_slot(self: &mut Lowerer, ty: IrType) -> i64 {
+    var a: i64 = lw_detached(&mut self.current_func, Inst::Alloca(ty, Region::Stack));
+    self.own_prologue.push(a);
+    return a;
+}
+
+/// Copy the bytes of a local of aggregate type `ty` from `src` to `dst`: a
+/// struct by a struct store, an array word by word.
+fn Lowerer_txn_copy(self: &mut Lowerer, dst: i64, src: i64, ty: IrType) {
+    match ty {
+        IrType::Array(_, _) => {
+            var size: i64 = IrModule_type_size(&self.module, ty);
+            var a: Vec<i64> = Vec::new();
+            a.push(Lowerer_rc_env(self));
+            a.push(Lowerer_rc_as_i64(self, dst));
+            a.push(Lowerer_rc_as_i64(self, src));
+            a.push(Lowerer_emit_inst(self, Inst::ConstInt((size + 7) / 8, IrType::I64)));
+            Lowerer_emit_inst(self, Inst::Call("p_copy_words", a, IrType::Void, lw_rc_eff()));
+            return;
+        }
+        _ => {}
+    }
+    Lowerer_emit_inst(self, Inst::Store(dst, src, OptIrType::Some(ty)));
+}
+
+/// Whether allocas[i] is the binding its name refers to now (not shadowed).
+fn Lowerer_txn_latest(self: &Lowerer, i: i64) -> bool {
+    var name: str = self.allocas.get(i).key;
+    var j: i64 = i + 1;
+    while j < self.allocas.len() {
+        if self.allocas.get(j).key == name { return false; }
+        j = j + 1;
+    }
+    return true;
+}
+
+/// Open a txn: an ownership scope (the snapshots are its slots), a
+/// snapshot of each live local, and the block after the txn.
+fn Lowerer_txn_open(self: &mut Lowerer) -> LwTxn {
+    var tx: LwTxn = LwTxn {
+        slots: Vec::new(), snaps: Vec::new(), tys: Vec::new(), irtys: Vec::new(),
+        aggs: Vec::new(), owned: Vec::new(),
+        end_block: Lowerer_new_block(self), mark: self.own_slots.len(),
+    };
+    Lowerer_rc_scope_open(self);
+    var n: i64 = self.allocas.len();
+    var i: i64 = 0;
+    while i < n {
+        var ent: StringValueIdEntry = self.allocas.get(i);
+        if ent.val >= 0 && Lowerer_txn_latest(self, i) {
+            var slot: i64 = ent.val;
+            var irty: IrType = IrType::Void;
+            match Lowerer_lookup_alloca_type(self, slot) {
+                OptIrType::Some(at) => { irty = at; }
+                OptIrType::None => {}
+            }
+            var t: Type = Type::Infer;
+            match Lowerer_lookup_var_ast_type(self, ent.key) {
+                OptType::Some(vt) => { t = vt; }
+                OptType::None => {}
+            }
+            var is_void: bool = false;
+            match irty {
+                IrType::Void => { is_void = true; }
+                _ => {}
+            }
+            if !is_void { Lowerer_txn_snapshot(self, &mut tx, slot, irty, t); }
+        }
+        i = i + 1;
+    }
+    return tx;
+}
+
+/// Snapshot one local: an owned value gets one more owner (a Vec, a map or
+/// a string is shared copy-on-write, so later changes leave the snapshot
+/// alone); anything else is copied as it is.
+fn Lowerer_txn_snapshot(self: &mut Lowerer, tx: &mut LwTxn, slot: i64, irty: IrType, t: Type) {
+    var agg: bool = false;
+    match irty {
+        IrType::Struct(_) => { agg = true; }
+        IrType::Array(_, _) => { agg = true; }
+        _ => {}
+    }
+    var k: i64 = RC_NONE;
+    if self.own_on && Lowerer_rc_owns_slot(self, slot) { k = Lowerer_rc_kind(self, t); }
+    var owned: bool = k != RC_NONE;
+    var snap: i64 = 0;
+    if agg {
+        if owned && k == RC_MEM { snap = Lowerer_rc_new_slot(self, irty, t); }
+        else { snap = Lowerer_txn_raw_slot(self, irty); owned = false; }
+        Lowerer_txn_copy(self, snap, slot, irty);
+        if owned {
+            Lowerer_rc_call_mem(self, "__own_dup_", snap, t);
+            Lowerer_rc_add_slot(self, snap, t);
+        }
+    } else {
+        if k == RC_MEM { owned = false; }
+        var cur: i64 = Lowerer_emit_inst(self, Inst::Load(slot, irty));
+        if owned {
+            snap = Lowerer_rc_new_slot(self, irty, t);
+            var dup: i64 = Lowerer_rc_dup(self, cur, t);
+            Lowerer_emit_inst(self, Inst::Store(snap, dup, OptIrType::None));
+            Lowerer_rc_add_slot(self, snap, t);
+        } else {
+            snap = Lowerer_txn_raw_slot(self, irty);
+            Lowerer_emit_inst(self, Inst::Store(snap, cur, OptIrType::None));
+        }
+    }
+    tx.slots.push(slot);
+    tx.snaps.push(snap);
+    tx.tys.push(t);
+    tx.irtys.push(irty);
+    tx.aggs.push(agg);
+    tx.owned.push(owned);
+}
+
+/// `abort;`: drop what the body declared, put every snapshotted local back
+/// (an owned one drops what it holds now and takes the snapshot over), and
+/// leave the innermost txn.
+fn Lowerer_txn_abort(self: &mut Lowerer) {
+    if self.txn_stack.len() == 0 { return; }
+    var tx: LwTxn = self.txn_stack.get(self.txn_stack.len() - 1);
+    var j: i64 = self.own_slots.len() - 1;
+    while j >= tx.mark {
+        var os: OwnSlot = self.own_slots.get(j);
+        var is_snap: bool = false;
+        var q: i64 = 0;
+        while q < tx.snaps.len() {
+            if tx.snaps.get(q) == os.slot { is_snap = true; }
+            q = q + 1;
+        }
+        if !is_snap { Lowerer_rc_drop_slot(self, os); }
+        j = j - 1;
+    }
+    var i: i64 = 0;
+    while i < tx.slots.len() {
+        var slot: i64 = tx.slots.get(i);
+        var snap: i64 = tx.snaps.get(i);
+        var t: Type = tx.tys.get(i);
+        var irty: IrType = tx.irtys.get(i);
+        if tx.aggs.get(i) {
+            if tx.owned.get(i) { Lowerer_rc_call_mem(self, "__own_drop_", slot, t); }
+            Lowerer_txn_copy(self, slot, snap, irty);
+            // the snapshot moved back: its slot no longer owns it
+            if tx.owned.get(i) { Lowerer_rc_clear_slot(self, snap, t); }
+        } else {
+            if tx.owned.get(i) {
+                var now: i64 = Lowerer_emit_inst(self, Inst::Load(slot, irty));
+                Lowerer_rc_drop(self, now, t);
+            }
+            var back: i64 = Lowerer_emit_inst(self, Inst::Load(snap, irty));
+            Lowerer_emit_inst(self, Inst::Store(slot, back, OptIrType::None));
+            if tx.owned.get(i) { Lowerer_rc_clear_slot(self, snap, t); }
+        }
+        i = i + 1;
+    }
+    Lowerer_emit_inst(self, Inst::TxnEnd);
+    Lowerer_emit_terminator(self, Inst::Jump(tx.end_block));
+    // what follows `abort;` in its block is not reached
+    var dead: i64 = Lowerer_new_block(self);
+    Lowerer_set_current_block(self, dead);
 }
 
 // --- Lowerer_lower_stmt helper functions ----------------------------------
@@ -5433,6 +5755,16 @@ fn Lowerer_lower_let_stmt(self: &mut Lowerer, name: str, ty: OptType, expr: Expr
                     Type::Infer => { own_ty = Lowerer_rc_expr_type(self, expr); }
                     _ => {}
                 }
+                // a generic struct literal: Pair<i64, str>, not Pair
+                match expr {
+                    Expr::StructLit(_, _, _) => {
+                        match Lowerer_infer_expr_ast_type(self, expr) {
+                            Type::Generic(gsn, gsa) => { own_ty = Type::Generic(gsn, gsa); }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
         lval = Lowerer_rc_own_value(self, lval, own_ty);
@@ -5543,10 +5875,21 @@ fn Lowerer_lower_let_stmt(self: &mut Lowerer, name: str, ty: OptType, expr: Expr
             Lowerer_insert_var_ast_type(self, name, ast_ty);
         }
         OptType::None => {
-            var inferred: Type = Lowerer_infer_expr_ast_type(self, expr);
-            match inferred {
-                Type::I64 => {}
-                _ => { Lowerer_insert_var_ast_type(self, name, inferred); }
+            // The type ownership worked out for the value (a struct
+            // literal's, a call's): without it `var t = s` of an
+            // unannotated struct `s` took no owner of its Vec fields, so
+            // `t.v.push(..)` changed `s.v` too (known-bugs 2g.3)
+            var known_own: bool = false;
+            if self.own_on && Lowerer_rc_kind(self, own_ty) != RC_NONE {
+                Lowerer_insert_var_ast_type(self, name, own_ty);
+                known_own = true;
+            }
+            if !known_own {
+                var inferred: Type = Lowerer_infer_expr_ast_type(self, expr);
+                match inferred {
+                    Type::I64 => {}
+                    _ => { Lowerer_insert_var_ast_type(self, name, inferred); }
+                }
             }
         }
     }
@@ -5874,6 +6217,11 @@ fn Lowerer_lower_stmt_inner(self: &mut Lowerer, stmt: Stmt) {
             }
             Lowerer_insert_alloca_type(self, alloca, ir_ty);
             Lowerer_insert_alloca(self, name, alloca);
+            // Its type, as a `let` records it: `m = mm` later must know it
+            // owns an M, or it takes no owner of the value it keeps while
+            // the slot is still dropped as an M (known-bugs 2g.2: a match
+            // payload assigned to `var m: M;` was freed twice)
+            Lowerer_insert_var_ast_type(self, name, ty);
             Lowerer_bind_local(self, name, alloca);
             // F88: @zeroize — track locals to zero at scope exit
             if has_annotation(annotations, "zeroize") {
@@ -6354,15 +6702,27 @@ fn Lowerer_lower_stmt_inner(self: &mut Lowerer, stmt: Stmt) {
             self.sandbox_depth = self.sandbox_depth - 1;
         }
         Stmt::Txn(body, _line) => {
+            // Every live local is snapshotted; `abort;` puts them back and
+            // leaves the block, the normal end drops the snapshots (commit).
+            // Same lowering for every backend: TxnBegin/TxnEnd only matter
+            // to the interpreter.
+            var tx: LwTxn = Lowerer_txn_open(self);
             var _tb: i64 = Lowerer_emit_inst(self, Inst::TxnBegin);
+            self.txn_stack.push(tx);
             var si: i64 = 0;
             while si < body.len() {
                 Lowerer_lower_stmt(self, body.get(si));
                 si = si + 1;
             }
+            self.txn_stack.pop();
             if !Lowerer_current_block_has_terminator(self) {
                 var _te: i64 = Lowerer_emit_inst(self, Inst::TxnEnd);
             }
+            Lowerer_rc_scope_close(self);
+            if !Lowerer_current_block_has_terminator(self) {
+                Lowerer_emit_terminator(self, Inst::Jump(tx.end_block));
+            }
+            Lowerer_set_current_block(self, tx.end_block);
         }
         Stmt::ComptimeGen(_body, _line) => {
             // Comptime gen blocks are processed before lowering - no-op here
@@ -6415,17 +6775,13 @@ fn Lowerer_lower_stmt_inner(self: &mut Lowerer, stmt: Stmt) {
                             match e {
                                 Expr::Call(callee, args) => {
                                     // Spawn: p_thread_spawn(func_name, num_args, args...)
-                                    var func_name_val: i64 = Lowerer_emit_inst(self, Inst::ConstStr(callee));
-                                    var num_args_val: i64 = Lowerer_emit_inst(self, Inst::ConstInt(args.len(), IrType::I64));
-                                    var all_args: Vec<i64> = Vec::new();
-                                    all_args.push(func_name_val);
-                                    all_args.push(num_args_val);
+                                    var pvals: Vec<i64> = Vec::new();
                                     var ai: i64 = 0;
                                     while ai < args.len() {
-                                        all_args.push(Lowerer_lower_expr(self, args.get(ai)));
+                                        pvals.push(Lowerer_lower_expr(self, args.get(ai)));
                                         ai = ai + 1;
                                     }
-                                    var handle: i64 = Lowerer_emit_inst(self, Inst::Call("p_thread_spawn", all_args, IrType::I64, EffectSet_new()));
+                                    var handle: i64 = Lowerer_spawn_call(self, callee, args, pvals);
                                     thread_handles.push(handle);
                                     spawned = true;
                                 }
@@ -6461,15 +6817,7 @@ fn Lowerer_lower_stmt_inner(self: &mut Lowerer, stmt: Stmt) {
                                             aai = aai + 1;
                                         }
                                         if words && lw_par_word(Lowerer_lookup_func_ret_ty_ir(self, acallee)) {
-                                            var sargs: Vec<i64> = Vec::new();
-                                            sargs.push(Lowerer_emit_inst(self, Inst::ConstStr(acallee)));
-                                            sargs.push(Lowerer_emit_inst(self, Inst::ConstInt(aargs.len(), IrType::I64)));
-                                            aai = 0;
-                                            while aai < avals.len() {
-                                                sargs.push(avals.get(aai));
-                                                aai = aai + 1;
-                                            }
-                                            var rh: i64 = Lowerer_emit_inst(self, Inst::Call("p_thread_spawn", sargs, IrType::I64, EffectSet_new()));
+                                            var rh: i64 = Lowerer_spawn_call(self, acallee, aargs, avals);
                                             result_handles.push(rh);
                                             result_slots.push(slot);
                                             spawned = true;
@@ -7243,6 +7591,53 @@ fn Lowerer_vec_set_mem(self: &mut Lowerer, arr: i64, idx: i64, val: i64, elem_ty
     a.push(Lowerer_emit_inst(self, Inst::ConstInt(tid, IrType::I64)));
     Lowerer_emit_inst(self, Inst::Call("Vec_set_mem", a, IrType::Void, lw_rc_eff()));
     return true;
+}
+
+/// Release D15: `&v[i]` / `&mut v[i]` refer to the element where it is
+/// stored (core `Vec_elem_addr`, or the array element's address), so a write
+/// through the reference changes the container. The borrow checker keeps the
+/// container unchanged while the reference lives. Off: the element is copied
+/// to a temporary and the reference points at the copy (writes are lost).
+const LOWER_REF_INDEX: bool = true;
+
+fn Lowerer_ref_index_addr(self: &mut Lowerer, arr: Box<Expr>, idx: Box<Expr>, is_mut: bool) -> i64 {
+    var et: Type = Lowerer_infer_expr_ast_type(self, Expr::Index(arr, idx));
+    var arr_val: i64 = Lowerer_lower_expr(self, lw_box_expr_unbox(arr));
+    // through a `&Vec` / `&mut Vec`: the Vec it refers to
+    arr_val = Lowerer_auto_deref_recv(self, arr_val, Lowerer_get_value_type(self, arr_val));
+    var idx_val: i64 = Lowerer_lower_expr(self, lw_box_expr_unbox(idx));
+    var arr_ty: IrType = Lowerer_get_value_type(self, arr_val);
+    if ir_type_is_opaque_named(arr_ty, "Vec") || ir_type_eq(arr_ty, IrType::I64) {
+        var elem_ty: IrType = Lowerer_lower_type(self, et);
+        var is_struct: i64 = 0;
+        match elem_ty {
+            IrType::Struct(_) => { is_struct = 1; }
+            _ => {}
+        }
+        var w: i64 = 0;
+        if is_mut { w = 1; }
+        var a: Vec<i64> = Vec::new();
+        a.push(Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64)));
+        a.push(arr_val);
+        a.push(idx_val);
+        a.push(Lowerer_emit_inst(self, Inst::ConstInt(w, IrType::I64)));
+        a.push(Lowerer_emit_inst(self, Inst::ConstInt(is_struct, IrType::I64)));
+        var raw: i64 = Lowerer_emit_inst(self, Inst::Call("Vec_elem_addr", a, IrType::I64, lw_rc_eff()));
+        return Lowerer_emit_inst(self, Inst::BitCast(raw, IrType::I64, IrType::Ptr(Box::new(elem_ty))));
+    }
+    // a fixed-size array: the element's address
+    var aelem: IrType = IrType::I64;
+    match arr_ty {
+        IrType::Array(inner, _) => { aelem = box_ir_type_unbox(inner); }
+        IrType::Ptr(inner2) => {
+            match box_ir_type_unbox(inner2) {
+                IrType::Array(inner3, _) => { aelem = box_ir_type_unbox(inner3); }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    return Lowerer_emit_inst(self, Inst::GetElemPtr(arr_val, idx_val, aelem));
 }
 
 // Helper: box a struct value at the last index of call_args
@@ -8190,7 +8585,19 @@ fn Lowerer_lower_field_access_expr(self: &mut Lowerer, obj: Box<Expr>, field: st
         IrType::Struct(_) => { return field_ptr; }
         _ => {}
     }
-    return Lowerer_emit_inst(self, Inst::Load(field_ptr, field_ty));
+    var loaded: i64 = Lowerer_emit_inst(self, Inst::Load(field_ptr, field_ty));
+    // A type-parameter field of a generic struct: its word, read as the
+    // instance's type (Pair<f64, str>: an f64 and a string)
+    if Lowerer_field_is_type_param(self, struct_name, field) {
+        var want: IrType = Lowerer_lower_type(self, Lowerer_infer_expr_ast_type(self, Expr::FieldAccess(obj, field)));
+        match want {
+            IrType::I64 => {}
+            IrType::Struct(_) => {}
+            IrType::Void => {}
+            _ => { loaded = Lowerer_emit_inst(self, Inst::BitCast(loaded, field_ty, want)); }
+        }
+    }
+    return loaded;
 }
 
 // &obj.field — the field's address (GetFieldPtr), used by Expr::Ref so a
@@ -9013,6 +9420,17 @@ fn Lowerer_lower_struct_lit_expr(self: &mut Lowerer, name: str, fields: Vec<Fiel
                             Lowerer_rc_drop(self, Lowerer_emit_inst(self, Inst::Load(field_ptr, field_ty)), lfty);
                         }
                     }
+                    // A type-parameter field holds the value's bits as a word
+                    // (an f64 is not converted to an integer, a string's
+                    // pointer is kept), as a generic enum's payload does
+                    if Lowerer_field_is_type_param(self, real_name, field_init.name) {
+                        var fvt: IrType = Lowerer_get_value_type(self, field_val);
+                        match fvt {
+                            IrType::I64 => {}
+                            IrType::Struct(_) => {}
+                            _ => { field_val = Lowerer_emit_inst(self, Inst::BitCast(field_val, fvt, IrType::I64)); }
+                        }
+                    }
                     match field_ty {
                         IrType::Struct(field_struct_name) => {
                             Lowerer_emit_struct_copy(self, field_val, field_ptr, field_struct_name);
@@ -9414,6 +9832,21 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
             return Lowerer_emit_inst(self, Inst::UnaryOp(op, operand, result_ty));
         }
         Expr::Call(callee, args) => {
+            if callee == "__txn_abort" {
+                Lowerer_txn_abort(self);
+                return Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
+            }
+            // A spawn wrapper frees the copy its thread was given
+            if callee == "__thread_drop" && args.len() == 1 {
+                match args.get(0) {
+                    Expr::Ident(dn) => {
+                        var dv: i64 = Lowerer_lower_expr(self, args.get(0));
+                        Lowerer_rc_drop(self, dv, Lowerer_rc_var_type(self, dn));
+                    }
+                    _ => {}
+                }
+                return Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
+            }
             return Lowerer_lower_call_expr(self, callee, args);
         }
         Expr::MethodCall(receiver, method, args) => {
@@ -9633,6 +10066,12 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
                 Expr::Deref(inner) => {
                     // &*p — the pointer itself.
                     return Lowerer_lower_expr(self, lw_box_expr_unbox(inner));
+                }
+                Expr::Index(rarr, ridx) => {
+                    // &v[i] / &mut v[i]: the element's address, not a copy (D15)
+                    if LOWER_REF_INDEX {
+                        return Lowerer_ref_index_addr(self, rarr, ridx, is_mut);
+                    }
                 }
                 _ => {}
             }
@@ -10202,17 +10641,13 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
                         return Lowerer_lower_expr(self, lw_box_expr_unbox(e));
                     }
                     // spawn func(args) - p_thread_spawn(func_name, num_args, args...)
-                    var func_name_val: i64 = Lowerer_emit_inst(self, Inst::ConstStr(callee));
-                    var num_args_val: i64 = Lowerer_emit_inst(self, Inst::ConstInt(args.len(), IrType::I64));
-                    var all_args: Vec<i64> = Vec::new();
-                    all_args.push(func_name_val);
-                    all_args.push(num_args_val);
+                    var svals: Vec<i64> = Vec::new();
                     var ai: i64 = 0;
                     while ai < args.len() {
-                        all_args.push(Lowerer_lower_expr(self, args.get(ai)));
+                        svals.push(Lowerer_lower_expr(self, args.get(ai)));
                         ai = ai + 1;
                     }
-                    return Lowerer_emit_inst(self, Inst::Call("p_thread_spawn", all_args, IrType::I64, EffectSet_new()));
+                    return Lowerer_spawn_call(self, callee, args, svals);
                 }
                 _ => {
                     // Non-call spawn - fall back to eager evaluation
@@ -12065,6 +12500,60 @@ pub fn Lowerer_infer_expr_ast_type(self: &Lowerer, expr: Expr) -> Type {
         Expr::EnumLit(en, variant, args) => {
             return Lowerer_enum_lit_ast_type(self, en, variant, args);
         }
+        Expr::StructLit(sln, slf, _) => { return Lowerer_struct_lit_ast_type(self, sln, slf); }
+        // A field of a generic struct instance: its declared type with the
+        // instance's type arguments
+        Expr::FieldAccess(fobj, ffield) => {
+            var ot: Type = Lowerer_infer_expr_ast_type(self, lw_box_expr_unbox(fobj));
+            match ot {
+                Type::Ref(inner, _) => { ot = lw_box_type_unbox(inner); }
+                _ => {}
+            }
+            match ot {
+                Type::Generic(gn, gargs) => {
+                    match Lowerer_lookup_struct(self, gn) {
+                        OptStructDef::Some(sd) => {
+                            var i: i64 = 0;
+                            while i < sd.fields.len() {
+                                if sd.fields.get(i).name == ffield { return lw_rc_subst(sd.fields.get(i).ty, sd.type_params, gargs); }
+                                i = i + 1;
+                            }
+                        }
+                        OptStructDef::None => {}
+                    }
+                }
+                _ => {}
+            }
+            return Type::I64;
+        }
+        // `spawn f(..)` is a Future of what f returns; `await` gives it
+        Expr::Spawn(sp) => {
+            match lw_box_expr_unbox(sp) {
+                Expr::Call(scallee, _) => {
+                    match Lowerer_lookup_func_ret_type(self, scallee) {
+                        OptType::Some(srt) => {
+                            match srt {
+                                Type::Generic(sgn, _) => { if sgn == "Future" { return srt; } }
+                                _ => {}
+                            }
+                            var fa: Vec<Type> = Vec::new();
+                            fa.push(srt);
+                            return Type::Generic("Future", fa);
+                        }
+                        OptType::None => {}
+                    }
+                }
+                _ => {}
+            }
+            return Type::I64;
+        }
+        Expr::Await(aw) => {
+            match Lowerer_infer_expr_ast_type(self, lw_box_expr_unbox(aw)) {
+                Type::Generic(agn, aga) => { if agn == "Future" && aga.len() == 1 { return aga.get(0); } }
+                _ => {}
+            }
+            return Type::I64;
+        }
         // What `unwrap` or `get` returns: the type argument of the receiver
         Expr::MethodCall(recv, m, _) => {
             match Lowerer_infer_expr_ast_type(self, lw_box_expr_unbox(recv)) {
@@ -12342,6 +12831,67 @@ fn lw_rc_eff() -> EffectSet {
 
 /// `t` with each of `params` replaced by the argument at its position (a
 /// parameter without one is unknown).
+/// Whether field `field` of struct `sn` is declared as one of the struct's
+/// type parameters (`first: A` in `struct Pair<A, B>`): such a field is
+/// held as one word, whatever the instance's type for it.
+fn Lowerer_field_is_type_param(self: &Lowerer, sn: str, field: str) -> bool {
+    match Lowerer_lookup_struct(self, sn) {
+        OptStructDef::Some(sd) => {
+            if sd.type_params.len() == 0 { return false; }
+            var i: i64 = 0;
+            while i < sd.fields.len() {
+                if sd.fields.get(i).name == field {
+                    match sd.fields.get(i).ty {
+                        Type::Named(n) => { return lw_c_str_vec_contains(sd.type_params, n); }
+                        _ => {}
+                    }
+                }
+                i = i + 1;
+            }
+        }
+        OptStructDef::None => {}
+    }
+    return false;
+}
+
+/// A generic struct literal's type: Pair<A, B> with the types of the
+/// values given to its type-parameter fields (known-bugs 2f.11).
+fn Lowerer_struct_lit_ast_type(self: &Lowerer, name: str, fields: Vec<FieldInit>) -> Type {
+    match Lowerer_lookup_struct(self, name) {
+        OptStructDef::Some(sd) => {
+            if sd.type_params.len() == 0 { return Type::Named(name); }
+            var args: Vec<Type> = Vec::new();
+            var ti: i64 = 0;
+            while ti < sd.type_params.len() {
+                var found: Type = Type::I64;
+                var fi: i64 = 0;
+                while fi < sd.fields.len() {
+                    match sd.fields.get(fi).ty {
+                        Type::Named(n) => {
+                            if n == sd.type_params.get(ti) {
+                                var k: i64 = 0;
+                                while k < fields.len() {
+                                    if fields.get(k).name == sd.fields.get(fi).name {
+                                        found = Lowerer_infer_expr_ast_type(self, fields.get(k).value);
+                                    }
+                                    k = k + 1;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    fi = fi + 1;
+                }
+                args.push(found);
+                ti = ti + 1;
+            }
+            return Type::Generic(name, args);
+        }
+        OptStructDef::None => {}
+    }
+    return Type::Named(name);
+}
+
 fn lw_rc_subst(t: Type, params: Vec<str>, args: Vec<Type>) -> Type {
     match t {
         Type::Named(n) => {

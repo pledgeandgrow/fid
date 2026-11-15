@@ -61,6 +61,14 @@ Ok(Type),
 Err(str),
 }
 
+/// LG8: a synthetic binding for a nested pattern position. `Ok(x)` in
+/// `Some(Ok(x))` records ("__np0", Ok(x)-pattern); the match arm's
+/// desugar turns it into an inner match on __np0.
+pub struct PatNest {
+    pub name: str,
+    pub pat: Pattern,
+}
+
 pub enum ParseResultPattern {
 Ok(Pattern),
 Err(str),
@@ -3003,12 +3011,17 @@ match self.expect(TokenKind::LBrace, "{") {
     ParseResultUnit::Ok => {}
 }
 var arms: Vec<MatchArm> = Vec::new();
+var nests: Vec<PatNest> = Vec::new();
+var npctr: i64 = 0;
+var marks: Vec<i64> = Vec::new();
+marks.push(0);
 while !self.check(TokenKind::RBrace) && !self.is_at_end() {
     var pattern: Pattern = Pattern::Wildcard;
-    match self.parse_pattern() {
+    match self.parse_pattern(&mut nests, &mut npctr) {
         ParseResultPattern::Ok(p) => { pattern = p; }
         ParseResultPattern::Err(e) => { return ParseResultStmt::Err(e); }
     }
+    marks.push(nests.len());
     var match_guard: OptBoxExpr = OptBoxExpr::None;
     if self.check(TokenKind::If) {
         self.advance();
@@ -3040,6 +3053,15 @@ while !self.check(TokenKind::RBrace) && !self.is_at_end() {
 match self.expect(TokenKind::RBrace, "}") {
     ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
     ParseResultUnit::Ok => {}
+}
+if nests.len() > 0 {
+    // LG8: nested patterns desugar to inner matches. Bind the scrutinee
+    // once so the inner fallthrough matches never re-evaluate it.
+    var vstmts: Vec<Stmt> = Vec::new();
+    vstmts.push(Stmt::Let("__ms", OptType::None, expr, false, false, Vec::new(), line));
+    arms = self.pd_desugar_arms("__ms", arms, nests, marks, 0, line, false);
+    vstmts.push(Stmt::Match(Expr::Ident("__ms"), arms, line));
+    return ParseResultStmt::Ok(Stmt::If(Expr::BoolLit(true), vstmts, OptStmts::None, line));
 }
 return ParseResultStmt::Ok(Stmt::Match(expr, arms, line));
 }
@@ -3842,7 +3864,7 @@ match self.expect(TokenKind::RBrace, "}") {
 return ParseResultStmt::Ok(Stmt::GradBlock(grad_var, body, line));
 }
 
-fn parse_pattern(self: &mut Parser) -> ParseResultPattern {
+fn parse_pattern(self: &mut Parser, nests: &mut Vec<PatNest>, ctr: &mut i64) -> ParseResultPattern {
 var tok: Token = self.peek_token();
 var k: TokenKind = tok.kind;
 
@@ -3926,19 +3948,10 @@ if token_kind_eq(k, TokenKind::Ident("")) {
         var bindings: Vec<Binding> = Vec::new();
         if self.match_tok(TokenKind::LParen) {
             loop {
-                var bname: str = "";
-                match self.expect_ident() {
-                    ParseResultStr::Ok(s) => { bname = s; }
-                    ParseResultStr::Err(e) => { return ParseResultPattern::Err(e); }
+                match self.parse_pat_arg(&mut bindings, nests, ctr) {
+                    ParseResultUnit::Err(e) => { return ParseResultPattern::Err(e); }
+                    ParseResultUnit::Ok => {}
                 }
-                var bty: str = "";
-                if self.match_tok(TokenKind::Colon) {
-                    match self.read_type_name() {
-                        ParseResultStr::Ok(s) => { bty = s; }
-                        ParseResultStr::Err(e) => { return ParseResultPattern::Err(e); }
-                    }
-                }
-                bindings.push(Binding_new(bname, bty));
                 if !self.match_tok(TokenKind::Comma) { break; }
             }
             match self.expect(TokenKind::RParen, ")") {
@@ -3952,19 +3965,10 @@ if token_kind_eq(k, TokenKind::Ident("")) {
         self.advance();
         var bindings: Vec<Binding> = Vec::new();
         loop {
-            var bname: str = "";
-            match self.expect_ident() {
-                ParseResultStr::Ok(s) => { bname = s; }
-                ParseResultStr::Err(e) => { return ParseResultPattern::Err(e); }
+            match self.parse_pat_arg(&mut bindings, nests, ctr) {
+                ParseResultUnit::Err(e) => { return ParseResultPattern::Err(e); }
+                ParseResultUnit::Ok => {}
             }
-            var bty: str = "";
-            if self.match_tok(TokenKind::Colon) {
-                match self.read_type_name() {
-                    ParseResultStr::Ok(s) => { bty = s; }
-                    ParseResultStr::Err(e) => { return ParseResultPattern::Err(e); }
-                }
-            }
-            bindings.push(Binding_new(bname, bty));
             if !self.match_tok(TokenKind::Comma) { break; }
         }
         match self.expect(TokenKind::RParen, ")") {
@@ -3980,6 +3984,115 @@ return ParseResultPattern::Err(
     "Parse error at " + int_to_str(tok.line) + ":" + int_to_str(tok.col) +
     ": invalid pattern '" + token_kind_to_str(tok.kind) + "'"
 );
+}
+
+/// One argument inside `Ctor(...)`: either a plain `name [: ty]` binding
+/// or a nested pattern (`Ok(x)`, `E::V(y)`, `1`, `_`). A nested pattern
+/// is bound to a fresh `__np` name and recorded in `nests`; the match
+/// arm's desugar gives it an inner match of its own.
+fn parse_pat_arg(self: &mut Parser, bindings: &mut Vec<Binding>, nests: &mut Vec<PatNest>, ctr: &mut i64) -> ParseResultUnit {
+    var nested: bool = false;
+    var tk: TokenKind = self.peek_token().kind;
+    if !token_kind_eq(tk, TokenKind::Ident("")) {
+        // literals / wildcard-as-_ are not identifiers; anything that is
+        // not `name [: ty]` shape is a nested pattern position
+        match self.parse_pattern(nests, ctr) {
+            ParseResultPattern::Ok(p) => {
+                var sn2: str = "__np" + int_to_str(*ctr);
+                *ctr = *ctr + 1;
+                nests.push(PatNest { name: sn2, pat: p });
+                bindings.push(Binding_new(sn2, ""));
+                return ParseResultUnit::Ok;
+            }
+            ParseResultPattern::Err(e) => { return ParseResultUnit::Err(e); }
+        }
+    }
+    if self.pos + 1 < self.tokens.len() {
+        var k1: TokenKind = self.tokens.get(self.pos + 1).kind;
+        if token_kind_eq(k1, TokenKind::LParen) || token_kind_eq(k1, TokenKind::DoubleColon) {
+            nested = true;
+        }
+    }
+    if nested {
+        match self.parse_pattern(nests, ctr) {
+            ParseResultPattern::Ok(p) => {
+                var sn: str = "__np" + int_to_str(*ctr);
+                *ctr = *ctr + 1;
+                nests.push(PatNest { name: sn, pat: p });
+                bindings.push(Binding_new(sn, ""));
+            }
+            ParseResultPattern::Err(e) => { return ParseResultUnit::Err(e); }
+        }
+        return ParseResultUnit::Ok;
+    }
+    var bname: str = "";
+    match self.expect_ident() {
+        ParseResultStr::Ok(s) => { bname = s; }
+        ParseResultStr::Err(e) => { return ParseResultUnit::Err(e); }
+    }
+    var bty: str = "";
+    if self.match_tok(TokenKind::Colon) {
+        match self.read_type_name() {
+            ParseResultStr::Ok(s) => { bty = s; }
+            ParseResultStr::Err(e) => { return ParseResultUnit::Err(e); }
+        }
+    }
+    bindings.push(Binding_new(bname, bty));
+    return ParseResultUnit::Ok;
+}
+
+/// Desugar a match's arms after parse: an arm whose pattern recorded
+/// nested positions gets a body of inner `match __np { pat => body,
+/// _ => <the remaining arms> }`, applied once per nested position.
+/// `marks` — nests[marks[i] .. marks[i+1]] are arm i's positions;
+/// marks.len() == arms.len() + 1. Recursive over the arm list.
+fn pd_desugar_arms(self: &mut Parser, scrut: str, arms: Vec<MatchArm>, nests: Vec<PatNest>, marks: Vec<i64>, i: i64, line: i64, as_expr: bool) -> Vec<MatchArm> {
+    var out: Vec<MatchArm> = Vec::new();
+    if i >= arms.len() { return out; }
+    var arm: MatchArm = arms.get(i);
+    var s: i64 = marks.get(i);
+    var e: i64 = marks.get(i + 1);
+    var rest: Vec<MatchArm> = self.pd_desugar_arms(scrut, arms, nests, marks, i + 1, line, as_expr);
+    if s == e {
+        out.push(arm);
+    } else {
+        var rest_stmts: Vec<Stmt> = Vec::new();
+        if rest.len() > 0 {
+            if as_expr {
+                rest_stmts.push(Stmt::Expr(Expr::Match(Box::new(Expr::Ident(scrut)), rest), line));
+            } else {
+                rest_stmts.push(Stmt::Match(Expr::Ident(scrut), rest, line));
+            }
+        } else {
+            var pargs: Vec<Expr> = Vec::new();
+            pargs.push(Expr::StringLit("nested match: no arm matched"));
+            rest_stmts.push(Stmt::Expr(Expr::Call("panic", pargs), line));
+        }
+        var body: Vec<Stmt> = arm.body;
+        // nests are pushed post-order — children before parents — so the
+        // deepest pattern comes first: it becomes the innermost match
+        // (which carries the arm's guard).
+        var j: i64 = s;
+        while j < e {
+            var ent: PatNest = nests.get(j);
+            var g: OptBoxExpr = OptBoxExpr::None;
+            if j == s { g = arm.guard; }
+            var iarms: Vec<MatchArm> = Vec::new();
+            iarms.push(MatchArm_new(ent.pat, g, body));
+            iarms.push(MatchArm_new(Pattern::Wildcard, OptBoxExpr::None, rest_stmts));
+            body = Vec::new();
+            if as_expr {
+                body.push(Stmt::Expr(Expr::Match(Box::new(Expr::Ident(ent.name)), iarms), line));
+            } else {
+                body.push(Stmt::Match(Expr::Ident(ent.name), iarms, line));
+            }
+            j = j + 1;
+        }
+        out.push(MatchArm_new(arm.pattern, OptBoxExpr::None, body));
+    }
+    var ri: i64 = 0;
+    while ri < rest.len() { out.push(rest.get(ri)); ri = ri + 1; }
+    return out;
 }
 
 fn parse_expr(self: &mut Parser) -> ParseResultExpr {
@@ -4525,12 +4638,18 @@ match self.expect(TokenKind::LBrace, "{") {
     ParseResultUnit::Ok => {}
 }
 var arms: Vec<MatchArm> = Vec::new();
+var nests: Vec<PatNest> = Vec::new();
+var npctr: i64 = 0;
+var marks: Vec<i64> = Vec::new();
+marks.push(0);
+var pat_line: i64 = self.peek_token().line;
 while !self.check(TokenKind::RBrace) && !self.is_at_end() {
     var pattern: Pattern = Pattern::Wildcard;
-    match self.parse_pattern() {
+    match self.parse_pattern(&mut nests, &mut npctr) {
         ParseResultPattern::Ok(p) => { pattern = p; }
         ParseResultPattern::Err(e) => { return ParseResultExpr::Err(e); }
     }
+    marks.push(nests.len());
     var match_guard: OptBoxExpr = OptBoxExpr::None;
     if self.check(TokenKind::If) {
         self.advance();
@@ -4569,6 +4688,21 @@ while !self.check(TokenKind::RBrace) && !self.is_at_end() {
 match self.expect(TokenKind::RBrace, "}") {
     ParseResultUnit::Err(e) => { return ParseResultExpr::Err(e); }
     ParseResultUnit::Ok => {}
+}
+if nests.len() > 0 {
+    // Nested patterns in expression position: the scrutinee must be a
+    // plain variable — there is no statement context to hoist a
+    // one-time evaluation into.
+    var scrut2: str = "";
+    match expr {
+        Expr::Ident(nm2) => { scrut2 = nm2; }
+        _ => {}
+    }
+    if scrut2 == "" {
+        return ParseResultExpr::Err("Parse error at " + int_to_str(pat_line) + ": nested patterns in match expressions need a variable scrutinee");
+    }
+    arms = self.pd_desugar_arms(scrut2, arms, nests, marks, 0, pat_line, true);
+    return ParseResultExpr::Ok(Expr::Match(Box::new(Expr::Ident(scrut2)), arms));
 }
 return ParseResultExpr::Ok(Expr::Match(Box::new(expr), arms));
 }

@@ -52,6 +52,8 @@ and `AGENTS.md` first when working on the compiler.
 | [reference/language-guide.md](reference/language-guide.md) | Comprehensive language guide — type system, ownership, effects; includes references §4.6 and @secret §5.4. |
 | [reference/selfhost.md](reference/selfhost.md) | Self-hosted compiler — coordination, architecture, build pipeline, porting guide (consolidated). |
 | [reference/quickstart.md](reference/quickstart.md) | Install + first program. |
+| [reference/status.md](reference/status.md) | Detailed status, test results and limits (moved from the README). |
+| [reference/releasing.md](reference/releasing.md) | How to cut a release: checks, installer signing, checksums, publishing. |
 | [reference/reference.md](reference/reference.md) | **The language reference**: what `fid` accepts, rule by rule, each with the compiler function that enforces it. |
 | [reference/safety-rules.md](reference/safety-rules.md) | The 17 safety rules (SR-1–SR-17), each traced to its negative test. |
 | [reference/memory-model.md](reference/memory-model.md) | What one thread may see of another's writes (C++11 model, proposal 0003). |
@@ -110,6 +112,8 @@ and `AGENTS.md` first when working on the compiler.
 | File | Description |
 |------|-------------|
 | [README.md](../README.md) | Project overview, status, feature matrix, quick start. |
+| [CONTRIBUTING.md](../CONTRIBUTING.md) | How to build, test and send a change. |
+| [SECURITY.md](../SECURITY.md) | Reporting vulnerabilities privately; what counts as a security bug. |
 | [AGENTS.md](../AGENTS.md) | **Working guide for AI assistants & humans** — build commands, high-risk files, known bugs, conventions. Read before editing. |
 | [Cargo.toml](../Cargo.toml) | Rust package manifest (`fidesc` v0.1.0). |
 | [Cargo.lock](../Cargo.lock) | Pinned dependency versions. |

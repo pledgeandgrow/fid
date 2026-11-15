@@ -1,0 +1,77 @@
+# Quick checks on every push and pull request to main.
+#
+#   rust      the frozen Rust bootstrap compiler (src/) builds and its unit
+#             tests pass, on Linux and Windows; it runs hello.fd.
+#   selfhost  the self-hosted compiler fid is built from compiler/*.fd in one
+#             stage (scripts/build-selfhost.sh) and runs and compiles a few
+#             programs, and the leak gate passes.
+#
+# The full suite, the 3-stage fixpoint and the cross targets take hours and
+# run before a release (docs/reference/releasing.md, scripts/ci/cross.yml).
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: mold (the Linux linker .cargo/config.toml asks for)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mold
+      - name: Build
+        run: cargo build --release
+      - name: Unit tests
+        run: cargo test --release --lib
+      - name: hello.fd through the interpreter
+        shell: bash
+        run: ./target/release/fidesc run tests/bootstrap/hello.fd
+
+  selfhost:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - name: mold
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mold
+      - name: Build the Rust bootstrap compiler
+        run: cargo build --release
+      - name: Build fid (one stage)
+        env:
+          CC: zig cc
+        run: ./scripts/build-selfhost.sh
+      - name: fid run / ccompile
+        env:
+          CC: zig cc
+        run: |
+          ./release/fid-dev run tests/bootstrap/hello.fd
+          ./release/fid-dev ccompile tests/bootstrap/test_vec_filled.fd -o vf
+          ./vf
+      - name: Leak gate (tests/leaks)
+        env:
+          CC: zig cc
+        run: bash scripts/leak-check.sh release/fid-dev

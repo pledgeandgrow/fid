@@ -1,0 +1,78 @@
+# Run-time and compile-time benchmarks (release D7): fail a change that makes
+# a benchmark more than 10% slower than the commit it is based on.
+#
+# Times depend on the machine, so both compilers are built and measured on
+# the same runner, one after the other: the base commit's fid records the
+# baseline (bench/check.sh --save), the head's is checked against it.
+#   run time      bench/check.sh: bench/fides/*.fd, native (`fid emit
+#                 --target x86_64-linux`) and through C, best of 5
+#   compile time  bench/compile-check.sh: `fid emit --time` per stage
+# Locally: ./bench/check.sh (see its header).
+
+name: Benchmarks
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      CC: zig cc
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - name: mold (the Linux linker .cargo/config.toml asks for)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mold
+      - name: Base commit
+        id: base
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "sha=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "sha=$(git rev-parse HEAD~1)" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build fid (head)
+        run: |
+          cargo build --release
+          ./scripts/build-selfhost.sh
+      - name: Build fid (base)
+        run: |
+          git worktree add "$RUNNER_TEMP/base-src" "${{ steps.base.outputs.sha }}"
+          cd "$RUNNER_TEMP/base-src"
+          STAGE0="$GITHUB_WORKSPACE/target/release/fidesc" ./scripts/build-selfhost.sh
+      # Each fid runs from its own tree: it finds its stdlib at <exe>/../stdlib.
+      - name: Run time (base records, head is checked)
+        env:
+          BASE_FID: ${{ runner.temp }}/base-src/release/fid-dev
+          HEAD_FID: ${{ github.workspace }}/release/fid-dev
+        run: |
+          FID="$BASE_FID" BENCH_BASE="$RUNNER_TEMP/run-base.txt" ./bench/check.sh --save
+          FID="$HEAD_FID" BENCH_BASE="$RUNNER_TEMP/run-base.txt" ./bench/check.sh
+      - name: Compile time (base records, head is checked)
+        if: always()
+        env:
+          BASE_FID: ${{ runner.temp }}/base-src/release/fid-dev
+          HEAD_FID: ${{ github.workspace }}/release/fid-dev
+        run: |
+          cp bench/compile-baseline.txt "$RUNNER_TEMP/compile-baseline.orig" || true
+          FID="$BASE_FID" ./bench/compile-check.sh --save
+          FID="$HEAD_FID" ./bench/compile-check.sh
+          cp "$RUNNER_TEMP/compile-baseline.orig" bench/compile-baseline.txt || true

@@ -279,6 +279,52 @@ pub fn collect_all_coverage(module: IrModule) -> CoverageData {
     return data;
 }
 
+/// What the interpreter ran, into `data`: each instruction (they come
+/// once each), its function, and its source line (once per function and
+/// line). Tables, not the linear mark_* scans: a run covers core too.
+fn vl_record_covered(data: &mut CoverageData, interp: &Interpreter, module: IrModule) {
+    var fn_at: i64 = HashMap_new();
+    var fi: i64 = 0;
+    while fi < module.functions.len() {
+        var fname: str = module.functions.get(fi).name;
+        if HashMap_get(fn_at, fname) == 0 { HashMap_insert(fn_at, fname, fi + 1); }
+        fi = fi + 1;
+    }
+    var called: i64 = HashMap_new();
+    var lines: i64 = HashMap_new();
+    var n: i64 = Interpreter_cov_count(interp);
+    var i: i64 = 0;
+    while i < n {
+        var name: str = Interpreter_cov_fn(interp, i);
+        var id: i64 = Interpreter_cov_id(interp, i);
+        data.covered_instructions.push(CovLineEntry_new(name, id));
+        if HashMap_get(called, name) == 0 {
+            HashMap_insert(called, name, 1);
+            data.called_functions.push(name);
+        }
+        var at: i64 = HashMap_get(fn_at, name);
+        if at > 0 {
+            var func: IrFunction = module.functions.get(at - 1).func;
+            match IrFunction_get_meta(&func, id) {
+                OptValueMeta::Some(meta) => {
+                    match meta.source_line {
+                        OptU64::Some(line) => {
+                            var lk: str = name + "#" + int_to_str(line);
+                            if line > 0 && HashMap_get(lines, lk) == 0 {
+                                HashMap_insert(lines, lk, 1);
+                                data.covered_lines.push(CovLineEntry_new(name, line));
+                            }
+                        }
+                        OptU64::None => {}
+                    }
+                }
+                OptValueMeta::None => {}
+            }
+        }
+        i = i + 1;
+    }
+}
+
 /// Run the interpreter on `source` while collecting coverage data.
 /// Ported from src/veil.rs:88 (Rust: run_with_coverage).
 ///
@@ -289,12 +335,9 @@ pub fn collect_all_coverage(module: IrModule) -> CoverageData {
 ///      lines/instructions/functions.
 ///   4. Return (CoverageData, RunResult, Option<StackTrace>).
 ///
-/// NOTE: Interpreter_set_debug_hook is currently a no-op in the self-hosted
-/// interpreter (compiler/interp.fd:2712), so covered_lines, covered_instructions,
-/// and called_functions remain empty until the hook is fully wired. This
-/// matches the existing veil_run pattern which only reports structural
-/// coverage. The interpreter is still run so that panics and the panic stack
-/// trace are captured.
+/// Interpreter_set_debug_hook makes the interpreter record each instruction
+/// it runs (once); those give the covered instructions, functions and
+/// source lines.
 pub fn run_with_coverage(source: str, source_path: str) -> CoverageRunResult {
     // 1. Build IR from source
     var module_result: ResultIrModule = lower_to_ir_module(source);
@@ -317,12 +360,11 @@ pub fn run_with_coverage(source: str, source_path: str) -> CoverageRunResult {
     var data: CoverageData = collect_all_coverage(module);
 
     // 3. Run interpreter with debug hook for coverage tracking.
-    //    The hook is a no-op in the self-hosted interpreter, so the
-    //    covered_* sets stay empty (see note above).
     var interp: Interpreter = Interpreter_new(module);
     Interpreter_set_debug_hook(&mut interp);
     var result: RunResult = Interpreter_run(&mut interp);
     var trace: OptStr = Interpreter_take_panic_stack_trace(&mut interp);
+    vl_record_covered(&mut data, &interp, module);
 
     // 4. Compute per-function line counts
     CoverageData_compute_func_counts(&mut data);
@@ -355,15 +397,17 @@ pub fn veil_run(input_path: str, format: str, output_dir: str) -> str {
     var slash: i64 = vl_str_rfind_char(filename, 47);
     if slash >= 0 { filename = str_slice(filename, slash + 1, str_len(filename)); }
 
+    // The output directory may not exist yet (an existing one is fine)
+    var _mk: i64 = p_mkdir(output_dir);
     if format == "html" {
         var html: str = generate_html_report(data, source, filename);
         var path: str = output_dir + "/coverage.html";
-        p_file_write(path, html);
+        if p_file_write(path, html) < 0 { return status_line + "\nError: could not write " + path; }
         return status_line + "\nCoverage report: " + path;
     } else {
         var text: str = generate_text_report(data, source);
         var path: str = output_dir + "/coverage.txt";
-        p_file_write(path, text);
+        if p_file_write(path, text) < 0 { return status_line + text + "\n\nError: could not write " + path; }
         return status_line + text + "\n\nCoverage report: " + path;
     }
 }

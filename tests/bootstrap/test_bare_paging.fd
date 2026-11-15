@@ -1,0 +1,99 @@
+// Release G1: the bootable bare image runs with paging on: CR3 is the boot
+// PML4 at 0x70000, the first 4 GB are identity-mapped with 2 MB pages (the
+// PD of the second GB is at 0x77000). The program maps the virtual 2 MB
+// page at 1 GB onto physical 0x200000, then unmaps the next one and touches
+// it: the page fault handler (vector 14, an exception with an error code)
+// maps it and returns, and the faulting store runs again with every
+// register as it was. Run it with scripts/bare-qemu-test.sh (QEMU). Hosted
+// backends print the same lines without the hardware.
+//
+// Expected output:
+// cr3: 0x70000
+// paging: 1
+// through the alias: 1234
+// page faults: 1
+// fault address: 0x40200010
+// after the fault: 5678
+// done
+
+var g_faults: i64 = 0;
+var g_cr2: i64 = 0;
+
+// PD entry of the virtual 2 MB page `n` of the second GB
+fn pd_entry(n: i64) -> *mut i64 {
+    var a: i64 = 0x77000 + n * 8;
+    var p: *mut i64 = a;
+    return p;
+}
+
+@interrupt(14) fn on_page_fault() {
+    g_faults = g_faults + 1;
+    var x: i64 = 0;
+    g_cr2 = asm!("mov rax, cr2", out("rax") x);
+    // map the page that faulted (virtual 0x40200000 -> physical 0x200000)
+    unsafe {
+        var e: *mut i64 = pd_entry(1);
+        *e = 0x200000 + 0x83;
+    }
+    p_invlpg(0x40200000);
+}
+
+fn hex(n: i64) {
+    print("0x");
+    var started: bool = false;
+    var shift: i64 = 60;
+    while shift >= 0 {
+        var d: i64 = (n >> shift) & 15;
+        if d != 0 || started || shift == 0 {
+            started = true;
+            var c: str = "0";
+            if d == 1 { c = "1"; } else if d == 2 { c = "2"; } else if d == 3 { c = "3"; }
+            else if d == 4 { c = "4"; } else if d == 5 { c = "5"; } else if d == 6 { c = "6"; }
+            else if d == 7 { c = "7"; } else if d == 8 { c = "8"; } else if d == 9 { c = "9"; }
+            else if d == 10 { c = "a"; } else if d == 11 { c = "b"; } else if d == 12 { c = "c"; }
+            else if d == 13 { c = "d"; } else if d == 14 { c = "e"; } else if d == 15 { c = "f"; }
+            print(c);
+        }
+        shift = shift - 4;
+    }
+}
+
+@unsafe
+fn main() -> i64 {
+    var cr3: i64 = 0x70000;
+    var paging: i64 = 1;
+    var alias: i64 = 1234;
+    var after: i64 = 5678;
+    if p_argc() == 0 {
+        // bare metal
+        cr3 = p_cr3_read() & 0xFFFFFFFFF000;
+        paging = (p_cr0_read() >> 31) & 1;
+        // virtual 0x40000000 -> physical 0x200000
+        var e0: *mut i64 = pd_entry(0);
+        *e0 = 0x200000 + 0x83;
+        p_invlpg(0x40000000);
+        var virt: *mut i64 = 0x40000008;
+        *virt = 1234;
+        var phys: *mut i64 = 0x200008;
+        alias = *phys;
+        // virtual 0x40200000 not present: the store faults once
+        var e1: *mut i64 = pd_entry(1);
+        *e1 = 0;
+        p_invlpg(0x40200000);
+        var virt2: *mut i64 = 0x40200010;
+        *virt2 = 5678;
+        var phys2: *mut i64 = 0x200010;
+        after = *phys2;
+    } else {
+        g_faults = 1;
+        g_cr2 = 0x40200010;
+    }
+    print("cr3: "); hex(cr3); print("\n");
+    print("paging: "); print(paging); print("\n");
+    print("through the alias: "); print(alias); print("\n");
+    print("page faults: "); print(g_faults); print("\n");
+    print("fault address: "); hex(g_cr2); print("\n");
+    print("after the fault: "); print(after); print("\n");
+    print("done\n");
+    return 0;
+}

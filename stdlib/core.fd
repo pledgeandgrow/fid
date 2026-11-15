@@ -737,6 +737,18 @@ pub fn p_zero_words(p: i64, n: i64) {
     }
 }
 
+/// Copy `n` words from `src` to `dst` (the compiler snapshots and restores
+/// a fixed-size array local for txn { } with it).
+pub fn p_copy_words(dst: i64, src: i64, n: i64) {
+    var i: i64 = 0;
+    while i < n {
+        var dp: *mut i64 = dst + i * 8;
+        var sp: *mut i64 = src + i * 8;
+        unsafe { *dp = *sp; }
+        i = i + 1;
+    }
+}
+
 /// Drop the elements [from, to) of the buffer at `data` (word elements).
 fn vec_drop_range(data: i64, from: i64, to: i64, tid: i64) {
     if tid == 0 || data == 0 { return; }
@@ -1413,6 +1425,34 @@ pub fn Vec_is_empty(v: i64) -> bool {
         len = *len_ptr;
     }
     return len == 0;
+}
+
+/// The address of element `idx`, for `&v[i]` and `&mut v[i]` (release D15):
+/// the reference points into the buffer, so a write through it changes the
+/// Vec. `write != 0` first takes the buffer for this Vec alone (it may be
+/// shared until its first write). `is_struct != 0`: the element is a struct;
+/// one stored in the buffer (code 16 and up) is reached at its address, one
+/// stored boxed (a word) by the pointer in its slot. The borrow checker keeps
+/// the Vec unchanged while the reference lives, so the address stays valid.
+pub fn Vec_elem_addr(v: i64, idx: i64, write: i64, is_struct: i64) -> i64 {
+    if write != 0 { vec_own(v); }
+    var len_ptr: *mut i64 = v + 8;
+    var data_ptr_ptr: *mut i64 = v;
+    var len: i64 = 0;
+    var data: i64 = 0;
+    unsafe { len = *len_ptr; data = *data_ptr_ptr; }
+    if idx >= len || idx < 0 {
+        p_panic("Vec index out of bounds");
+    }
+    var code: i64 = vec_code(v);
+    var at: i64 = data + idx * vec_esz(code);
+    if is_struct != 0 && code < 16 {
+        var slot: *mut i64 = at;
+        var sp: i64 = 0;
+        unsafe { sp = *slot; }
+        return sp;
+    }
+    return at;
 }
 
 pub fn Vec_get(v: i64, idx: i64) -> i64 {
@@ -2821,6 +2861,113 @@ pub fn HashMap_clone(m: i64) -> i64 {
     return result;
 }
 
+// --- Copies for another thread ------------------------------------------
+// A value handed to a spawned thread is copied whole first (in the parent,
+// before the thread starts): the copy shares no buffer and no owner count
+// with the original, so neither thread ever writes memory the other reads.
+// Owner counts are not atomic; sharing a buffer copy-on-write across
+// threads would race on them. The compiler allows only what these can copy
+// (numbers, strings, Vec and HashMap of those, structs of plain fields).
+
+/// A copy of `e`, a value of element type `tid`, sharing nothing with it.
+pub fn p_send_copy(e: i64, tid: i64) -> i64 {
+    if e == 0 || tid == 0 { return e; }
+    if tid == P_TID_STR { return p_str_send_copy(e); }
+    if tid == P_TID_VEC { return Vec_send_copy(e); }
+    if tid == P_TID_MAP { return HashMap_send_copy(e); }
+    if tid >= P_TID_BOX { p_panic("internal: a Box cannot be copied for another thread"); }
+    // a struct element (16 and up): the compiler lets only structs of plain
+    // fields reach here, so its heap copy shares nothing
+    return __p_elem_dup(tid, e);
+}
+
+/// A new string with the bytes of `s` (a literal is never freed: kept).
+pub fn p_str_send_copy(s: i64) -> i64 {
+    if s == 0 { return s; }
+    var n: i64 = str_len(s as str);
+    // a raw counted buffer (one owner): a `str` local here would be
+    // dropped at the return, freeing the copy
+    var r: i64 = p_str_buf(n);
+    var i: i64 = 0;
+    while i < n {
+        var dp: *mut u8 = r + i;
+        var sp: *mut u8 = s + i;
+        unsafe { *dp = *sp; }
+        i = i + 1;
+    }
+    return r;
+}
+
+/// A Vec with copies of the elements of `v`, in a buffer of its own.
+pub fn Vec_send_copy(v: i64) -> i64 {
+    if v == 0 { return v; }
+    var kcode: i64 = vec_code(v);
+    var tid: i64 = vec_tid(v);
+    var n: i64 = Vec_len(v);
+    if kcode != 0 {
+        // sized elements (numbers, bytes, structs of plain fields): bytes
+        var kv: i64 = Vec_new_typed(kcode, tid);
+        var ki: i64 = 0;
+        while ki < n {
+            vec_sz_push(kv, kcode, vec_sz_get(v, ki));
+            ki = ki + 1;
+        }
+        return kv;
+    }
+    var nv: i64 = Vec_new_typed(0, tid);
+    var data_ptr_ptr: *mut i64 = v;
+    var data: i64 = 0;
+    unsafe { data = *data_ptr_ptr; }
+    var i: i64 = 0;
+    while i < n {
+        var ptr: *mut i64 = data + i * 8;
+        var elem: i64 = 0;
+        unsafe { elem = *ptr; }
+        Vec_push(nv, p_send_copy(elem, tid));
+        i = i + 1;
+    }
+    return nv;
+}
+
+/// A HashMap with copies of the keys and values of `m`.
+pub fn HashMap_send_copy(m: i64) -> i64 {
+    if m == 0 { return m; }
+    var result: i64 = HashMap_new();
+    var tw: *mut i64 = m + 48;
+    var rtw: *mut i64 = result + 48;
+    unsafe { *rtw = *tw; }
+    if hm_is_int(m) {
+        var rf: *mut i64 = result + 40;
+        unsafe { *rf = 1; }
+    }
+    var kown: bool = hm_kown(m);
+    var vtid: i64 = hm_vtid(m);
+    var cap_ptr: *mut i64 = m + 24;
+    var keys_ptr_ptr: *mut i64 = m;
+    var vals_ptr_ptr: *mut i64 = m + 8;
+    var capacity: i64 = 0;
+    var keys: i64 = 0;
+    var vals: i64 = 0;
+    unsafe { capacity = *cap_ptr; keys = *keys_ptr_ptr; vals = *vals_ptr_ptr; }
+    if keys == 0 || capacity == 0 { return result; }
+    var i: i64 = 0;
+    while i < capacity {
+        var kptr: *mut i64 = keys + i * 8;
+        var slot_key: i64 = 0;
+        unsafe { slot_key = *kptr; }
+        if slot_key != 0 && slot_key != -1 {
+            var vptr: *mut i64 = vals + i * 8;
+            var value: i64 = 0;
+            unsafe { value = *vptr; }
+            var nk: i64 = slot_key;
+            if kown { nk = p_str_send_copy(slot_key); }
+            HashMap_insert(result, nk, p_send_copy(value, vtid));
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
 pub fn HashMap_get_or(m: i64, key: i64, default: i64) -> i64 {
     var cap_ptr: *mut i64 = m + 24;
     var capacity: i64 = 0;
@@ -3128,7 +3275,7 @@ fn p_str_len_word(w: i64) -> bool {
 }
 
 // str_copy_n: copy n bytes from src to dst. Both are i64 addresses.
-fn p_str_copy_n(dst: i64, src: i64, n: i64) {
+pub fn p_str_copy_n(dst: i64, src: i64, n: i64) {
     // Byte by byte: the interpreter cannot read its strings a word at a
     // time. The C backend replaces the body with memcpy (fast_core_vec_body).
     var i: i64 = 0;
@@ -3334,7 +3481,7 @@ pub fn String_replace(s: i64, from: i64, to: i64) -> str {
 /// Whether the `n` bytes at `a` and `b` are equal (byte by byte: the
 /// interpreter cannot read strings a word at a time; the C backend uses
 /// memcmp, fast_core_vec_body).
-fn p_bytes_eq(a: i64, b: i64, n: i64) -> bool {
+pub fn p_bytes_eq(a: i64, b: i64, n: i64) -> bool {
     var j: i64 = 0;
     while j < n {
         var ap: *mut u8 = a + j;

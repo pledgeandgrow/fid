@@ -1,31 +1,38 @@
-// wasm.fd -- WebAssembly code generation from Fides IR.
+// wasm.fd -- IR -> a WebAssembly module that runs under WASI (release F9):
+// `fid wasm <file.fd> -o x.wasm`, run with `node scripts/wasm-run.mjs x.wasm`
+// (or any WASI preview-1 host: wasmtime, wasmer).
 //
-// Ported from src/wasm.rs (~1266 lines Rust).
+// The lowering of the machine layer (compiler/nat_ir.fd), on WASM's stack
+// machine: every IR value is an i64 local (a float travels as its bits, an
+// f32 as its 32 bits zero-extended; narrow integers are normalized by
+// extension, as in registers). Memory is wasm32: an address is the value's
+// low 32 bits (i32.wrap_i64 at every load and store). Integer semantics
+// are nat_ir's and the interpreter's (release F6): i64/u64 arithmetic
+// panics on overflow unless the function is @wrapping, a narrow result
+// that does not fit panics, division and remainder by zero panic, MIN / -1
+// panics.
 //
-// Phase 5D.1 -- WASM target.
+// Every function takes and returns i64s: its IR parameters (`__env` first,
+// an sret pointer before it) and one result (0 for void). A builtin p_X
+// runs the runtime's Fides pert_X (stdlib/linux_runtime, merged by the
+// front end) with a null `__env`, as on the native targets; the runtime's
+// system calls (nat_syscall) go to pe_wasi_syscall (stdlib/linux_runtime/
+// wasi.fd), whose `wasi_<name>` externs are the imports of
+// wasi_snapshot_preview1 here. The other nat_* primitives are written here
+// in WASM.
 //
-// Strategy: translate IR functions to WASM functions operating on a 64-bit
-// linear memory model. All Fides pointers become i64 offsets into linear
-// memory. Integers use i64 (Fides's default int) or i32 for the narrower
-// kinds. Structs/enums/collections are pointer-sized opaque handles.
+// Control flow: one loop around one block per IR block (the "switch loop"):
+// a jump sets the block index and branches to the loop, whose br_table
+// enters the block; a jump to the next block falls through.
 //
-// Control flow: IR uses an arbitrary CFG of basic blocks. WASM is structured.
-// We use the "block dispatcher" trampoline: one outer `loop` and a local
-// `cur_block` variable; each block is an `if cur_block == N { ... }` arm.
-// Jumps set `cur_block = M` and `br 1` back to the loop top.
+// Linear memory: [0, 1024) unused, [1024, WG_STACK_TOP) the stack of
+// allocas (global 0 is its pointer; it grows down, a frame below 1024 is
+// "Stack overflow"), then the data (strings, globals, tables) from
+// WG_DATA_BASE, then the heap (mmap grows the memory). A function pointer
+// is an index in the table (closures, nat_call_fn), 0 is null.
 //
-// Runtime: print, p_print_int, p_print_str, p_print_bool, p_print_float,
-// p_print_newline, p_panic, p_malloc, p_alloc, p_free, p_str_concat, p_to_str*
-// are imported from the host module "env". Collections (Vec/HashMap/String)
-// are not yet supported in the WASM backend -- calls to p_vec_* / p_map_* /
-// p_string_* emit `unreachable` with a TODO.
-//
-// Adaptations from Rust:
-// 1. Vec<u8> -> Vec<i64> (Fides Vec stores i64; bytes masked with & 0xFF)
-// 2. HashMap<K, V> -> Vec<Entry> with linear search
-// 3. &str -> str, u32 -> i64, u8 -> i64
-// 4. format!() -> string concatenation
-// 5. ValueId is plain i64 in self-hosted IR
+// Functions are compiled from `_start` on, as they are called (a
+// worklist): unused code is never emitted.
 
 module compiler::wasm;
 
@@ -34,1623 +41,2166 @@ use vec;
 use string;
 use compiler::ir;
 use compiler::ast;
+use compiler::checks;
 
-// ─── WASM value types ──────────────────────────────────────────────────
-
+// WASM value types
 const WT_I32: i64 = 0x7F;
 const WT_I64: i64 = 0x7E;
-const WT_F32: i64 = 0x7D;
-const WT_F64: i64 = 0x7C;
 const WT_VOID: i64 = 0x40;
 
-// ─── WASM section IDs ──────────────────────────────────────────────────
-
+// Section ids
 const SEC_TYPE: i64 = 1;
 const SEC_IMPORT: i64 = 2;
 const SEC_FUNCTION: i64 = 3;
+const SEC_TABLE: i64 = 4;
 const SEC_MEMORY: i64 = 5;
 const SEC_GLOBAL: i64 = 6;
 const SEC_EXPORT: i64 = 7;
+const SEC_ELEM: i64 = 9;
 const SEC_CODE: i64 = 10;
 const SEC_DATA: i64 = 11;
 
-// ─── Encoder helpers ──────────────────────────────────────────────────
+// Memory layout
+const WG_STACK_LO: i64 = 1024;
+const WG_STACK_TOP: i64 = 8389632;     // 1024 + 8 MB
+const WG_DATA_BASE: i64 = 8389632;
 
-/// Byte buffer for WASM encoding. Bytes stored as i64 values (masked to 0xFF).
-pub struct WasmBuf {
-    pub bytes: Vec<i64>,
+// The arithmetic panics (nat_ir's NP_*)
+const WP_ADD: i64 = 0;
+const WP_SUB: i64 = 1;
+const WP_MUL: i64 = 2;
+const WP_DIV_OVF: i64 = 3;
+const WP_DIV_ZERO: i64 = 4;
+const WP_MOD_ZERO: i64 = 5;
+
+// Integer compare kinds
+const WCC_EQ: i64 = 0;
+const WCC_NE: i64 = 1;
+const WCC_LT: i64 = 2;
+const WCC_LE: i64 = 3;
+const WCC_GT: i64 = 4;
+const WCC_GE: i64 = 5;
+const WCC_LTU: i64 = 6;
+const WCC_LEU: i64 = 7;
+const WCC_GTU: i64 = 8;
+const WCC_GEU: i64 = 9;
+
+fn wg_panic_messages() -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    v.push("Integer overflow on addition");
+    v.push("Integer overflow on subtraction");
+    v.push("Integer overflow on multiplication");
+    v.push("Integer overflow on division");
+    v.push("Division by zero");
+    v.push("Modulo by zero");
+    return v;
 }
 
-pub fn WasmBuf_new() -> WasmBuf {
-    return WasmBuf { bytes: Vec::new() };
+// ─── The generator ─────────────────────────────────────────────────────
+
+pub struct WasmGen {
+    // Every function of the module: name -> its parameter count + 1
+    pub all_fns: i64,
+    // Function name -> its index in the module (imports first)
+    pub fn_index: i64,
+    // Functions queued for compilation, in index order (after _start)
+    pub queue: Vec<str>,
+    // The type of each defined function (index - n_imports), in order
+    pub def_types: Vec<i64>,
+    pub n_imports: i64,
+    // Imports: WASI name, the extern's C name, its signature key
+    pub imp_names: Vec<str>,
+    pub imp_sigs: Vec<str>,
+    // C name of an extern -> import index + 1
+    pub imp_index: i64,
+    // Types: signature keys ("III>I": params, '>' then results; I = i64,
+    // i = i32), key -> index + 1
+    pub type_keys: Vec<str>,
+    pub type_index: i64,
+    // The table: function indices; name -> table index (from 1)
+    pub table: Vec<i64>,
+    pub table_index: i64,
+    // Data from WG_DATA_BASE: bytes; string -> address; global -> address
+    pub data: Vec<i64>,
+    pub str_addr: i64,
+    pub glob_addr: i64,
+    pub globs: Vec<str>,
+    // Functions named by a string constant (thread and task entries)
+    pub named_fns: Vec<str>,
+    pub named_seen: i64,
+    // dyn: sorted type names; the id of a type is its position + 1
+    pub dyn_types: Vec<str>,
+    // extern "C" functions: Fides name -> 1 + index in c_list (C names)
+    pub c_names: i64,
+    pub c_list: Vec<str>,
+    // Called but defined nowhere
+    pub unresolved: Vec<str>,
+    pub unresolved_seen: i64,
+    // The body being written
+    pub b: Vec<i64>,
+    // The function being compiled
+    pub cur_name: str,
+    pub cur_wrapping: bool,
+    pub unchecked: Vec<i64>,
+    pub local_of: Vec<i64>,
+    pub alloca_off: Vec<i64>,
+    pub frame: i64,
+    pub va_off: i64,
+    pub t0: i64,
+    pub t1: i64,
+    pub t2: i64,
+    pub t3: i64,
+    pub fp: i64,
+    pub cur: i64,
+    pub block_index: i64,
+    pub nblocks: i64,
+    pub k: i64,
+    pub extra: i64,
+    pub cur_inst_line: i64,
 }
 
-fn WasmBuf_push(self: &mut WasmBuf, b: i64) {
-    self.bytes.push(b & 0xFF);
-}
-
-fn WasmBuf_push_bytes(self: &mut WasmBuf, bs: Vec<i64>) {
-    var i: i64 = 0;
-    while i < bs.len() {
-        self.bytes.push(bs[i] & 0xFF);
-        i = i + 1;
-    }
-}
-
-fn WasmBuf_uleb(self: &mut WasmBuf, v: i64) {
-    var vval: i64 = v;
-    while true {
-        var byte: i64 = vval & 0x7F;
-        vval = vval >> 7;
-        if vval != 0 {
-            byte = byte | 0x80;
-        }
-        self.bytes.push(byte & 0xFF);
-        if vval == 0 {
-            break;
-        }
-    }
-}
-
-fn WasmBuf_sleb(self: &mut WasmBuf, v: i64) {
-    var vval: i64 = v;
-    while true {
-        var byte: i64 = vval & 0x7F;
-        vval = vval >> 7;
-        var more: bool = !((vval == 0 && (byte & 0x40) == 0) || (vval == -1 && (byte & 0x40) != 0));
-        if more {
-            self.bytes.push((byte | 0x80) & 0xFF);
-        } else {
-            self.bytes.push(byte & 0xFF);
-            break;
-        }
-    }
-}
-
-fn WasmBuf_u32(self: &mut WasmBuf, v: i64) {
-    self.bytes.push(v & 0xFF);
-    self.bytes.push((v >> 8) & 0xFF);
-    self.bytes.push((v >> 16) & 0xFF);
-    self.bytes.push((v >> 24) & 0xFF);
-}
-
-fn WasmBuf_f64(self: &mut WasmBuf, v: f64) {
-    var bits: i64 = p_f64_to_bits(v);
-    var i: i64 = 0;
-    while i < 8 {
-        self.bytes.push((bits >> (i * 8)) & 0xFF);
-        i = i + 1;
-    }
-}
-
-fn WasmBuf_f32(self: &mut WasmBuf, v: f64) {
-    // f32: use p_f32_to_bits
-    var bits: i64 = p_f32_to_bits(v);
-    var i: i64 = 0;
-    while i < 4 {
-        self.bytes.push((bits >> (i * 8)) & 0xFF);
-        i = i + 1;
-    }
-}
-
-fn WasmBuf_name(self: &mut WasmBuf, s: str) {
-    WasmBuf_uleb(self, str_len(s));
-    var i: i64 = 0;
-    while i < str_len(s) {
-        self.bytes.push(str_byte_at(s, i) & 0xFF);
-        i = i + 1;
-    }
-}
-
-fn WasmBuf_len(self: &WasmBuf) -> i64 {
-    return self.bytes.len();
-}
-
-/// Consume the buffer and return the bytes.
-/// Ported from src/wasm.rs:106 (WasmBuf::into_vec).
-pub fn WasmBuf_into_vec(self: WasmBuf) -> Vec<i64> {
-    return self.bytes;
-}
-
-/// Write a section: id, uleb size, contents.
-fn section(id: i64, contents: Vec<i64>) -> Vec<i64> {
-    var s: WasmBuf = WasmBuf_new();
-    WasmBuf_push(&mut s, id);
-    WasmBuf_uleb(&mut s, contents.len());
-    WasmBuf_push_bytes(&mut s, contents);
-    return s.bytes;
-}
-
-// ─── Type mapping ──────────────────────────────────────────────────────
-
-fn wasm_valtype(ty: IrType) -> i64 {
-    match ty {
-        IrType::I8 => { return WT_I32; }
-        IrType::I16 => { return WT_I32; }
-        IrType::I32 => { return WT_I32; }
-        IrType::U8 => { return WT_I32; }
-        IrType::U16 => { return WT_I32; }
-        IrType::U32 => { return WT_I32; }
-        IrType::Bool => { return WT_I32; }
-        IrType::I64 => { return WT_I64; }
-        IrType::U64 => { return WT_I64; }
-        IrType::F32 => { return WT_F32; }
-        IrType::F64 => { return WT_F64; }
-        _ => { return WT_I64; }
-    }
-    return WT_I64;
-}
-
-/// Whether a type produces a value on the WASM stack (non-void, non-never).
-fn has_value(ty: IrType) -> bool {
-    match ty {
-        IrType::Void => { return false; }
-        IrType::Never => { return false; }
-        _ => { return true; }
-    }
-    return true;
-}
-
-// ─── Host imports ──────────────────────────────────────────────────────
-
-pub struct HostImport {
-    pub name: str,
-    pub params: Vec<i64>,
-    pub results: Vec<i64>,
-}
-
-/// Get the list of host imports.
-fn host_imports() -> Vec<HostImport> {
-    var imports: Vec<HostImport> = Vec::new();
-
-    var p1: Vec<i64> = Vec::new(); p1.push(WT_I64);
-    var r0: Vec<i64> = Vec::new();
-    imports.push(HostImport { name: "p_print_int", params: p1, results: r0 });
-
-    var p2: Vec<i64> = Vec::new(); p2.push(WT_I64);
-    imports.push(HostImport { name: "p_print_str", params: p2, results: Vec::new() });
-
-    var p3: Vec<i64> = Vec::new(); p3.push(WT_I32);
-    imports.push(HostImport { name: "p_print_bool", params: p3, results: Vec::new() });
-
-    var p4: Vec<i64> = Vec::new(); p4.push(WT_F64);
-    imports.push(HostImport { name: "p_print_float", params: p4, results: Vec::new() });
-
-    imports.push(HostImport { name: "p_print_newline", params: Vec::new(), results: Vec::new() });
-
-    var p5: Vec<i64> = Vec::new(); p5.push(WT_I64);
-    imports.push(HostImport { name: "p_panic", params: p5, results: Vec::new() });
-
-    var p6: Vec<i64> = Vec::new(); p6.push(WT_I64);
-    var r6: Vec<i64> = Vec::new(); r6.push(WT_I64);
-    imports.push(HostImport { name: "p_malloc", params: p6, results: r6 });
-
-    var p7: Vec<i64> = Vec::new(); p7.push(WT_I64);
-    var r7: Vec<i64> = Vec::new(); r7.push(WT_I64);
-    imports.push(HostImport { name: "p_alloc", params: p7, results: r7 });
-
-    var p8: Vec<i64> = Vec::new(); p8.push(WT_I64);
-    imports.push(HostImport { name: "p_free", params: p8, results: Vec::new() });
-
-    var p9: Vec<i64> = Vec::new(); p9.push(WT_I64); p9.push(WT_I64);
-    var r9: Vec<i64> = Vec::new(); r9.push(WT_I64);
-    imports.push(HostImport { name: "p_str_concat", params: p9, results: r9 });
-
-    var p10: Vec<i64> = Vec::new(); p10.push(WT_I64);
-    var r10: Vec<i64> = Vec::new(); r10.push(WT_I64);
-    imports.push(HostImport { name: "p_to_str", params: p10, results: r10 });
-
-    var p11: Vec<i64> = Vec::new(); p11.push(WT_I32);
-    var r11: Vec<i64> = Vec::new(); r11.push(WT_I64);
-    imports.push(HostImport { name: "p_to_str_bool", params: p11, results: r11 });
-
-    var p12: Vec<i64> = Vec::new(); p12.push(WT_F64);
-    var r12: Vec<i64> = Vec::new(); r12.push(WT_I64);
-    imports.push(HostImport { name: "p_to_str_float", params: p12, results: r12 });
-
-    var p13: Vec<i64> = Vec::new(); p13.push(WT_I64);
-    var r13: Vec<i64> = Vec::new(); r13.push(WT_I64);
-    imports.push(HostImport { name: "p_to_str_vec", params: p13, results: r13 });
-
-    var p14: Vec<i64> = Vec::new(); p14.push(WT_I64);
-    var r14: Vec<i64> = Vec::new(); r14.push(WT_I64);
-    imports.push(HostImport { name: "p_to_str_str", params: p14, results: r14 });
-
-    var p15: Vec<i64> = Vec::new(); p15.push(WT_I64);
-    var r15: Vec<i64> = Vec::new(); r15.push(WT_I64);
-    imports.push(HostImport { name: "print", params: p15, results: r15 });
-
-    return imports;
-}
-
-fn host_import_index(name: str) -> i64 {
-    var imports: Vec<HostImport> = host_imports();
-    var i: i64 = 0;
-    while i < imports.len() {
-        if imports[i].name == name {
-            return i;
-        }
-        i = i + 1;
-    }
-    return -1;
-}
-
-// ─── Code generator ────────────────────────────────────────────────────
-
-pub struct WasmCodeGen {
-    pub locals: Vec<LocalEntry>,           // ValueId -> local index
-    pub local_types: Vec<i64>,             // local types (excluding params)
-    pub string_addrs: Vec<WasmStringAddrEntry>,  // string -> address
-    pub data_ptr: i64,                      // next free data address
-    pub type_indices: Vec<TypeIndexEntry>,   // signature key -> type index
-    pub type_sigs: Vec<TypeSig>,             // collected type signatures
-    pub func_type: Vec<FuncTypeEntry>,      // function name -> type index
-    pub func_index: Vec<FuncIndexEntry>,     // function name -> function index
-    pub user_funcs: Vec<str>,                // ordered user function names
-    pub struct_layouts: Vec<StructLayoutEntry>, // struct layouts
-}
-
-pub struct LocalEntry {
-    pub value_id: i64,
-    pub local_idx: i64,
-}
-
-pub struct WasmStringAddrEntry {
-    pub s: str,
-    pub addr: i64,
-}
-
-pub struct TypeIndexEntry {
-    pub key: str,
-    pub index: i64,
-}
-
-pub struct TypeSig {
-    pub params: Vec<i64>,
-    pub results: Vec<i64>,
-}
-
-pub struct FuncTypeEntry {
-    pub name: str,
-    pub type_idx: i64,
-}
-
-pub struct FuncIndexEntry {
-    pub name: str,
-    pub index: i64,
-}
-
-pub fn WasmCodeGen_new() -> WasmCodeGen {
-    return WasmCodeGen {
-        locals: Vec::new(),
-        local_types: Vec::new(),
-        string_addrs: Vec::new(),
-        data_ptr: 1024,
-        type_indices: Vec::new(),
-        type_sigs: Vec::new(),
-        func_type: Vec::new(),
-        func_index: Vec::new(),
-        user_funcs: Vec::new(),
-        struct_layouts: Vec::new(),
+fn WasmGen_new() -> WasmGen {
+    return WasmGen {
+        all_fns: HashMap_new(),
+        fn_index: HashMap_new(),
+        queue: Vec::new(),
+        def_types: Vec::new(),
+        n_imports: 0,
+        imp_names: Vec::new(),
+        imp_sigs: Vec::new(),
+        imp_index: HashMap_new(),
+        type_keys: Vec::new(),
+        type_index: HashMap_new(),
+        table: Vec::new(),
+        table_index: HashMap_new(),
+        data: Vec::new(),
+        str_addr: HashMap_new(),
+        glob_addr: HashMap_new(),
+        globs: Vec::new(),
+        named_fns: Vec::new(),
+        named_seen: HashMap_new(),
+        dyn_types: Vec::new(),
+        c_names: HashMap_new(),
+        c_list: Vec::new(),
+        unresolved: Vec::new(),
+        unresolved_seen: HashMap_new(),
+        b: Vec::new(),
+        cur_name: "",
+        cur_wrapping: false,
+        unchecked: Vec::new(),
+        local_of: Vec::new(),
+        alloca_off: Vec::new(),
+        frame: 0,
+        va_off: 0 - 1,
+        t0: 0,
+        t1: 0,
+        t2: 0,
+        t3: 0,
+        fp: 0,
+        cur: 0,
+        block_index: HashMap_new(),
+        nblocks: 0,
+        k: 0,
+        extra: 0,
+        cur_inst_line: 0,
     };
 }
 
-fn WasmCodeGen_locals_get(self: &WasmCodeGen, id: i64) -> i64 {
+// ─── Bytes ─────────────────────────────────────────────────────────────
+
+fn wb_uleb(out: &mut Vec<i64>, v: i64) {
+    var x: i64 = v;
+    while true {
+        var byte: i64 = x & 0x7F;
+        x = (x >> 7) & 0x1FFFFFFFFFFFFFF;
+        if x != 0 {
+            out.push(byte | 0x80);
+        } else {
+            out.push(byte);
+            return;
+        }
+    }
+}
+
+fn wb_sleb(out: &mut Vec<i64>, v: i64) {
+    var x: i64 = v;
+    while true {
+        var byte: i64 = x & 0x7F;
+        x = x >> 7;
+        var done: bool = (x == 0 && (byte & 0x40) == 0) || (x == 0 - 1 && (byte & 0x40) != 0);
+        if done {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+fn wb_name(out: &mut Vec<i64>, s: str) {
+    var n: i64 = str_len(s);
+    wb_uleb(out, n);
     var i: i64 = 0;
-    while i < self.locals.len() {
-        if self.locals[i].value_id == id {
-            return self.locals[i].local_idx;
-        }
+    while i < n {
+        out.push(str_byte_at(s, i) & 0xFF);
         i = i + 1;
     }
-    return -1;
 }
 
-fn WasmCodeGen_locals_insert(self: &mut WasmCodeGen, id: i64, idx: i64) {
-    self.locals.push(LocalEntry { value_id: id, local_idx: idx });
-}
-
-fn WasmCodeGen_string_addrs_get(self: &WasmCodeGen, s: str) -> i64 {
+fn wb_append(out: &mut Vec<i64>, bs: &Vec<i64>) {
     var i: i64 = 0;
-    while i < self.string_addrs.len() {
-        if self.string_addrs[i].s == s {
-            return self.string_addrs[i].addr;
-        }
+    var n: i64 = bs.len();
+    while i < n {
+        out.push(bs.get(i));
         i = i + 1;
     }
-    return -1;
 }
 
-fn WasmCodeGen_func_type_get(self: &WasmCodeGen, name: str) -> i64 {
-    var i: i64 = 0;
-    while i < self.func_type.len() {
-        if self.func_type[i].name == name {
-            return self.func_type[i].type_idx;
-        }
-        i = i + 1;
+/// A section: id, size, contents.
+fn wb_section(out: &mut Vec<i64>, id: i64, contents: &Vec<i64>) {
+    out.push(id);
+    wb_uleb(out, contents.len());
+    wb_append(out, contents);
+}
+
+// ─── Instructions into the current body ────────────────────────────────
+
+fn w(g: &mut WasmGen, byte: i64) { g.b.push(byte & 0xFF); }
+fn wu(g: &mut WasmGen, v: i64) { wb_uleb(&mut g.b, v); }
+fn wi64(g: &mut WasmGen, v: i64) { w(g, 0x42); wb_sleb(&mut g.b, v); }
+fn wi32(g: &mut WasmGen, v: i64) { w(g, 0x41); wb_sleb(&mut g.b, v); }
+fn wlget(g: &mut WasmGen, l: i64) { w(g, 0x20); wu(g, l); }
+fn wlset(g: &mut WasmGen, l: i64) { w(g, 0x21); wu(g, l); }
+fn wltee(g: &mut WasmGen, l: i64) { w(g, 0x22); wu(g, l); }
+fn wgget(g: &mut WasmGen, x: i64) { w(g, 0x23); wu(g, x); }
+fn wgset(g: &mut WasmGen, x: i64) { w(g, 0x24); wu(g, x); }
+fn wend(g: &mut WasmGen) { w(g, 0x0B); }
+fn wbr(g: &mut WasmGen, depth: i64) { w(g, 0x0C); wu(g, depth); }
+fn wif(g: &mut WasmGen) { w(g, 0x04); w(g, WT_VOID); g.extra = g.extra + 1; }
+fn wif_t(g: &mut WasmGen, t: i64) { w(g, 0x04); w(g, t); g.extra = g.extra + 1; }
+fn welse(g: &mut WasmGen) { w(g, 0x05); }
+fn wendif(g: &mut WasmGen) { w(g, 0x0B); g.extra = g.extra - 1; }
+fn wcall(g: &mut WasmGen, fidx: i64) { w(g, 0x10); wu(g, fidx); }
+fn wwrap(g: &mut WasmGen) { w(g, 0xA7); }
+fn wextu(g: &mut WasmGen) { w(g, 0xAD); }
+fn wexts(g: &mut WasmGen) { w(g, 0xAC); }
+
+/// i64 load of `size` bytes at [top-of-stack address + off] (an i64 address)
+fn wload(g: &mut WasmGen, size: i64, signed: bool, off: i64) {
+    wwrap(g);
+    if size == 1 {
+        if signed { w(g, 0x30); } else { w(g, 0x31); }
+        wu(g, 0);
+    } else if size == 2 {
+        if signed { w(g, 0x32); } else { w(g, 0x33); }
+        wu(g, 1);
+    } else if size == 4 {
+        if signed { w(g, 0x34); } else { w(g, 0x35); }
+        wu(g, 2);
+    } else {
+        w(g, 0x29);
+        wu(g, 3);
     }
-    return -1;
+    wu(g, off);
 }
 
-fn WasmCodeGen_func_index_get(self: &WasmCodeGen, name: str) -> i64 {
-    var i: i64 = 0;
-    while i < self.func_index.len() {
-        if self.func_index[i].name == name {
-            return self.func_index[i].index;
-        }
-        i = i + 1;
-    }
-    return -1;
+/// i64 store of `size` bytes; the stack is [i32 address, i64 value]
+fn wstore(g: &mut WasmGen, size: i64, off: i64) {
+    if size == 1 { w(g, 0x3C); wu(g, 0); }
+    else if size == 2 { w(g, 0x3D); wu(g, 1); }
+    else if size == 4 { w(g, 0x3E); wu(g, 2); }
+    else { w(g, 0x37); wu(g, 3); }
+    wu(g, off);
 }
 
-fn WasmCodeGen_struct_layout_get(self: &WasmCodeGen, name: str) -> OptStructLayout {
-    var i: i64 = 0;
-    while i < self.struct_layouts.len() {
-        if self.struct_layouts[i].name == name {
-            return OptStructLayout::Some(self.struct_layouts[i].layout);
-        }
-        i = i + 1;
-    }
-    return OptStructLayout::None;
+/// The local of value `id` (-1: none)
+fn wg_local(g: &WasmGen, id: i64) -> i64 {
+    if id < 0 || id >= g.local_of.len() { return 0 - 1; }
+    return g.local_of.get(id);
 }
 
-pub enum OptStructLayout {
-    Some(StructLayout),
-    None,
+/// Push value `id` (0 for a value without a local)
+fn wget(g: &mut WasmGen, id: i64) {
+    var l: i64 = wg_local(g, id);
+    if l < 0 { wi64(g, 0); } else { wlget(g, l); }
 }
 
-fn WasmCodeGen_intern_string(self: &mut WasmCodeGen, s: str) -> i64 {
-    var existing: i64 = WasmCodeGen_string_addrs_get(self, s);
-    if existing >= 0 {
-        return existing;
-    }
-    var addr: i64 = self.data_ptr;
-    self.string_addrs.push(WasmStringAddrEntry { s: s, addr: addr });
-    var slen: i64 = str_len(s);
-    self.data_ptr = self.data_ptr + slen + 1; // null terminator
-    // Pad to 8-byte alignment
-    while self.data_ptr % 8 != 0 {
-        self.data_ptr = self.data_ptr + 1;
-    }
-    return addr;
+/// Pop into value `id`
+fn wset(g: &mut WasmGen, id: i64) {
+    var l: i64 = wg_local(g, id);
+    if l < 0 { w(g, 0x1A); } else { wlset(g, l); }
 }
 
-fn WasmCodeGen_intern_type(self: &mut WasmCodeGen, params: Vec<i64>, results: Vec<i64>) -> i64 {
-    // Build a key string for deduplication
-    var key: str = type_sig_key(params, results);
-    var i: i64 = 0;
-    while i < self.type_indices.len() {
-        if self.type_indices[i].key == key {
-            return self.type_indices[i].index;
-        }
-        i = i + 1;
-    }
-    var idx: i64 = self.type_sigs.len();
-    self.type_sigs.push(TypeSig { params: params, results: results });
-    self.type_indices.push(TypeIndexEntry { key: key, index: idx });
-    return idx;
+/// Push value `id` as an i32 address
+fn wget_addr(g: &mut WasmGen, id: i64) {
+    wget(g, id);
+    wwrap(g);
 }
 
-fn type_sig_key(params: Vec<i64>, results: Vec<i64>) -> str {
-    var key: str = "p";
-    var i: i64 = 0;
-    while i < params.len() {
-        key = key + "_" + int_to_str(params[i]);
-        i = i + 1;
-    }
-    key = key + "_r";
-    i = 0;
-    while i < results.len() {
-        key = key + "_" + int_to_str(results[i]);
-        i = i + 1;
-    }
-    return key;
+/// i64 comparison of the two values on the stack -> i64 0/1
+fn wcmp(g: &mut WasmGen, cc: i64) {
+    if cc == WCC_EQ { w(g, 0x51); }
+    else if cc == WCC_NE { w(g, 0x52); }
+    else if cc == WCC_LT { w(g, 0x53); }
+    else if cc == WCC_LTU { w(g, 0x54); }
+    else if cc == WCC_GT { w(g, 0x55); }
+    else if cc == WCC_GTU { w(g, 0x56); }
+    else if cc == WCC_LE { w(g, 0x57); }
+    else if cc == WCC_LEU { w(g, 0x58); }
+    else if cc == WCC_GE { w(g, 0x59); }
+    else { w(g, 0x5A); }
+    wextu(g);
 }
 
-/// Map a Fides function name to a sanitized WASM-safe name.
-/// Ported from src/wasm.rs:250 (WasmCodeGen::sanitize).
-/// Replaces "::" with "_" and "." with "_".
-pub fn WasmCodeGen_sanitize(name: str) -> str {
-    var result: str = str_replace(name, "::", "_");
-    result = str_replace(result, ".", "_");
-    return result;
-}
-
-/// Field offset for GetFieldPtr, using struct layouts when available.
-/// Ported from src/wasm.rs:256 (WasmCodeGen::field_offset).
-/// Returns the byte offset of field `field_index` in struct `struct_name`.
-/// If no layout is found, defaults to field_index * 8.
-pub fn WasmCodeGen_field_offset(self: &WasmCodeGen, struct_name: str, field_index: i64) -> i64 {
-    var layout_opt: OptStructLayout = WasmCodeGen_struct_layout_get(self, struct_name);
-    match layout_opt {
-        OptStructLayout::Some(layout) => {
-            if field_index >= 0 && field_index < layout.fields.len() {
-                var field: StringIrTypeOffset = layout.fields.get(field_index);
-                return field.offset;
-            }
-            return field_index * 8;
-        }
-        OptStructLayout::None => {
-            return field_index * 8;
-        }
-    }
-}
-
-/// Resolve the struct name from an IrType (Struct or Opaque/Generic).
-/// Ported from src/wasm.rs:265 (WasmCodeGen::struct_name_of).
-/// Returns OptStr::Some(name) if the type is a struct/opaque/generic,
-/// OptStr::None otherwise.
-pub fn WasmCodeGen_struct_name_of(ty: IrType) -> OptString {
+/// Normalize the i64 on the stack to narrow type `ty` (nat_ir's ng_ext)
+fn wnarrow(g: &mut WasmGen, ty: IrType) {
     match ty {
-        IrType::Struct(n) => { return OptString::Some(n); }
-        IrType::Opaque(n) => { return OptString::Some(n); }
-        IrType::Generic(n, _) => { return OptString::Some(n); }
-        _ => { return OptString::None; }
+        IrType::I8 => { w(g, 0xC2); }
+        IrType::I16 => { w(g, 0xC3); }
+        IrType::I32 => { w(g, 0xC4); }
+        IrType::U8 => { wi64(g, 0xFF); w(g, 0x83); }
+        IrType::U16 => { wi64(g, 0xFFFF); w(g, 0x83); }
+        IrType::U32 => { wi64(g, 0xFFFFFFFF); w(g, 0x83); }
+        _ => {}
     }
 }
 
-// ─── Local get/set helpers ─────────────────────────────────────────────
-
-fn WasmCodeGen_emit_local_get(self: &WasmCodeGen, out: &mut WasmBuf, idx: i64) {
-    WasmBuf_push(out, 0x20);
-    WasmBuf_uleb(out, idx);
-}
-
-fn WasmCodeGen_emit_local_set(self: &WasmCodeGen, out: &mut WasmBuf, idx: i64) {
-    WasmBuf_push(out, 0x21);
-    WasmBuf_uleb(out, idx);
-}
-
-/// Emit a local.tee (set and keep on stack).
-/// Ported from src/wasm.rs:292 (emit_local_tee).
-fn WasmCodeGen_emit_local_tee(self: &WasmCodeGen, out: &mut WasmBuf, idx: i64) {
-    WasmBuf_push(out, 0x22);
-    WasmBuf_uleb(out, idx);
-}
-
-fn WasmCodeGen_emit_global_get(self: &WasmCodeGen, out: &mut WasmBuf, idx: i64) {
-    WasmBuf_push(out, 0x23);
-    WasmBuf_uleb(out, idx);
-}
-
-fn WasmCodeGen_emit_global_set(self: &WasmCodeGen, out: &mut WasmBuf, idx: i64) {
-    WasmBuf_push(out, 0x24);
-    WasmBuf_uleb(out, idx);
-}
-
-fn WasmCodeGen_emit_const_i32(self: &WasmCodeGen, out: &mut WasmBuf, cval: i64) {
-    WasmBuf_push(out, 0x41);
-    WasmBuf_sleb(out, cval);
-}
-
-fn WasmCodeGen_emit_const_i64(self: &WasmCodeGen, out: &mut WasmBuf, cval: i64) {
-    WasmBuf_push(out, 0x42);
-    WasmBuf_sleb(out, cval);
-}
-
-/// Emit a load of the value produced by `id` onto the stack.
-fn WasmCodeGen_emit_value(self: &WasmCodeGen, out: &mut WasmBuf, id: i64, func: &IrFunction) {
-    var meta_opt: OptValueMeta = IrFunction_get_meta(func, id);
-    match meta_opt {
-        OptValueMeta::Some(meta) => {
-            if !has_value(meta.ty) {
-                return;
-            }
-            var idx: i64 = WasmCodeGen_locals_get(self, id);
-            if idx >= 0 {
-                WasmCodeGen_emit_local_get(self, out, idx);
-            }
-        }
-        OptValueMeta::None => {}
-    }
-}
-
-/// Emit a store of the top of stack into the local for `id`.
-fn WasmCodeGen_emit_set_value(self: &WasmCodeGen, out: &mut WasmBuf, id: i64, func: &IrFunction) {
-    var idx: i64 = WasmCodeGen_locals_get(self, id);
-    if idx >= 0 {
-        WasmCodeGen_emit_local_set(self, out, idx);
-    }
-}
-
-// ─── Per-function setup ────────────────────────────────────────────────
-
-fn WasmCodeGen_setup_locals(self: &mut WasmCodeGen, func: &IrFunction) {
-    self.locals.clear();
-    self.local_types.clear();
-
-    // Params first (params share the local index space)
-    var i: i64 = 0;
-    while i < func.params.len() {
-        WasmCodeGen_locals_insert(self, func.params[i].id, i);
-        i = i + 1;
-    }
-    var next: i64 = func.params.len();
-
-    // All other values become locals
-    i = 0;
-    while i < func.value_metas.len() {
-        var vm: ValueIdMeta = func.value_metas[i];
-        // Skip params
-        var is_param: bool = false;
-        var j: i64 = 0;
-        while j < func.params.len() {
-            if func.params[j].id == vm.id {
-                is_param = true;
-                break;
-            }
-            j = j + 1;
-        }
-        if is_param {
-            i = i + 1;
-            continue;
-        }
-
-        if !has_value(vm.meta.ty) {
-            // Allocate a slot with i32 placeholder
-            WasmCodeGen_locals_insert(self, vm.id, next);
-            self.local_types.push(WT_I32);
-            next = next + 1;
-        } else {
-            WasmCodeGen_locals_insert(self, vm.id, next);
-            self.local_types.push(wasm_valtype(vm.meta.ty));
-            next = next + 1;
-        }
-        i = i + 1;
-    }
-}
-
-// ─── Function body generation ──────────────────────────────────────────
-
-fn WasmCodeGen_gen_function(self: &mut WasmCodeGen, name: str, func: &IrFunction) -> Vec<i64> {
-    WasmCodeGen_setup_locals(self, func);
-
-    var out: WasmBuf = WasmBuf_new();
-
-    // Local declarations (excluding params)
-    // Encoded as: count, then (count, type) pairs.
-    if self.local_types.len() == 0 {
-        WasmBuf_uleb(&mut out, 0);
-    } else {
-        var groups: Vec<GroupEntry> = Vec::new();
-        var i: i64 = 0;
-        while i < self.local_types.len() {
-            var t: i64 = self.local_types[i];
-            if groups.len() > 0 {
-                var last: GroupEntry = groups[groups.len() - 1];
-                if last.ty == t {
-                    var updated: GroupEntry = GroupEntry_new(last.count + 1, t);
-                    groups.set(groups.len() - 1, updated);
-                    i = i + 1;
-                    continue;
-                }
-            }
-            var new_entry: GroupEntry = GroupEntry_new(1, t);
-            groups.push(new_entry);
-            i = i + 1;
-        }
-        WasmBuf_uleb(&mut out, groups.len());
-        i = 0;
-        while i < groups.len() {
-            WasmBuf_uleb(&mut out, groups[i].count);
-            WasmBuf_push(&mut out, groups[i].ty);
-            i = i + 1;
-        }
-    }
-
-    // Allocate cur_block local
-    var cur_block_local: i64 = self.local_types.len() + func.params.len();
-
-    // Re-emit locals including cur_block (i32)
-    out.bytes.clear();
-    var total_locals: i64 = self.local_types.len() + 1;
-    if total_locals == 1 {
-        WasmBuf_uleb(&mut out, 1);
-        WasmBuf_uleb(&mut out, 1);
-        WasmBuf_push(&mut out, WT_I32);
-    } else {
-        var groups: Vec<GroupEntry> = Vec::new();
-        var i: i64 = 0;
-        while i < self.local_types.len() {
-            var t: i64 = self.local_types[i];
-            if groups.len() > 0 {
-                var last: GroupEntry = groups[groups.len() - 1];
-                if last.ty == t {
-                    var updated: GroupEntry = GroupEntry_new(last.count + 1, t);
-                    groups.set(groups.len() - 1, updated);
-                    i = i + 1;
-                    continue;
-                }
-            }
-            var new_entry: GroupEntry = GroupEntry_new(1, t);
-            groups.push(new_entry);
-            i = i + 1;
-        }
-        // Append cur_block (i32)
-        if groups.len() > 0 {
-            var last: GroupEntry = groups[groups.len() - 1];
-            if last.ty == WT_I32 {
-                var updated: GroupEntry = GroupEntry_new(last.count + 1, WT_I32);
-                groups.set(groups.len() - 1, updated);
-            } else {
-                var new_i32: GroupEntry = GroupEntry_new(1, WT_I32);
-                groups.push(new_i32);
-            }
-        } else {
-            var first_i32: GroupEntry = GroupEntry_new(1, WT_I32);
-            groups.push(first_i32);
-        }
-        WasmBuf_uleb(&mut out, groups.len());
-        i = 0;
-        while i < groups.len() {
-            WasmBuf_uleb(&mut out, groups[i].count);
-            WasmBuf_push(&mut out, groups[i].ty);
-            i = i + 1;
-        }
-    }
-
-    // cur_block = 0 (entry block)
-    WasmCodeGen_emit_const_i32(self, &mut out, 0);
-    WasmCodeGen_emit_local_set(self, &mut out, cur_block_local);
-
-    // block $exit
-    WasmBuf_push(&mut out, 0x02); WasmBuf_push(&mut out, WT_VOID);
-    // loop $top
-    WasmBuf_push(&mut out, 0x03); WasmBuf_push(&mut out, WT_VOID);
-    // block $dispatch
-    WasmBuf_push(&mut out, 0x02); WasmBuf_push(&mut out, WT_VOID);
-
-    // Generate blocks
-    var bi: i64 = 0;
-    while bi < func.blocks.len() {
-        var block: BasicBlock = func.blocks[bi];
-
-        // if (cur_block == bi) { ... }
-        WasmCodeGen_emit_local_get(self, &mut out, cur_block_local);
-        WasmCodeGen_emit_const_i32(self, &mut out, bi);
-        WasmBuf_push(&mut out, 0x46); // i32.eq
-        WasmBuf_push(&mut out, 0x04); WasmBuf_push(&mut out, WT_VOID); // if void
-
-        // Generate instructions
-        var ii: i64 = 0;
-        while ii < block.instructions.len() {
-            var inst_id: i64 = block.instructions[ii];
-            var inst_opt: OptInst = IrFunction_get_inst(func, inst_id);
-            match inst_opt {
-                OptInst::Some(inst) => {
-                    WasmCodeGen_gen_inst(self, &mut out, inst, inst_id, func, cur_block_local);
-                }
-                OptInst::None => {}
-            }
-            ii = ii + 1;
-        }
-
-        // Check if block has a terminator
-        var has_terminator: bool = false;
-        ii = 0;
-        while ii < block.instructions.len() {
-            var inst_id: i64 = block.instructions[ii];
-            var inst_opt: OptInst = IrFunction_get_inst(func, inst_id);
-            match inst_opt {
-                OptInst::Some(inst) => {
-                    if ws_inst_is_terminator(inst) {
-                        has_terminator = true;
-                    }
-                }
-                OptInst::None => {}
-            }
-            ii = ii + 1;
-        }
-
-        if !has_terminator {
-            if bi + 1 < func.blocks.len() {
-                WasmCodeGen_emit_const_i32(self, &mut out, bi + 1);
-                WasmCodeGen_emit_local_set(self, &mut out, cur_block_local);
-                WasmBuf_push(&mut out, 0x0C); WasmBuf_uleb(&mut out, 0); // br $dispatch
-            } else {
-                WasmBuf_push(&mut out, 0x0C); WasmBuf_uleb(&mut out, 2); // br $exit
-            }
-        }
-
-        WasmBuf_push(&mut out, 0x0B); // end if
-        bi = bi + 1;
-    }
-
-    // No matching block -> exit
-    WasmBuf_push(&mut out, 0x0C); WasmBuf_uleb(&mut out, 2); // br $exit
-
-    WasmBuf_push(&mut out, 0x0B); // end $dispatch
-    WasmBuf_push(&mut out, 0x0C); WasmBuf_uleb(&mut out, 1); // br $top
-    WasmBuf_push(&mut out, 0x0B); // end $top
-    WasmBuf_push(&mut out, 0x0B); // end $exit
-
-    // Function epilogue: push default return value
-    if has_value(func.ret_ty) {
-        var wt: i64 = wasm_valtype(func.ret_ty);
-        match wt {
-            WT_I32 => { WasmCodeGen_emit_const_i32(self, &mut out, 0); }
-            WT_I64 => { WasmCodeGen_emit_const_i64(self, &mut out, 0); }
-            WT_F32 => { WasmBuf_push(&mut out, 0x43); WasmBuf_f32(&mut out, 0.0); }
-            WT_F64 => { WasmBuf_push(&mut out, 0x44); WasmBuf_f64(&mut out, 0.0); }
-            _ => {}
-        }
-    }
-    WasmBuf_push(&mut out, 0x0B); // end function body
-
-    return out.bytes;
-}
-
-pub struct GroupEntry {
-    pub count: i64,
-    pub ty: i64,
-}
-
-pub fn GroupEntry_new(count: i64, ty: i64) -> GroupEntry {
-    return GroupEntry { count: count, ty: ty };
-}
-
-/// Check if an instruction is a terminator (Jump, Branch, Return, Unreachable).
-pub fn ws_inst_is_terminator(inst: Inst) -> bool {
-    match inst {
-        Inst::Jump(_) => { return true; }
-        Inst::Branch(_, _, _) => { return true; }
-        Inst::Return(_) => { return true; }
-        Inst::Unreachable => { return true; }
-        _ => { return false; }
+fn wg_is_narrow(ty: IrType) -> bool {
+    match ty {
+        IrType::I8 => { return true; }
+        IrType::I16 => { return true; }
+        IrType::I32 => { return true; }
+        IrType::U8 => { return true; }
+        IrType::U16 => { return true; }
+        IrType::U32 => { return true; }
+        _ => {}
     }
     return false;
 }
 
-// ─── Instruction translation ──────────────────────────────────────────
+/// Push value `id` as an f64 (its bits reinterpreted), or an f32
+fn wget_f(g: &mut WasmGen, id: i64, is32: bool) {
+    wget(g, id);
+    if is32 { wwrap(g); w(g, 0xBE); } else { w(g, 0xBF); }
+}
 
-fn WasmCodeGen_gen_inst(self: &mut WasmCodeGen, out: &mut WasmBuf, inst: Inst, id: i64, func: &IrFunction, cur_block_local: i64) {
-    var dst_meta_opt: OptValueMeta = IrFunction_get_meta(func, id);
-    var dst_has_value: bool = false;
-    match dst_meta_opt {
-        OptValueMeta::Some(m) => { dst_has_value = has_value(m.ty); }
+/// The float on the stack back to bits (i64)
+fn wf_bits(g: &mut WasmGen, is32: bool) {
+    if is32 { w(g, 0xBC); wextu(g); } else { w(g, 0xBD); }
+}
+
+// ─── Names: functions, types, strings, globals ─────────────────────────
+
+/// Parameter count of primitive `name` (written here in WASM), -1 if none.
+fn wg_prim_params(name: str) -> i64 {
+    if name == "nat_syscall" { return 7; }
+    if name == "nat_start_sp" { return 0; }
+    if name == "nat_atomic_load" { return 1; }
+    if name == "nat_atomic_store" { return 2; }
+    if name == "nat_atomic_add" { return 2; }
+    if name == "nat_atomic_cas" { return 3; }
+    if name == "nat_ctx_swap" { return 2; }
+    if name == "nat_ctx_tramp" { return 0; }
+    if name == "nat_clone_thread" { return 5; }
+    if name == "nat_call_fn" { return 3; }
+    if name == "nat_fn_table" { return 0; }
+    if name == "nat_tls_get" { return 0; }
+    if name == "nat_tls_set" { return 1; }
+    if name == "nat_frame_fp" { return 0; }
+    if name == "nat_frame_ret" { return 1; }
+    if name == "nat_frame_next" { return 1; }
+    if name == "nat_fn_names" { return 0; }
+    if name == "nat_sig_handler" { return 0; }
+    if name == "nat_sig_restorer" { return 0; }
+    if name == "nat_fma" { return 3; }
+    if name == "nat_arch" { return 0; }
+    if name == "nat_os" { return 0; }
+    if name == "nat_wasm_grow" { return 1; }
+    if name == "nat_wasm_size" { return 0; }
+    if name == "nat_c_sqrt" || name == "nat_c_fabs" || name == "nat_c_floor" || name == "nat_c_ceil"
+        || name == "nat_c_trunc" || name == "nat_c_round" {
+        return 1;
+    }
+    return 0 - 1;
+}
+
+/// The WASI preview-1 functions the runtime's `wasi_<name>` externs name,
+/// with their signatures (i: i32, I: i64; after '>' the result).
+fn wg_wasi_sig(name: str) -> str {
+    if name == "fd_write" || name == "fd_read" || name == "poll_oneoff" { return "iiii>i"; }
+    if name == "fd_close" { return "i>i"; }
+    if name == "fd_seek" { return "iIii>i"; }
+    if name == "fd_readdir" { return "iiiIi>i"; }
+    if name == "path_open" { return "iiiiiIIii>i"; }
+    if name == "path_filestat_get" { return "iiiii>i"; }
+    if name == "path_unlink_file" || name == "path_remove_directory" || name == "path_create_directory" { return "iii>i"; }
+    if name == "path_rename" { return "iiiiii>i"; }
+    if name == "proc_exit" { return "i>"; }
+    if name == "clock_time_get" { return "iIi>i"; }
+    if name == "random_get" || name == "args_sizes_get" || name == "args_get"
+        || name == "environ_sizes_get" || name == "environ_get" {
+        return "ii>i";
+    }
+    if name == "sched_yield" { return ">i"; }
+    return "";
+}
+
+fn wg_has_fn(g: &WasmGen, name: str) -> bool {
+    return HashMap_contains(g.all_fns, name);
+}
+
+/// Parameter count of a function or primitive (-1: neither)
+fn wg_nparams(g: &WasmGen, name: str) -> i64 {
+    if HashMap_contains(g.all_fns, name) { return HashMap_get(g.all_fns, name) - 1; }
+    return wg_prim_params(name);
+}
+
+/// The type index of signature `key`
+fn wg_type(g: &mut WasmGen, key: str) -> i64 {
+    if HashMap_contains(g.type_index, key) { return HashMap_get(g.type_index, key) - 1; }
+    g.type_keys.push(key);
+    HashMap_insert(g.type_index, key, g.type_keys.len());
+    return g.type_keys.len() - 1;
+}
+
+/// The type of a function of n i64 parameters returning an i64
+fn wg_type_n(g: &mut WasmGen, n: i64) -> i64 {
+    var key: str = "";
+    var i: i64 = 0;
+    while i < n { key = key + "I"; i = i + 1; }
+    return wg_type(g, key + ">I");
+}
+
+/// The function a call to `name` runs: an alias (p_vec_* -> core's
+/// Vec_*), the runtime's pert_X for builtin p_X, else `name`.
+fn wg_resolve(g: &WasmGen, name: str) -> str {
+    var alias: str = pe_runtime_alias(name);
+    if alias != name { return alias; }
+    var p: str = pert_name(name);
+    if p != "" && wg_has_fn(g, p) { return p; }
+    return name;
+}
+
+/// The index of function `name`, queueing it for compilation; -1 when the
+/// program defines no such function and it is not a primitive.
+fn wg_fn_ref(g: &mut WasmGen, name: str) -> i64 {
+    if HashMap_contains(g.fn_index, name) { return HashMap_get(g.fn_index, name); }
+    var np: i64 = wg_nparams(g, name);
+    if np < 0 { return 0 - 1; }
+    var idx: i64 = g.n_imports + g.def_types.len();
+    HashMap_insert(g.fn_index, name, idx);
+    g.def_types.push(wg_type_n(g, np));
+    g.queue.push(name);
+    return idx;
+}
+
+/// The table index of function `name` (0: none)
+fn wg_table_ref(g: &mut WasmGen, name: str) -> i64 {
+    if HashMap_contains(g.table_index, name) { return HashMap_get(g.table_index, name); }
+    var f: i64 = wg_fn_ref(g, name);
+    if f < 0 { return 0; }
+    g.table.push(f);
+    HashMap_insert(g.table_index, name, g.table.len());
+    return g.table.len();
+}
+
+fn wg_unresolved(g: &mut WasmGen, name: str) {
+    if !HashMap_contains(g.unresolved_seen, name) {
+        HashMap_insert(g.unresolved_seen, name, 1);
+        g.unresolved.push(name + " (from " + g.cur_name + ")");
+    }
+}
+
+fn wg_data_align(g: &mut WasmGen) {
+    while g.data.len() % 8 != 0 { g.data.push(0); }
+}
+
+/// The address of string constant `s` (its bytes and a NUL, 8-aligned)
+fn wg_str(g: &mut WasmGen, s: str) -> i64 {
+    if HashMap_contains(g.str_addr, s) { return HashMap_get(g.str_addr, s); }
+    wg_data_align(g);
+    var a: i64 = WG_DATA_BASE + g.data.len();
+    HashMap_insert(g.str_addr, s, a);
+    var n: i64 = str_len(s);
+    var i: i64 = 0;
+    while i < n {
+        g.data.push(str_byte_at(s, i) & 0xFF);
+        i = i + 1;
+    }
+    g.data.push(0);
+    return a;
+}
+
+/// The address of global `name` (its value is written at the end)
+fn wg_glob(g: &mut WasmGen, name: str, module: &IrModule) -> i64 {
+    if HashMap_contains(g.glob_addr, name) { return HashMap_get(g.glob_addr, name); }
+    wg_data_align(g);
+    var a: i64 = WG_DATA_BASE + g.data.len();
+    HashMap_insert(g.glob_addr, name, a);
+    g.globs.push(name);
+    var size: i64 = 8;
+    match IrModule_get_global(module, name) {
+        OptGlobalLookup::Some(gty, _) => {
+            size = IrModule_type_size(module, gty);
+            if size < 8 { size = 8; }
+            size = (size + 7) & (0 - 8);
+        }
+        OptGlobalLookup::None => {}
+    }
+    var i: i64 = 0;
+    while i < size { g.data.push(0); i = i + 1; }
+    return a;
+}
+
+fn wg_data_word(g: &mut WasmGen, addr: i64, v: i64) {
+    var at: i64 = addr - WG_DATA_BASE;
+    var i: i64 = 0;
+    while i < 8 {
+        g.data.set(at + i, (v >> (i * 8)) & 0xFF);
+        i = i + 1;
+    }
+}
+
+fn wg_dyn_id(g: &WasmGen, name: str) -> i64 {
+    var i: i64 = 0;
+    while i < g.dyn_types.len() {
+        if g.dyn_types.get(i) == name { return i + 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn wg_insert_sorted(v: Vec<str>, s: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var placed: bool = false;
+    var i: i64 = 0;
+    while i < v.len() {
+        var x: str = v.get(i);
+        if x == s { return v; }
+        if !placed && str_compare(x, s) > 0 {
+            out.push(s);
+            placed = true;
+        }
+        out.push(x);
+        i = i + 1;
+    }
+    if !placed { out.push(s); }
+    return out;
+}
+
+fn wg_meta_ty(func: &IrFunction, id: i64) -> IrType {
+    match IrFunction_get_meta(func, id) {
+        OptValueMeta::Some(m) => { return m.ty; }
         OptValueMeta::None => {}
     }
+    return IrType::I64;
+}
 
-    match inst {
-        // ─── Constants ───
-        Inst::ConstInt(value, ty) => {
-            var wt: i64 = wasm_valtype(ty);
-            if wt == WT_I32 {
-                WasmCodeGen_emit_const_i32(self, out, value);
-            } else {
-                WasmCodeGen_emit_const_i64(self, out, value);
+fn wg_meta_line(func: &IrFunction, id: i64) -> i64 {
+    match IrFunction_get_meta(func, id) {
+        OptValueMeta::Some(m) => {
+            match m.source_line {
+                OptU64::Some(v) => { return v as i64; }
+                OptU64::None => {}
             }
-            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
         }
-        Inst::ConstFloat(value, ty) => {
-            match ty {
-                IrType::F32 => {
-                    WasmBuf_push(out, 0x43);
-                    WasmBuf_f32(out, value);
-                }
-                _ => {
-                    WasmBuf_push(out, 0x44);
-                    WasmBuf_f64(out, value);
-                }
-            }
-            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
+        OptValueMeta::None => {}
+    }
+    return 0;
+}
+
+fn wg_is_unsigned_ty(t: IrType) -> bool {
+    return ir_type_eq(t, IrType::U8) || ir_type_eq(t, IrType::U16) || ir_type_eq(t, IrType::U32)
+        || ir_type_eq(t, IrType::U64);
+}
+
+fn wg_is_ptr_ty(t: IrType) -> bool {
+    match t {
+        IrType::Ptr(_) => { return true; }
+        _ => {}
+    }
+    return false;
+}
+
+fn wg_unchecked(g: &WasmGen, id: i64) -> bool {
+    return id >= 0 && id < g.unchecked.len() && (g.unchecked.get(id) & 1) != 0;
+}
+
+// ─── Calls ─────────────────────────────────────────────────────────────
+
+/// Call function `name` (resolved) with `pushed` arguments on the stack:
+/// extra ones dropped, missing ones 0 (WASM checks arity, machine code
+/// does not). Without a definition: a trap. Leaves its i64 result.
+fn wg_call_named(g: &mut WasmGen, name: str, pushed: i64) {
+    var f: i64 = wg_fn_ref(g, name);
+    if f < 0 {
+        wg_unresolved(g, name);
+        var i: i64 = 0;
+        while i < pushed { w(g, 0x1A); i = i + 1; }
+        w(g, 0x00);
+        wi64(g, 0);
+        return;
+    }
+    var np: i64 = wg_nparams(g, name);
+    var k: i64 = pushed;
+    while k > np { w(g, 0x1A); k = k - 1; }
+    while k < np { wi64(g, 0); k = k + 1; }
+    wcall(g, f);
+}
+
+/// Push values `srcs` (-1: a null `__env`)
+fn wg_push_srcs(g: &mut WasmGen, srcs: &Vec<i64>) {
+    var i: i64 = 0;
+    while i < srcs.len() {
+        var s: i64 = srcs.get(i);
+        if s < 0 { wi64(g, 0); } else { wget(g, s); }
+        i = i + 1;
+    }
+}
+
+/// Start a call of builtin `name`: its null `__env` pushed when it runs
+/// the runtime's Fides function. Returns the function to call.
+fn wg_builtin_begin(g: &mut WasmGen, name: str) -> str {
+    var target: str = wg_resolve(g, name);
+    if wg_has_fn(g, target) && !wg_has_fn(g, name) {
+        wi64(g, 0);
+    }
+    return target;
+}
+
+/// Call builtin `name` with the values `args`; leaves the result.
+fn wg_call_builtin(g: &mut WasmGen, name: str, args: &Vec<i64>) {
+    var target: str = wg_resolve(g, name);
+    var env: bool = wg_has_fn(g, target) && !wg_has_fn(g, name);
+    var n: i64 = args.len();
+    if env { wi64(g, 0); n = n + 1; }
+    wg_push_srcs(g, args);
+    wg_call_named(g, target, n);
+}
+
+/// A panic with `msg` (the runtime prints it, its trace, and exits 1)
+fn wg_panic_msg(g: &mut WasmGen, msg: str) {
+    var target: str = wg_builtin_begin(g, "p_panic");
+    var env: i64 = 0;
+    if wg_has_fn(g, target) && !wg_has_fn(g, "p_panic") { env = 1; }
+    wi64(g, wg_str(g, msg));
+    wg_call_named(g, target, env + 1);
+    w(g, 0x1A);
+    w(g, 0x00);
+}
+
+/// Arithmetic panic `which`: with " at line N" for the division panics
+/// when the instruction has a line (as the interpreter prints them)
+fn wg_panic(g: &mut WasmGen, which: i64) {
+    var msg: str = wg_panic_messages().get(which);
+    if which >= WP_DIV_OVF && g.cur_inst_line > 0 {
+        msg = msg + " at line " + int_to_str(g.cur_inst_line);
+    }
+    wg_panic_msg(g, msg);
+}
+
+/// if (i32 on the stack) { panic which }
+fn wg_panic_if(g: &mut WasmGen, which: i64) {
+    wif(g);
+    wg_panic(g, which);
+    wendif(g);
+}
+
+/// A call to a WASI import (C name `wasi_<name>`) with values `args`
+fn wg_call_import(g: &mut WasmGen, ix: i64, args: &Vec<i64>) {
+    var sig: str = g.imp_sigs.get(ix);
+    var gt: i64 = str_find(sig, ">");
+    var i: i64 = 0;
+    while i < gt {
+        if i < args.len() { wget(g, args.get(i)); } else { wi64(g, 0); }
+        if str_byte_at(sig, i) == 105 { wwrap(g); }
+        i = i + 1;
+    }
+    wcall(g, ix);
+    if gt + 1 < str_len(sig) {
+        if str_byte_at(sig, gt + 1) == 105 { wexts(g); }
+    } else {
+        wi64(g, 0);
+    }
+}
+
+fn wg_gen_call(g: &mut WasmGen, id: i64, call_name: str, args: Vec<i64>, func: &IrFunction) {
+    // An f64 lives in its local as its bits: these copy the word
+    if (call_name == "p_f64_to_bits" || call_name == "p_f64_from_bits") && args.len() == 1 {
+        wget(g, args.get(0));
+        wset(g, id);
+        return;
+    }
+    if call_name == "p_int_to_float" && args.len() == 1 {
+        wget(g, args.get(0));
+        w(g, 0xB9);
+        wf_bits(g, false);
+        wset(g, id);
+        return;
+    }
+    if call_name == "p_float_to_int" && args.len() == 1 {
+        wget_f(g, args.get(0), false);
+        w(g, 0xFC); wu(g, 6);
+        wset(g, id);
+        return;
+    }
+    if call_name == "p_f32_to_bits" && args.len() == 1 {
+        wget_f(g, args.get(0), false);
+        w(g, 0xB6);
+        wf_bits(g, true);
+        wset(g, id);
+        return;
+    }
+    // Varargs spawns: the arguments after `nargs` go to the frame's varargs
+    // area and are handed over as an array
+    var va_target: str = "";
+    var va_first: i64 = 0;
+    if call_name == "p_thread_spawn" { va_target = "pert_thread_spawn_v"; }
+    if call_name == "p_co_async" { va_target = "pert_co_async_v"; }
+    if call_name == "p_executor_spawn" { va_target = "pert_executor_spawn_v"; va_first = 1; }
+    if va_target != "" && wg_has_fn(g, va_target) && args.len() >= va_first + 2 && g.va_off >= 0 {
+        var k: i64 = va_first + 2;
+        var slot: i64 = 0;
+        while k < args.len() && slot < 8 {
+            wlget(g, g.fp);
+            wwrap(g);
+            wget(g, args.get(k));
+            wstore(g, 8, g.va_off + slot * 8);
+            k = k + 1;
+            slot = slot + 1;
+        }
+        wi64(g, 0);
+        wget(g, args.get(va_first));
+        wget(g, args.get(va_first + 1));
+        wlget(g, g.fp);
+        wi64(g, g.va_off);
+        w(g, 0x7C);
+        wg_call_named(g, va_target, 4);
+        wset(g, id);
+        return;
+    }
+    // extern "C" functions: the runtime's Fides pert_c_<C name>, an
+    // instruction primitive nat_c_<C name>, or a WASI import
+    if HashMap_contains(g.c_names, call_name) && !wg_has_fn(g, call_name) {
+        var cname: str = g.c_list.get(HashMap_get(g.c_names, call_name) - 1);
+        var over: str = "pert_c_" + cname;
+        var prim: str = "nat_c_" + cname;
+        if wg_has_fn(g, over) {
+            wi64(g, 0);
+            wg_push_srcs(g, &args);
+            wg_call_named(g, over, args.len() + 1);
+            wset(g, id);
+            return;
+        }
+        if wg_prim_params(prim) >= 0 {
+            wg_push_srcs(g, &args);
+            wg_call_named(g, prim, args.len());
+            wset(g, id);
+            return;
+        }
+        if HashMap_contains(g.imp_index, cname) {
+            wg_call_import(g, HashMap_get(g.imp_index, cname) - 1, &args);
+            wset(g, id);
+            return;
+        }
+        if wg_prim_params(cname) >= 0 {
+            wg_push_srcs(g, &args);
+            wg_call_named(g, cname, args.len());
+            wset(g, id);
+            return;
+        }
+    }
+    var target: str = call_name;
+    if call_name == "print" {
+        target = "p_print_int";
+        if args.len() > 0 {
+            var aty: IrType = wg_meta_ty(func, args.get(0));
+            if wg_is_ptr_ty(aty) { target = "p_print_str"; }
+            else if ir_type_is_float(aty) { target = "p_print_float"; }
+            else if ir_type_eq(aty, IrType::Bool) { target = "p_print_bool"; }
+            else if ir_type_is_opaque_named(aty, "Vec") { target = "p_print_vec"; }
+            else if ir_type_is_opaque_named(aty, "HashMap") { target = "p_print_map"; }
+            else if ir_type_is_opaque_named(aty, "Tensor") { target = "p_print_tensor"; }
+        }
+    } else if call_name == "p_to_str" {
+        if args.len() > 0 {
+            var aty2: IrType = wg_meta_ty(func, args.get(0));
+            if ir_type_is_opaque_named(aty2, "Vec") { target = "p_to_str_vec"; }
+            else if ir_type_is_float(aty2) { target = "p_to_str_float"; }
+            else if wg_is_ptr_ty(aty2) { target = "p_to_str_str"; }
+            else if ir_type_eq(aty2, IrType::Bool) { target = "p_to_str_bool"; }
+        }
+    }
+    var resolved: str = wg_resolve(g, target);
+    var n: i64 = args.len();
+    if wg_has_fn(g, resolved) && !wg_has_fn(g, call_name) {
+        wi64(g, 0);
+        n = n + 1;
+    }
+    wg_push_srcs(g, &args);
+    wg_call_named(g, resolved, n);
+    wset(g, id);
+}
+
+// ─── Integer arithmetic (nat_ir's meaning) ─────────────────────────────
+
+/// t0 / t1 or t0 % t1 in type `ty`, onto the stack
+fn wg_divmod(g: &mut WasmGen, is_mod: bool, ty: IrType, checked: bool) {
+    // Division by zero panics, even in @wrapping code
+    wlget(g, g.t1);
+    w(g, 0x50);
+    if is_mod { wg_panic_if(g, WP_MOD_ZERO); } else { wg_panic_if(g, WP_DIV_ZERO); }
+    if wg_is_unsigned_ty(ty) {
+        wlget(g, g.t0);
+        wlget(g, g.t1);
+        if is_mod { w(g, 0x82); } else { w(g, 0x80); }
+        return;
+    }
+    wlget(g, g.t1);
+    wi64(g, 0 - 1);
+    w(g, 0x51);
+    wif_t(g, WT_I64);
+    if is_mod {
+        wi64(g, 0);
+    } else {
+        if checked && ir_type_eq(ty, IrType::I64) {
+            wlget(g, g.t0);
+            wi64(g, 0 - 9223372036854775807 - 1);
+            w(g, 0x51);
+            wg_panic_if(g, WP_DIV_OVF);
+        }
+        wi64(g, 0);
+        wlget(g, g.t0);
+        w(g, 0x7D);
+    }
+    welse(g);
+    wlget(g, g.t0);
+    wlget(g, g.t1);
+    if is_mod { w(g, 0x81); } else { w(g, 0x7F); }
+    wendif(g);
+}
+
+/// The i64 in t2 normalized to narrow type `ty`; with a panic: one that
+/// does not fit. Leaves it in t2.
+fn wg_narrow_t2(g: &mut WasmGen, ty: IrType, panic: i64) {
+    if !wg_is_narrow(ty) { return; }
+    if panic >= 0 {
+        wlget(g, g.t2);
+        wnarrow(g, ty);
+        wlget(g, g.t2);
+        w(g, 0x52);
+        wg_panic_if(g, panic);
+        return;
+    }
+    wlget(g, g.t2);
+    wnarrow(g, ty);
+    wlset(g, g.t2);
+}
+
+/// t2 = t0 op t1 for add (0), sub (1), mul (2), with overflow checks
+fn wg_checked(g: &mut WasmGen, kind: i64, ty: IrType, checked: bool) {
+    var is_i64: bool = ir_type_eq(ty, IrType::I64);
+    var is_u64: bool = ir_type_eq(ty, IrType::U64);
+    var which: i64 = WP_ADD;
+    if kind == 1 { which = WP_SUB; }
+    if kind == 2 { which = WP_MUL; }
+    wlget(g, g.t0);
+    wlget(g, g.t1);
+    if kind == 0 { w(g, 0x7C); } else if kind == 1 { w(g, 0x7D); } else { w(g, 0x7E); }
+    wlset(g, g.t2);
+    if checked && is_i64 {
+        if kind == 0 {
+            // ((a ^ r) & (b ^ r)) < 0
+            wlget(g, g.t0); wlget(g, g.t2); w(g, 0x85);
+            wlget(g, g.t1); wlget(g, g.t2); w(g, 0x85);
+            w(g, 0x83);
+            wi64(g, 0);
+            w(g, 0x53);
+            wg_panic_if(g, which);
+        } else if kind == 1 {
+            // ((a ^ b) & (a ^ r)) < 0
+            wlget(g, g.t0); wlget(g, g.t1); w(g, 0x85);
+            wlget(g, g.t0); wlget(g, g.t2); w(g, 0x85);
+            w(g, 0x83);
+            wi64(g, 0);
+            w(g, 0x53);
+            wg_panic_if(g, which);
+        } else {
+            // a == -1 ? b == MIN : a != 0 && r / a != b
+            wlget(g, g.t0);
+            wi64(g, 0 - 1);
+            w(g, 0x51);
+            wif_t(g, WT_I32);
+            wlget(g, g.t1);
+            wi64(g, 0 - 9223372036854775807 - 1);
+            w(g, 0x51);
+            welse(g);
+            wlget(g, g.t0);
+            w(g, 0x50);
+            wif_t(g, WT_I32);
+            wi32(g, 0);
+            welse(g);
+            wlget(g, g.t2); wlget(g, g.t0); w(g, 0x7F);
+            wlget(g, g.t1);
+            w(g, 0x52);
+            wendif(g);
+            wendif(g);
+            wg_panic_if(g, which);
+        }
+        return;
+    }
+    if checked && is_u64 {
+        if kind == 0 {
+            wlget(g, g.t2); wlget(g, g.t0); w(g, 0x54);
+            wg_panic_if(g, which);
+        } else if kind == 1 {
+            wlget(g, g.t0); wlget(g, g.t1); w(g, 0x54);
+            wg_panic_if(g, which);
+        } else {
+            wlget(g, g.t0);
+            w(g, 0x50);
+            wif_t(g, WT_I32);
+            wi32(g, 0);
+            welse(g);
+            wlget(g, g.t2); wlget(g, g.t0); w(g, 0x80);
+            wlget(g, g.t1);
+            w(g, 0x52);
+            wendif(g);
+            wg_panic_if(g, which);
+        }
+        return;
+    }
+    // A narrow result that changes did not fit (checked); else normalized
+    if checked { wg_narrow_t2(g, ty, which); } else { wg_narrow_t2(g, ty, 0 - 1); }
+}
+
+fn wg_fcmp(g: &mut WasmGen, cc: i64, is32: bool) {
+    var op: i64 = 0x61;
+    if cc == WCC_NE { op = 0x62; }
+    if cc == WCC_LT { op = 0x63; }
+    if cc == WCC_GT { op = 0x64; }
+    if cc == WCC_LE { op = 0x65; }
+    if cc == WCC_GE { op = 0x66; }
+    if is32 { op = op - 6; }
+    w(g, op);
+    wextu(g);
+}
+
+fn wg_gen_binop(g: &mut WasmGen, id: i64, op: BinOp, left: i64, right: i64, ty: IrType, func: &IrFunction) {
+    var lty: IrType = wg_meta_ty(func, left);
+    var rty: IrType = wg_meta_ty(func, right);
+    var float_ty: IrType = ty;
+    var is_float: bool = ir_type_is_float(ty);
+    if !is_float && ir_type_is_float(lty) { is_float = true; float_ty = lty; }
+    if is_float {
+        var is32: bool = ir_type_eq(float_ty, IrType::F32);
+        var arith: i64 = 0;
+        var cc: i64 = 0 - 1;
+        match op {
+            BinOp::Add => { arith = 0xA0; }
+            BinOp::Sub => { arith = 0xA1; }
+            BinOp::Mul => { arith = 0xA2; }
+            BinOp::Div => { arith = 0xA3; }
+            BinOp::Eq => { cc = WCC_EQ; }
+            BinOp::Neq => { cc = WCC_NE; }
+            BinOp::Lt => { cc = WCC_LT; }
+            BinOp::LtEq => { cc = WCC_LE; }
+            BinOp::Gt => { cc = WCC_GT; }
+            BinOp::GtEq => { cc = WCC_GE; }
+            _ => {}
+        }
+        if arith == 0 && cc < 0 {
+            wi64(g, 0);
+            wset(g, id);
+            return;
+        }
+        wget_f(g, left, is32);
+        wget_f(g, right, is32);
+        if arith != 0 {
+            if is32 { w(g, arith - 14); } else { w(g, arith); }
+            wf_bits(g, is32);
+        } else {
+            wg_fcmp(g, cc, is32);
+        }
+        wset(g, id);
+        return;
+    }
+    var checked: bool = !g.cur_wrapping && !wg_unchecked(g, id);
+    var unsigned_cmp: bool = ir_type_eq(lty, IrType::U64) || ir_type_eq(rty, IrType::U64);
+    wget(g, left);
+    wlset(g, g.t0);
+    wget(g, right);
+    wlset(g, g.t1);
+    match op {
+        BinOp::Add => { wg_checked(g, 0, ty, checked); wlget(g, g.t2); }
+        BinOp::Sub => { wg_checked(g, 1, ty, checked); wlget(g, g.t2); }
+        BinOp::Mul => { wg_checked(g, 2, ty, checked); wlget(g, g.t2); }
+        BinOp::Div => {
+            g.cur_inst_line = wg_meta_line(func, id);
+            wg_divmod(g, false, ty, checked);
+            wlset(g, g.t2);
+            if checked { wg_narrow_t2(g, ty, WP_DIV_OVF); } else { wg_narrow_t2(g, ty, 0 - 1); }
+            g.cur_inst_line = 0;
+            wlget(g, g.t2);
+        }
+        BinOp::Mod => {
+            g.cur_inst_line = wg_meta_line(func, id);
+            wg_divmod(g, true, ty, checked);
+            g.cur_inst_line = 0;
+        }
+        BinOp::BitAnd => { wlget(g, g.t0); wlget(g, g.t1); w(g, 0x83); }
+        BinOp::BitOr => { wlget(g, g.t0); wlget(g, g.t1); w(g, 0x84); }
+        BinOp::BitXor => { wlget(g, g.t0); wlget(g, g.t1); w(g, 0x85); }
+        BinOp::Shl => {
+            wlget(g, g.t0); wlget(g, g.t1); w(g, 0x86);
+            wnarrow(g, ty);
+        }
+        BinOp::Shr => {
+            wlget(g, g.t0); wlget(g, g.t1);
+            if ir_type_eq(ty, IrType::U64) { w(g, 0x88); } else { w(g, 0x87); }
+        }
+        BinOp::And => {
+            wlget(g, g.t0); wi64(g, 0); w(g, 0x52);
+            wlget(g, g.t1); wi64(g, 0); w(g, 0x52);
+            w(g, 0x71);
+            wextu(g);
+        }
+        BinOp::Or => {
+            wlget(g, g.t0); wlget(g, g.t1); w(g, 0x84);
+            wi64(g, 0); w(g, 0x52);
+            wextu(g);
+        }
+        BinOp::Eq => { wlget(g, g.t0); wlget(g, g.t1); wcmp(g, WCC_EQ); }
+        BinOp::Neq => { wlget(g, g.t0); wlget(g, g.t1); wcmp(g, WCC_NE); }
+        BinOp::Lt => { wlget(g, g.t0); wlget(g, g.t1); if unsigned_cmp { wcmp(g, WCC_LTU); } else { wcmp(g, WCC_LT); } }
+        BinOp::LtEq => { wlget(g, g.t0); wlget(g, g.t1); if unsigned_cmp { wcmp(g, WCC_LEU); } else { wcmp(g, WCC_LE); } }
+        BinOp::Gt => { wlget(g, g.t0); wlget(g, g.t1); if unsigned_cmp { wcmp(g, WCC_GTU); } else { wcmp(g, WCC_GT); } }
+        BinOp::GtEq => { wlget(g, g.t0); wlget(g, g.t1); if unsigned_cmp { wcmp(g, WCC_GEU); } else { wcmp(g, WCC_GE); } }
+    }
+    wset(g, id);
+}
+
+// ─── Instructions ──────────────────────────────────────────────────────
+
+fn wg_block(g: &WasmGen, block_id: i64) -> i64 {
+    if HashMap_contains(g.block_index, int_to_str(block_id)) {
+        return HashMap_get(g.block_index, int_to_str(block_id));
+    }
+    return 0;
+}
+
+/// Branch to the loop: the dispatch enters block `target`
+fn wg_jump(g: &mut WasmGen, target: i64) {
+    wi32(g, target);
+    wlset(g, g.cur);
+    wbr(g, g.nblocks - 1 - g.k + g.extra);
+}
+
+/// The epilogue of a return: the frame given back
+fn wg_epilogue(g: &mut WasmGen) {
+    if g.frame > 0 {
+        wlget(g, g.fp);
+        wi64(g, g.frame);
+        w(g, 0x7C);
+        wgset(g, 0);
+    }
+}
+
+fn wg_gen_inst(g: &mut WasmGen, id: i64, inst: Inst, last: bool, func: &IrFunction, module: &IrModule) {
+    match inst {
+        Inst::ConstInt(value, _) => {
+            wi64(g, value);
+            wset(g, id);
         }
         Inst::ConstBool(value) => {
-            if value {
-                WasmCodeGen_emit_const_i32(self, out, 1);
+            if value { wi64(g, 1); } else { wi64(g, 0); }
+            wset(g, id);
+        }
+        Inst::ConstFloat(value, ty) => {
+            if ir_type_eq(ty, IrType::F32) {
+                wi64(g, p_f32_to_bits(value) & 0xFFFFFFFF);
             } else {
-                WasmCodeGen_emit_const_i32(self, out, 0);
+                wi64(g, p_f64_to_bits(value));
             }
-            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
+            wset(g, id);
         }
         Inst::ConstStr(value) => {
-            var addr: i64 = WasmCodeGen_intern_string(self, value);
-            WasmCodeGen_emit_const_i64(self, out, addr);
-            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
+            // A string naming a program function (a thread or task entry):
+            // compiled, and found by name at run time (nat_fn_table)
+            if wg_has_fn(g, value) && !HashMap_contains(g.named_seen, value) {
+                HashMap_insert(g.named_seen, value, 1);
+                wg_table_ref(g, value);
+                g.named_fns.push(value);
+            }
+            wi64(g, wg_str(g, value));
+            wset(g, id);
         }
         Inst::ConstFnRef(name) => {
-            var addr: i64 = WasmCodeGen_intern_string(self, name);
-            WasmCodeGen_emit_const_i64(self, out, addr);
-            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
+            wi64(g, wg_table_ref(g, c_fn_target(name)));
+            wset(g, id);
         }
-        Inst::ConstNull(ty) => {
-            WasmCodeGen_emit_const_i64(self, out, 0);
-            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
+        Inst::ConstNull(_) => {
+            wi64(g, 0);
+            wset(g, id);
         }
-
-        Inst::GlobalAddr(name, ty) => {
-            // WASM doesn't have a direct global address concept; emit 0 as stub
-            WasmCodeGen_emit_const_i64(self, out, 0);
-            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
+        Inst::GlobalAddr(name, _) => {
+            wi64(g, wg_glob(g, name, module));
+            wset(g, id);
         }
-
-        // ─── Arithmetic ───
         Inst::BinOp(op, left, right, ty) => {
-            WasmCodeGen_emit_value(self, out, left, func);
-            WasmCodeGen_emit_value(self, out, right, func);
-            var is_i32: bool = wasm_valtype(ty) == WT_I32;
-            var opcode: i64 = 0;
-            match op {
-                BinOp::Add => { if is_i32 { opcode = 0x6A; } else { opcode = 0x7C; } }
-                BinOp::Sub => { if is_i32 { opcode = 0x6B; } else { opcode = 0x7D; } }
-                BinOp::Mul => { if is_i32 { opcode = 0x6C; } else { opcode = 0x7E; } }
-                BinOp::Div => { if is_i32 { opcode = 0x6D; } else { opcode = 0x7F; } }
-                BinOp::Mod => { if is_i32 { opcode = 0x6F; } else { opcode = 0x81; } }
-                BinOp::BitAnd => { if is_i32 { opcode = 0x71; } else { opcode = 0x83; } }
-                BinOp::BitOr => { if is_i32 { opcode = 0x72; } else { opcode = 0x84; } }
-                BinOp::BitXor => { if is_i32 { opcode = 0x73; } else { opcode = 0x85; } }
-                BinOp::Shl => { if is_i32 { opcode = 0x74; } else { opcode = 0x86; } }
-                BinOp::Shr => { if is_i32 { opcode = 0x75; } else { opcode = 0x87; } }
-                BinOp::Eq => { if is_i32 { opcode = 0x46; } else { opcode = 0x52; } }
-                BinOp::Neq => { if is_i32 { opcode = 0x47; } else { opcode = 0x53; } }
-                BinOp::Lt => { if is_i32 { opcode = 0x48; } else { opcode = 0x54; } }
-                BinOp::Gt => { if is_i32 { opcode = 0x4A; } else { opcode = 0x56; } }
-                BinOp::LtEq => { if is_i32 { opcode = 0x4C; } else { opcode = 0x55; } }
-                BinOp::GtEq => { if is_i32 { opcode = 0x4E; } else { opcode = 0x57; } }
-                BinOp::And => { opcode = 0x71; }
-                BinOp::Or => { opcode = 0x72; }
-            }
-            WasmBuf_push(out, opcode);
-            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
+            wg_gen_binop(g, id, op, left, right, ty, func);
         }
         Inst::UnaryOp(op, operand, ty) => {
-            WasmCodeGen_emit_value(self, out, operand, func);
             match op {
                 UnaryOp::Neg => {
-                    var wt: i64 = wasm_valtype(ty);
-                    if wt == WT_F32 {
-                        WasmBuf_push(out, 0x8C);
-                    } else if wt == WT_F64 {
-                        WasmBuf_push(out, 0x9A);
+                    if ir_type_eq(ty, IrType::F32) {
+                        wget(g, operand);
+                        wi64(g, 2147483648);
+                        w(g, 0x85);
+                    } else if ir_type_is_float(ty) {
+                        wget(g, operand);
+                        wi64(g, 0 - 9223372036854775807 - 1);
+                        w(g, 0x85);
                     } else {
-                        if wt == WT_I32 {
-                            WasmCodeGen_emit_const_i32(self, out, 0);
-                            WasmBuf_push(out, 0x6B);
-                        } else {
-                            WasmCodeGen_emit_const_i64(self, out, 0);
-                            WasmBuf_push(out, 0x7D);
-                        }
+                        wi64(g, 0);
+                        wget(g, operand);
+                        w(g, 0x7D);
                     }
                 }
                 UnaryOp::Not => {
-                    WasmBuf_push(out, 0x45); // i32.eqz
+                    wget(g, operand);
+                    wi64(g, 1);
+                    w(g, 0x85);
                 }
                 UnaryOp::BitNot => {
-                    if wasm_valtype(ty) == WT_I32 {
-                        WasmCodeGen_emit_const_i32(self, out, -1);
-                        WasmBuf_push(out, 0x73);
-                    } else {
-                        WasmCodeGen_emit_const_i64(self, out, -1);
-                        WasmBuf_push(out, 0x85);
-                    }
+                    wget(g, operand);
+                    wi64(g, 0 - 1);
+                    w(g, 0x85);
                 }
             }
-            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
+            wset(g, id);
         }
-
-        // ─── Memory ───
-        Inst::Alloca(ty, reg) => {
-            // Bump the global stack pointer; result = old sp.
-            WasmCodeGen_emit_global_get(self, out, 0);
-            var size: i64 = ir_type_size(ty);
-            if size == 0 { size = 8; }
-            WasmCodeGen_emit_global_set(self, out, 0);
-            WasmCodeGen_emit_global_get(self, out, 0);
-            WasmCodeGen_emit_const_i64(self, out, size);
-            WasmBuf_push(out, 0x7C); // i64.add
-            WasmCodeGen_emit_global_set(self, out, 0);
-            WasmCodeGen_emit_global_get(self, out, 0);
-            WasmCodeGen_emit_const_i64(self, out, size);
-            WasmBuf_push(out, 0x7D); // i64.sub
-            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
+        Inst::Alloca(_, _) => {
+            var off: i64 = 0 - 1;
+            if id >= 0 && id < g.alloca_off.len() { off = g.alloca_off.get(id); }
+            if off >= 0 {
+                wlget(g, g.fp);
+                if off != 0 {
+                    wi64(g, off);
+                    w(g, 0x7C);
+                }
+                wset(g, id);
+            }
         }
         Inst::Load(ptr, ty) => {
-            WasmCodeGen_emit_value(self, out, ptr, func);
-            var opcode: i64 = 0;
-            var align: i64 = 0;
-            var wt: i64 = wasm_valtype(ty);
-            if wt == WT_I32 {
-                // Check for sub-word types
-                match ty {
-                    IrType::I8 => { opcode = 0x2C; align = 0; }
-                    IrType::U8 => { opcode = 0x2D; align = 0; }
-                    IrType::I16 => { opcode = 0x30; align = 1; }
-                    IrType::U16 => { opcode = 0x31; align = 1; }
-                    IrType::Bool => { opcode = 0x2D; align = 0; }
-                    _ => { opcode = 0x28; align = 2; } // i32.load
-                }
-            } else if wt == WT_I64 {
-                opcode = 0x29; align = 3; // i64.load
-            } else if wt == WT_F32 {
-                opcode = 0x2A; align = 2;
-            } else if wt == WT_F64 {
-                opcode = 0x2B; align = 3;
-            } else {
-                opcode = 0x29; align = 3;
+            var size: i64 = IrModule_type_size(module, ty);
+            var unsigned: bool = false;
+            match ty {
+                IrType::U8 => { unsigned = true; }
+                IrType::U16 => { unsigned = true; }
+                IrType::U32 => { unsigned = true; }
+                IrType::Bool => { unsigned = true; }
+                _ => {}
             }
-            WasmBuf_push(out, opcode);
-            WasmBuf_uleb(out, align);
-            WasmBuf_uleb(out, 0);
-            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
+            var lsize: i64 = 8;
+            if size <= 1 { lsize = 1; }
+            else if size == 2 { lsize = 2; }
+            else if size == 4 { lsize = 4; }
+            wget(g, ptr);
+            wload(g, lsize, !unsigned, 0);
+            wset(g, id);
         }
-        Inst::Store(ptr, value, opt_ty) => {
-            WasmCodeGen_emit_value(self, out, ptr, func);
-            WasmCodeGen_emit_value(self, out, value, func);
-            var val_meta_opt: OptValueMeta = IrFunction_get_meta(func, value);
-            var opcode: i64 = 0x3E;
-            var align: i64 = 3;
-            match val_meta_opt {
-                OptValueMeta::Some(m) => {
-                    var wt: i64 = wasm_valtype(m.ty);
-                    if wt == WT_I32 {
-                        match m.ty {
-                            IrType::I8 => { opcode = 0x3A; align = 0; }
-                            IrType::U8 => { opcode = 0x3A; align = 0; }
-                            IrType::Bool => { opcode = 0x3A; align = 0; }
-                            IrType::I16 => { opcode = 0x3E; align = 1; }
-                            IrType::U16 => { opcode = 0x3E; align = 1; }
-                            _ => { opcode = 0x36; align = 2; }
-                        }
-                    } else if wt == WT_I64 {
-                        opcode = 0x3E; align = 3;
-                    } else if wt == WT_F32 {
-                        opcode = 0x38; align = 2;
-                    } else if wt == WT_F64 {
-                        opcode = 0x39; align = 3;
-                    }
-                }
-                OptValueMeta::None => {}
+        Inst::Store(ptr, value, explicit_ty) => {
+            // The explicit store type, else the pointee type, else the
+            // value's type (as the C backend, pe_ir and nat_ir)
+            var store_ty: IrType = IrType::I64;
+            var have: bool = false;
+            match explicit_ty {
+                OptIrType::Some(t0) => { store_ty = t0; have = true; }
+                OptIrType::None => {}
             }
-            WasmBuf_push(out, opcode);
-            WasmBuf_uleb(out, align);
-            WasmBuf_uleb(out, 0);
-        }
-        Inst::GetFieldPtr(struct_ptr, field_index, field_ty) => {
-            WasmCodeGen_emit_value(self, out, struct_ptr, func);
-            // Determine offset from struct layout
-            var ptr_meta_opt: OptValueMeta = IrFunction_get_meta(func, struct_ptr);
-            var struct_name: str = "";
-            match ptr_meta_opt {
-                OptValueMeta::Some(m) => {
-                    match m.ty {
-                        IrType::Struct(n) => { struct_name = n; }
-                        _ => {}
-                    }
-                }
-                OptValueMeta::None => {}
-            }
-            if struct_name == "" {
-                match field_ty {
-                    IrType::Struct(n) => { struct_name = n; }
+            if !have {
+                match wg_meta_ty(func, ptr) {
+                    IrType::Ptr(inner) => { store_ty = box_ir_type_unbox(inner); have = true; }
                     _ => {}
                 }
             }
-            var off: i64 = field_index * 8;
-            if struct_name != "" {
-                var layout_opt: OptStructLayout = WasmCodeGen_struct_layout_get(self, struct_name);
-                match layout_opt {
+            if !have { store_ty = wg_meta_ty(func, value); }
+            var sz: i64 = 8;
+            var is_struct: bool = false;
+            match store_ty {
+                IrType::Struct(_) => { is_struct = true; }
+                IrType::Array(_, _) => {}
+                IrType::Ptr(_) => {}
+                IrType::Opaque(_) => {}
+                IrType::Generic(_, _) => {}
+                _ => {
+                    var s0: i64 = IrModule_type_size(module, store_ty);
+                    if s0 == 1 || s0 == 2 || s0 == 4 { sz = s0; }
+                }
+            }
+            if is_struct {
+                wget_addr(g, ptr);
+                wget_addr(g, value);
+                wi32(g, IrModule_type_size(module, store_ty));
+                w(g, 0xFC); wu(g, 10); w(g, 0); w(g, 0);
+            } else {
+                wget_addr(g, ptr);
+                wget(g, value);
+                wstore(g, sz, 0);
+            }
+        }
+        Inst::StructCopy(dst_v, src_v, ty) => {
+            wget_addr(g, dst_v);
+            wget_addr(g, src_v);
+            wi32(g, IrModule_type_size(module, ty));
+            w(g, 0xFC); wu(g, 10); w(g, 0); w(g, 0);
+        }
+        Inst::GetFieldPtr(struct_ptr, field_index, _) => {
+            var offset: i64 = field_index * 8;
+            var sname: str = "";
+            match wg_meta_ty(func, struct_ptr) {
+                IrType::Ptr(inner) => {
+                    match box_ir_type_unbox(inner) {
+                        IrType::Struct(n) => { sname = n; }
+                        _ => {}
+                    }
+                }
+                IrType::Struct(n2) => { sname = n2; }
+                _ => {}
+            }
+            if sname != "" {
+                match IrModule_get_struct(module, sname) {
                     OptStructLayout::Some(layout) => {
                         if field_index >= 0 && field_index < layout.fields.len() {
-                            off = layout.fields[field_index].offset;
+                            offset = layout.fields.get(field_index).offset;
                         }
                     }
                     OptStructLayout::None => {}
                 }
             }
-            WasmCodeGen_emit_const_i64(self, out, off);
-            WasmBuf_push(out, 0x7C); // i64.add
-            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
+            wget(g, struct_ptr);
+            if offset != 0 {
+                wi64(g, offset);
+                w(g, 0x7C);
+            }
+            wset(g, id);
         }
         Inst::GetElemPtr(array_ptr, index, elem_ty) => {
-            WasmCodeGen_emit_value(self, out, array_ptr, func);
-            WasmCodeGen_emit_value(self, out, index, func);
-            var idx_meta_opt: OptValueMeta = IrFunction_get_meta(func, index);
-            var need_extend: bool = true;
-            match idx_meta_opt {
-                OptValueMeta::Some(m) => {
-                    if wasm_valtype(m.ty) != WT_I32 {
-                        need_extend = false;
-                    }
-                }
-                OptValueMeta::None => {}
+            var esize: i64 = IrModule_type_size(module, elem_ty);
+            if esize < 1 { esize = 1; }
+            wget(g, array_ptr);
+            wget(g, index);
+            if esize != 1 {
+                wi64(g, esize);
+                w(g, 0x7E);
             }
-            if need_extend {
-                WasmBuf_push(out, 0xAC); // i64.extend_i32_s
-            }
-            var elem_size: i64 = ir_type_size(elem_ty);
-            if elem_size < 1 { elem_size = 1; }
-            WasmCodeGen_emit_const_i64(self, out, elem_size);
-            WasmBuf_push(out, 0x7E); // i64.mul
-            WasmBuf_push(out, 0x7C); // i64.add
-            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
+            w(g, 0x7C);
+            wset(g, id);
         }
-
-        // ─── Control flow ───
         Inst::Jump(target) => {
-            WasmCodeGen_emit_const_i32(self, out, target);
-            WasmCodeGen_emit_local_set(self, out, cur_block_local);
-            WasmBuf_push(out, 0x0C); WasmBuf_uleb(out, 0); // br $dispatch
+            var t: i64 = wg_block(g, target);
+            if !(last && t == g.k + 1) { wg_jump(g, t); }
         }
-        Inst::Branch(cond, then_target, else_target) => {
-            WasmCodeGen_emit_value(self, out, cond, func);
-            WasmBuf_push(out, 0x04); WasmBuf_push(out, WT_VOID); // if void
-            WasmCodeGen_emit_const_i32(self, out, then_target);
-            WasmCodeGen_emit_local_set(self, out, cur_block_local);
-            WasmBuf_push(out, 0x05); // else
-            WasmCodeGen_emit_const_i32(self, out, else_target);
-            WasmCodeGen_emit_local_set(self, out, cur_block_local);
-            WasmBuf_push(out, 0x0B); // end if
-            WasmBuf_push(out, 0x0C); WasmBuf_uleb(out, 0); // br $dispatch
-        }
-        Inst::Return(value) => {
-            match value {
-                OptValueId::Some(v) => {
-                    WasmCodeGen_emit_value(self, out, v, func);
-                    var val_meta_opt: OptValueMeta = IrFunction_get_meta(func, v);
-                    var val_wt: i64 = WT_I64;
-                    match val_meta_opt {
-                        OptValueMeta::Some(m) => { val_wt = wasm_valtype(m.ty); }
-                        OptValueMeta::None => {}
-                    }
-                    var ret_wt: i64 = wasm_valtype(func.ret_ty);
-                    if val_wt == WT_I32 && ret_wt == WT_I64 {
-                        WasmBuf_push(out, 0xAC); // i64.extend_i32_s
-                    } else if val_wt == WT_I64 && ret_wt == WT_I32 {
-                        WasmBuf_push(out, 0xA7); // i32.wrap_i64
-                    }
-                }
-                OptValueId::None => {}
+        Inst::Branch(cond, then, else_) => {
+            var tb: i64 = wg_block(g, then);
+            var eb: i64 = wg_block(g, else_);
+            if last && tb == g.k + 1 {
+                wget(g, cond);
+                w(g, 0x50);
+                wif(g);
+                wg_jump(g, eb);
+                wendif(g);
+            } else if last && eb == g.k + 1 {
+                wget(g, cond);
+                wi64(g, 0);
+                w(g, 0x52);
+                wif(g);
+                wg_jump(g, tb);
+                wendif(g);
+            } else {
+                wi32(g, tb);
+                wi32(g, eb);
+                wget(g, cond);
+                wi64(g, 0);
+                w(g, 0x52);
+                w(g, 0x1B);
+                wlset(g, g.cur);
+                wbr(g, g.nblocks - 1 - g.k + g.extra);
             }
-            WasmBuf_push(out, 0x0F); // return
+        }
+        Inst::Return(ret) => {
+            match ret {
+                OptValueId::Some(v) => { wget(g, v); }
+                OptValueId::None => { wi64(g, 0); }
+            }
+            wg_epilogue(g);
+            w(g, 0x0F);
         }
         Inst::Unreachable => {
-            WasmBuf_push(out, 0x00); // unreachable
+            w(g, 0x00);
         }
-
-        // ─── Calls ───
-        Inst::Call(callee, args, ret_ty, effects) => {
-            var hi: i64 = host_import_index(callee);
-            if hi >= 0 {
-                // Host import
-                var imports: Vec<HostImport> = host_imports();
-                var host: HostImport = imports[hi];
-                var i: i64 = 0;
-                while i < args.len() {
-                    WasmCodeGen_emit_value(self, out, args[i], func);
-                    var arg_meta_opt: OptValueMeta = IrFunction_get_meta(func, args[i]);
-                    var arg_wt: i64 = WT_I64;
-                    match arg_meta_opt {
-                        OptValueMeta::Some(m) => { arg_wt = wasm_valtype(m.ty); }
-                        OptValueMeta::None => {}
+        Inst::Call(call_name, args, _, _) => {
+            wg_gen_call(g, id, call_name, args, func);
+        }
+        Inst::CallPtr(fn_ptr, args, _, _, _) => {
+            // A closure: its environment, whose word 0 is the function
+            var srcs: Vec<i64> = Vec::new();
+            srcs.push(fn_ptr);
+            var ai: i64 = 0;
+            while ai < args.len() {
+                srcs.push(args.get(ai));
+                ai = ai + 1;
+            }
+            wg_push_srcs(g, &srcs);
+            wget(g, fn_ptr);
+            wload(g, 8, false, 0);
+            wwrap(g);
+            w(g, 0x11);
+            wu(g, wg_type_n(g, srcs.len()));
+            wu(g, 0);
+            wset(g, id);
+        }
+        Inst::DynCall(_, method, args, _, _) => {
+            // env 0, the receiver, then args[1..]; the dyn value is
+            // {type id, receiver}
+            w(g, 0x02); w(g, WT_VOID);
+            g.extra = g.extra + 1;
+            var ti: i64 = 0;
+            while ti < g.dyn_types.len() {
+                var tname: str = g.dyn_types.get(ti);
+                var mname: str = tname + "_" + method;
+                if wg_has_fn(g, mname) && args.len() > 0 {
+                    wget(g, args.get(0));
+                    wload(g, 8, false, 0);
+                    wi64(g, ti + 1);
+                    w(g, 0x51);
+                    wif(g);
+                    wi64(g, 0);
+                    wget(g, args.get(0));
+                    wload(g, 8, false, 8);
+                    var ai2: i64 = 1;
+                    while ai2 < args.len() {
+                        wget(g, args.get(ai2));
+                        ai2 = ai2 + 1;
                     }
-                    var want: i64 = WT_I64;
-                    if i < host.params.len() {
-                        want = host.params[i];
-                    }
-                    if arg_wt == WT_I32 && want == WT_I64 {
-                        WasmBuf_push(out, 0xAC);
-                    } else if arg_wt == WT_I64 && want == WT_I32 {
-                        WasmBuf_push(out, 0xA7);
-                    }
-                    i = i + 1;
+                    wg_call_named(g, mname, args.len() + 1);
+                    wset(g, id);
+                    wbr(g, 1);
+                    wendif(g);
                 }
-                WasmBuf_push(out, 0x10); // call
-                WasmBuf_uleb(out, hi);
+                ti = ti + 1;
+            }
+            w(g, 0x00); // no implementation for this type
+            wend(g);
+            g.extra = g.extra - 1;
+        }
+        Inst::MakeDyn(value, type_name, _) => {
+            var target: str = wg_builtin_begin(g, "p_malloc");
+            var n: i64 = 1;
+            if wg_has_fn(g, target) && !wg_has_fn(g, "p_malloc") { n = 2; }
+            wi64(g, 16);
+            wg_call_named(g, target, n);
+            wlset(g, g.t0);
+            wlget(g, g.t0);
+            wwrap(g);
+            wi64(g, wg_dyn_id(g, type_name));
+            wstore(g, 8, 0);
+            wlget(g, g.t0);
+            wwrap(g);
+            wget(g, value);
+            wstore(g, 8, 8);
+            wlget(g, g.t0);
+            wset(g, id);
+        }
+        Inst::BitCast(value, _, _) => {
+            wget(g, value);
+            wset(g, id);
+        }
+        Inst::IntExtend(value, from, _) => {
+            wget(g, value);
+            match from {
+                IrType::I8 => { w(g, 0xC2); }
+                IrType::I16 => { w(g, 0xC3); }
+                IrType::I32 => { w(g, 0xC4); }
+                _ => {}
+            }
+            wset(g, id);
+        }
+        Inst::IntTrunc(value, _, to) => {
+            wget(g, value);
+            match to {
+                IrType::I8 => { wi64(g, 0xFF); w(g, 0x83); }
+                IrType::U8 => { wi64(g, 0xFF); w(g, 0x83); }
+                IrType::I16 => { wi64(g, 0xFFFF); w(g, 0x83); }
+                IrType::U16 => { wi64(g, 0xFFFF); w(g, 0x83); }
+                IrType::I32 => { wi64(g, 0xFFFFFFFF); w(g, 0x83); }
+                IrType::U32 => { wi64(g, 0xFFFFFFFF); w(g, 0x83); }
+                _ => {}
+            }
+            wset(g, id);
+        }
+        Inst::IntToFloat(value, _, to) => {
+            wget(g, value);
+            if ir_type_eq(to, IrType::F32) { w(g, 0xB4); wf_bits(g, true); }
+            else { w(g, 0xB9); wf_bits(g, false); }
+            wset(g, id);
+        }
+        Inst::FloatToInt(value, from, _) => {
+            if ir_type_eq(from, IrType::F32) {
+                wget_f(g, value, true);
+                w(g, 0xFC); wu(g, 4);
             } else {
-                var fidx: i64 = WasmCodeGen_func_index_get(self, callee);
-                if fidx >= 0 {
-                    var i: i64 = 0;
-                    while i < args.len() {
-                        WasmCodeGen_emit_value(self, out, args[i], func);
-                        i = i + 1;
-                    }
-                    WasmBuf_push(out, 0x10); // call
-                    WasmBuf_uleb(out, fidx);
-                } else {
-                    // Unknown callee -- emit default return value
-                    if has_value(ret_ty) {
-                        var wt: i64 = wasm_valtype(ret_ty);
-                        if wt == WT_I32 { WasmCodeGen_emit_const_i32(self, out, 0); }
-                        else if wt == WT_I64 { WasmCodeGen_emit_const_i64(self, out, 0); }
-                        else if wt == WT_F32 { WasmBuf_push(out, 0x43); WasmBuf_f32(out, 0.0); }
-                        else if wt == WT_F64 { WasmBuf_push(out, 0x44); WasmBuf_f64(out, 0.0); }
-                    }
-                }
+                wget_f(g, value, false);
+                w(g, 0xFC); wu(g, 6);
             }
-            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
-        }
-        Inst::MakeDyn(value, trait_name, type_name) => {
-            WasmBuf_push(out, 0x41);
-            WasmBuf_push(out, 0x00);
-            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
-        }
-        Inst::DynCall(trait_name, method, args, ret_ty, effects) => {
-            if !ir_type_eq(ret_ty, IrType::Void) {
-                WasmBuf_push(out, 0x41);
-                WasmBuf_push(out, 0x00);
-            }
-            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
-        }
-        Inst::CallPtr(fn_ptr, args, ret_ty, effects, is_indirect) => {
-            if has_value(ret_ty) {
-                var wt: i64 = wasm_valtype(ret_ty);
-                if wt == WT_I32 { WasmCodeGen_emit_const_i32(self, out, 0); }
-                else if wt == WT_I64 { WasmCodeGen_emit_const_i64(self, out, 0); }
-                else if wt == WT_F32 { WasmBuf_push(out, 0x43); WasmBuf_f32(out, 0.0); }
-                else if wt == WT_F64 { WasmBuf_push(out, 0x44); WasmBuf_f64(out, 0.0); }
-            }
-            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
-        }
-
-        // ─── Conversions ───
-        Inst::BitCast(value, from, to) => {
-            WasmCodeGen_emit_value(self, out, value, func);
-            var from_wt: i64 = wasm_valtype(from);
-            var to_wt: i64 = wasm_valtype(to);
-            if from_wt == WT_I32 && to_wt == WT_F32 { WasmBuf_push(out, 0xBE); }
-            else if from_wt == WT_F32 && to_wt == WT_I32 { WasmBuf_push(out, 0xBC); }
-            else if from_wt == WT_I64 && to_wt == WT_F64 { WasmBuf_push(out, 0xBF); }
-            else if from_wt == WT_F64 && to_wt == WT_I64 { WasmBuf_push(out, 0xBD); }
-            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
-        }
-        Inst::IntExtend(value, from, to) => {
-            WasmCodeGen_emit_value(self, out, value, func);
-            if wasm_valtype(to) == WT_I64 {
-                WasmBuf_push(out, 0xAC); // i64.extend_i32_s
-            }
-            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
-        }
-        Inst::IntTrunc(value, from, to) => {
-            WasmCodeGen_emit_value(self, out, value, func);
-            if wasm_valtype(to) == WT_I32 {
-                WasmBuf_push(out, 0xA7); // i32.wrap_i64
-            }
-            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
-        }
-        Inst::IntToFloat(value, from, to) => {
-            WasmCodeGen_emit_value(self, out, value, func);
-            var wt: i64 = wasm_valtype(to);
-            if wt == WT_F32 { WasmBuf_push(out, 0xB2); }
-            else { WasmBuf_push(out, 0xB7); }
-            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
-        }
-        Inst::FloatToInt(value, from, to) => {
-            WasmCodeGen_emit_value(self, out, value, func);
-            var wt: i64 = wasm_valtype(to);
-            if wt == WT_I32 { WasmBuf_push(out, 0xA8); }
-            else { WasmBuf_push(out, 0xAA); }
-            if dst_has_value { WasmCodeGen_emit_set_value(self, out, id, func); }
-        }
-
-        // ─── Fides-specific ───
-        Inst::TryUnwrap(value, ok_dst, err_block, ok_block) => {
-            WasmCodeGen_emit_value(self, out, value, func);
-            WasmCodeGen_emit_const_i64(self, out, 0);
-            WasmBuf_push(out, 0x29); WasmBuf_uleb(out, 3); WasmBuf_uleb(out, 0); // i64.load tag
-            WasmCodeGen_emit_const_i64(self, out, 0);
-            WasmBuf_push(out, 0x53); // i64.ne
-            WasmBuf_push(out, 0x04); WasmBuf_push(out, WT_VOID); // if void
-            WasmCodeGen_emit_const_i32(self, out, ok_block);
-            WasmCodeGen_emit_local_set(self, out, cur_block_local);
-            WasmBuf_push(out, 0x05); // else
-            WasmCodeGen_emit_const_i32(self, out, err_block);
-            WasmCodeGen_emit_local_set(self, out, cur_block_local);
-            WasmBuf_push(out, 0x0B); // end if
-            WasmBuf_push(out, 0x0C); WasmBuf_uleb(out, 0); // br $dispatch
+            wset(g, id);
         }
         Inst::Print(value, ty) => {
-            WasmCodeGen_emit_value(self, out, value, func);
-            var host: str = "p_print_int";
-            var want_wt: i64 = WT_I64;
-            match ty {
-                IrType::Bool => { host = "p_print_bool"; want_wt = WT_I32; }
-                IrType::F32 => { host = "p_print_float"; want_wt = WT_F64; }
-                IrType::F64 => { host = "p_print_float"; want_wt = WT_F64; }
-                IrType::Ptr(_) => { host = "p_print_str"; want_wt = WT_I64; }
-                IrType::Opaque(_) => { host = "p_print_str"; want_wt = WT_I64; }
-                _ => { host = "p_print_int"; want_wt = WT_I64; }
-            }
-            var val_meta_opt: OptValueMeta = IrFunction_get_meta(func, value);
-            var val_wt: i64 = WT_I64;
-            match val_meta_opt {
-                OptValueMeta::Some(m) => { val_wt = wasm_valtype(m.ty); }
-                OptValueMeta::None => {}
-            }
-            if val_wt == WT_I32 && want_wt == WT_I64 { WasmBuf_push(out, 0xAC); }
-            else if val_wt == WT_I64 && want_wt == WT_I32 { WasmBuf_push(out, 0xA7); }
-            else if val_wt == WT_F32 && want_wt == WT_F64 { WasmBuf_push(out, 0xC0); }
-            var hi: i64 = host_import_index(host);
-            if hi >= 0 {
-                WasmBuf_push(out, 0x10); WasmBuf_uleb(out, hi);
+            var formatter: str = pe_ir_print_formatter(ty);
+            if formatter != "" {
+                // Collections print through their Fides formatter
+                var ptarget: str = wg_builtin_begin(g, "p_print_str");
+                var pn: i64 = 1;
+                if wg_has_fn(g, ptarget) && !wg_has_fn(g, "p_print_str") { pn = 2; }
+                wi64(g, 0);
+                wget(g, value);
+                wg_call_named(g, wg_resolve(g, formatter), 2);
+                wg_call_named(g, ptarget, pn);
+                w(g, 0x1A);
             } else {
-                WasmBuf_push(out, 0x1A); // drop
+                var print_fn: str = "p_print_int";
+                match ty {
+                    IrType::Ptr(_) => { print_fn = "p_print_str"; }
+                    IrType::Opaque(oname) => { if oname == "String" { print_fn = "p_print_str"; } }
+                    IrType::F64 => { print_fn = "p_print_float"; }
+                    IrType::F32 => { print_fn = "p_print_float"; }
+                    IrType::Bool => { print_fn = "p_print_bool"; }
+                    _ => {}
+                }
+                var target2: str = wg_builtin_begin(g, print_fn);
+                var n2: i64 = 1;
+                if wg_has_fn(g, target2) && !wg_has_fn(g, print_fn) { n2 = 2; }
+                if ir_type_eq(ty, IrType::F32) {
+                    // the runtime prints an f64
+                    wget_f(g, value, true);
+                    w(g, 0xBB);
+                    wf_bits(g, false);
+                } else {
+                    wget(g, value);
+                }
+                wg_call_named(g, target2, n2);
+                w(g, 0x1A);
             }
         }
-        Inst::PersistLoad(default, name, ty) => {
-            WasmCodeGen_emit_value(self, out, default, func);
+        Inst::Panic(message) => {
+            wg_panic_msg(g, message);
         }
-        Inst::PersistSave(name, value) => {
-            // No-op in WASM
+        Inst::PersistLoad(_, default, _) => {
+            wget(g, default);
+            wset(g, id);
         }
+        Inst::PersistSave(_, _) => {}
         Inst::TxnBegin => {}
         Inst::TxnEnd => {}
         Inst::UnsafeBegin => {}
         Inst::UnsafeEnd => {}
-        Inst::GradBegin(name) => {}
-        Inst::GradEnd => {}
-        Inst::Backward(loss) => {}
-        Inst::StructCopy(_, _, _) => {}  // TODO: WASM struct copy
-        Inst::Panic(message) => {
-            var addr: i64 = WasmCodeGen_intern_string(self, message);
-            WasmCodeGen_emit_const_i64(self, out, addr);
-            var hi: i64 = host_import_index("p_panic");
-            if hi >= 0 {
-                WasmBuf_push(out, 0x10); WasmBuf_uleb(out, hi);
-            }
-            WasmBuf_push(out, 0x00); // unreachable
+        Inst::GradBegin(_) => {
+            var gargs: Vec<i64> = Vec::new();
+            wg_call_builtin(g, pe_ir_autograd_builtin(inst), &gargs);
+            w(g, 0x1A);
         }
-        Inst::Asm(asm_text, clobbers, outputs, ret_ty) => {
-            if !ir_type_eq(ret_ty, IrType::Void) {
-                WasmCodeGen_emit_const_i64(self, out, 0);
-            }
+        Inst::GradEnd => {
+            var eargs: Vec<i64> = Vec::new();
+            wg_call_builtin(g, pe_ir_autograd_builtin(inst), &eargs);
+            w(g, 0x1A);
         }
-        Inst::RegionBegin(name, is_heap, is_static, opt_size) => {
-            WasmCodeGen_emit_const_i64(self, out, 0);
+        Inst::Backward(v) => {
+            var bargs: Vec<i64> = Vec::new();
+            bargs.push(v);
+            wg_call_builtin(g, pe_ir_autograd_builtin(inst), &bargs);
+            w(g, 0x1A);
         }
-        Inst::RegionEnd(name, is_heap, is_static) => {}
+        Inst::TryUnwrap(_, _, _, _) => {}
+        Inst::Asm(_, _, _, _) => {
+            // A WASI program runs no inline assembly (as on the C path)
+            wi64(g, 0);
+            wset(g, id);
+        }
+        Inst::RegionBegin(_, _, _, _) => {
+            wi64(g, 0);
+            wset(g, id);
+        }
+        Inst::RegionEnd(_, _, _) => {}
     }
 }
 
-// ─── Module assembly ──────────────────────────────────────────────────
+// ─── Functions ─────────────────────────────────────────────────────────
 
-fn WasmCodeGen_generate(self: &mut WasmCodeGen, module: &IrModule) -> Vec<i64> {
-    // Collect struct layouts
-    self.struct_layouts.clear();
-    var si: i64 = 0;
-    while si < module.struct_layouts.len() {
-        self.struct_layouts.push(module.struct_layouts[si]);
-        si = si + 1;
+fn wg_note_id(maxid: i64, id: i64) -> i64 {
+    if id > maxid { return id; }
+    return maxid;
+}
+
+/// The body of IR function `func`: its locals, the frame, the blocks.
+fn wg_gen_function(g: &mut WasmGen, name: str, func: &IrFunction, module: &IrModule) {
+    g.cur_name = name;
+    // The runtime's arithmetic wraps, as pe_ir's and nat_ir's does
+    g.cur_wrapping = func.is_wrapping || is_pe_runtime_fn(name);
+    g.unchecked = peir_unchecked_ops(func, func.value_metas.len() + func.insts.len() + 16);
+    var maxid: i64 = 0;
+    var i: i64 = 0;
+    while i < func.value_metas.len() { maxid = wg_note_id(maxid, func.value_metas.get(i).id); i = i + 1; }
+    i = 0;
+    while i < func.insts.len() { maxid = wg_note_id(maxid, func.insts.get(i).id); i = i + 1; }
+    i = 0;
+    while i < func.params.len() { maxid = wg_note_id(maxid, func.params.get(i).id); i = i + 1; }
+    var np: i64 = func.params.len();
+    var local_of: Vec<i64> = Vec::new();
+    var aoff: Vec<i64> = Vec::new();
+    i = 0;
+    while i <= maxid { local_of.push(np + i); aoff.push(0 - 1); i = i + 1; }
+    i = 0;
+    while i < np {
+        local_of.set(func.params.get(i).id, i);
+        i = i + 1;
     }
-
-    // Intern all string constants
-    var sci: i64 = 0;
-    while sci < module.string_constants.len() {
-        WasmCodeGen_intern_string(self, module.string_constants[sci].key);
-        sci = sci + 1;
+    var nloc: i64 = np + maxid + 1;
+    g.t0 = nloc;
+    g.t1 = nloc + 1;
+    g.t2 = nloc + 2;
+    g.t3 = nloc + 3;
+    g.fp = nloc + 4;
+    g.cur = nloc + 5;
+    // The frame: every Alloca's data, then the varargs area of spawns
+    var cur: i64 = 0;
+    g.va_off = 0 - 1;
+    i = 0;
+    while i < func.insts.len() {
+        var ve: ValueIdInst = func.insts.get(i);
+        match ve.inst {
+            Inst::Alloca(aty, _) => {
+                var dsize: i64 = IrModule_type_size(module, aty);
+                if dsize < 8 { dsize = 8; }
+                dsize = (dsize + 7) & (0 - 8);
+                aoff.set(ve.id, cur);
+                cur = cur + dsize;
+            }
+            Inst::Call(vname, _, _, _) => {
+                if vname == "p_thread_spawn" || vname == "p_co_async" || vname == "p_executor_spawn" {
+                    g.va_off = 0 - 2;
+                }
+            }
+            _ => {}
+        }
+        i = i + 1;
     }
+    if g.va_off == 0 - 2 {
+        g.va_off = cur;
+        cur = cur + 64;
+    } else {
+        g.va_off = 0 - 1;
+    }
+    g.frame = (cur + 15) & (0 - 16);
+    g.local_of = local_of;
+    g.alloca_off = aoff;
 
-    // Also intern strings from ConstStr/Panic/ConstFnRef instructions
-    var fi: i64 = 0;
-    while fi < module.functions.len() {
-        var func: IrFunction = module.functions[fi].func;
+    g.b = Vec::new();
+    // Locals: the i64s after the parameters, then the block index (i32)
+    wu(g, 2);
+    wu(g, nloc + 5 - np);
+    w(g, WT_I64);
+    wu(g, 1);
+    w(g, WT_I32);
+    // The frame: sp -= frame; below the stack: "Stack overflow" (with the
+    // stack given back first, so the panic can run)
+    if g.frame > 0 {
+        wgget(g, 0);
+        wi64(g, g.frame);
+        w(g, 0x7D);
+        wltee(g, g.fp);
+        wgset(g, 0);
+        wlget(g, g.fp);
+        wi64(g, WG_STACK_LO);
+        w(g, 0x53);
+        wif(g);
+        wi64(g, WG_STACK_TOP);
+        wgset(g, 0);
+        wg_panic_msg(g, "Stack overflow");
+        wendif(g);
+    }
+    g.extra = 0;
+    var nb: i64 = func.blocks.len();
+    if nb == 0 {
+        wi64(g, 0);
+        wg_epilogue(g);
+        wend(g);
+        return;
+    }
+    g.block_index = HashMap_new();
+    var bi: i64 = 0;
+    while bi < nb {
+        HashMap_insert(g.block_index, int_to_str(func.blocks.get(bi).id), bi);
+        bi = bi + 1;
+    }
+    g.nblocks = nb;
+    // loop { block_{N-1} { ... block_0 { br_table } code_0 } ... code_{N-1} }
+    w(g, 0x03); w(g, WT_VOID);
+    bi = 0;
+    while bi < nb { w(g, 0x02); w(g, WT_VOID); bi = bi + 1; }
+    wlget(g, g.cur);
+    w(g, 0x0E);
+    wu(g, nb);
+    bi = 0;
+    while bi < nb { wu(g, bi); bi = bi + 1; }
+    wu(g, 0);
+    wend(g);
+    bi = 0;
+    while bi < nb {
+        var block: BasicBlock = func.blocks.get(bi);
+        g.k = bi;
+        g.extra = 0;
         var ii: i64 = 0;
-        while ii < func.insts.len() {
-            var inst: Inst = func.insts[ii].inst;
-            match inst {
-                Inst::ConstStr(value) => { WasmCodeGen_intern_string(self, value); }
-                Inst::ConstFnRef(name) => { WasmCodeGen_intern_string(self, name); }
-                Inst::Panic(message) => { WasmCodeGen_intern_string(self, message); }
-                _ => {}
+        var ninst: i64 = block.instructions.len();
+        while ii < ninst {
+            var iid: i64 = block.instructions.get(ii);
+            match IrFunction_get_inst(func, iid) {
+                OptInst::Some(inst) => { wg_gen_inst(g, iid, inst, ii == ninst - 1, func, module); }
+                OptInst::None => {}
             }
             ii = ii + 1;
         }
-        fi = fi + 1;
+        wend(g);
+        bi = bi + 1;
     }
+    // Falling off the end returns 0
+    wi64(g, 0);
+    wg_epilogue(g);
+    wend(g);
+}
 
-    // ─── Type section ─────────────────────────────────────────────────
-    self.type_sigs.clear();
-    self.type_indices.clear();
-
-    // Reserve type indices for host imports
-    var imports: Vec<HostImport> = host_imports();
-    var hi: i64 = 0;
-    while hi < imports.len() {
-        WasmCodeGen_intern_type(self, imports[hi].params, imports[hi].results);
-        hi = hi + 1;
-    }
-
-    // User function types
-    self.func_type.clear();
-    self.func_index.clear();
-    self.user_funcs.clear();
-
-    fi = 0;
-    while fi < module.functions.len() {
-        var name: str = module.functions[fi].name;
-        var func: IrFunction = module.functions[fi].func;
-
-        var params: Vec<i64> = Vec::new();
-        var pi: i64 = 0;
-        while pi < func.params.len() {
-            params.push(wasm_valtype(func.params[pi].ty));
-            pi = pi + 1;
+/// The body of primitive `name` (its parameters are locals 0..n)
+fn wg_gen_primitive(g: &mut WasmGen, name: str) {
+    g.cur_name = name;
+    g.b = Vec::new();
+    g.extra = 0;
+    // Two scratch f64 locals (2, 3 after up to... all primitives take < 8
+    // parameters: locals 8 and 9)
+    var np: i64 = wg_prim_params(name);
+    wu(g, 1);
+    wu(g, 10 - np);
+    w(g, 0x7C);
+    var x: i64 = 8;
+    var t: i64 = 9;
+    if name == "nat_syscall" {
+        if wg_has_fn(g, "pe_wasi_syscall") {
+            wi64(g, 0);
+            var k: i64 = 0;
+            while k < 7 { wlget(g, k); k = k + 1; }
+            wg_call_named(g, "pe_wasi_syscall", 8);
+        } else {
+            wi64(g, 0 - 38);
         }
-        var results: Vec<i64> = Vec::new();
-        if has_value(func.ret_ty) {
-            results.push(wasm_valtype(func.ret_ty));
+    } else if name == "nat_start_sp" {
+        if wg_has_fn(g, "pe_wasi_start_sp") {
+            wi64(g, 0);
+            wg_call_named(g, "pe_wasi_start_sp", 1);
+        } else {
+            wi64(g, 0);
         }
-        var ti: i64 = WasmCodeGen_intern_type(self, params, results);
-        self.func_type.push(FuncTypeEntry { name: name, type_idx: ti });
-        self.user_funcs.push(name);
-        fi = fi + 1;
+    } else if name == "nat_atomic_load" {
+        wlget(g, 0); wload(g, 8, false, 0);
+    } else if name == "nat_atomic_store" {
+        wlget(g, 0); wwrap(g); wlget(g, 1); wstore(g, 8, 0);
+        wi64(g, 0);
+    } else if name == "nat_atomic_add" {
+        wlget(g, 0); wwrap(g);
+        wlget(g, 0); wload(g, 8, false, 0);
+        wlget(g, 1); w(g, 0x7C);
+        wstore(g, 8, 0);
+        wlget(g, 0); wload(g, 8, false, 0);
+        wlget(g, 1); w(g, 0x7D);
+    } else if name == "nat_atomic_cas" {
+        wlget(g, 0); wload(g, 8, false, 0);
+        wlget(g, 1); w(g, 0x51);
+        wif_t(g, WT_I64);
+        wlget(g, 0); wwrap(g); wlget(g, 2); wstore(g, 8, 0);
+        wi64(g, 1);
+        welse(g);
+        wi64(g, 0);
+        wendif(g);
+    } else if name == "nat_ctx_swap" {
+        // Tasks need a stack switch: a WASI program has none
+        wg_panic_msg(g, "tasks are not supported in WebAssembly (fid wasm)");
+        wi64(g, 0);
+    } else if name == "nat_clone_thread" {
+        wi64(g, 0 - 38);
+    } else if name == "nat_call_fn" {
+        // addr(env 0, argv[0..nargs])
+        var k2: i64 = 0;
+        while k2 <= 8 {
+            wlget(g, 1); wi64(g, k2); w(g, 0x51);
+            wif(g);
+            wi64(g, 0);
+            var j: i64 = 0;
+            while j < k2 { wlget(g, 2); wload(g, 8, false, j * 8); j = j + 1; }
+            wlget(g, 0); wwrap(g);
+            w(g, 0x11); wu(g, wg_type_n(g, k2 + 1)); wu(g, 0);
+            w(g, 0x0F);
+            wendif(g);
+            k2 = k2 + 1;
+        }
+        w(g, 0x00);
+        wi64(g, 0);
+    } else if name == "nat_fn_table" {
+        wgget(g, 2);
+    } else if name == "nat_fn_names" {
+        wgget(g, 3);
+    } else if name == "nat_tls_get" {
+        wgget(g, 1);
+    } else if name == "nat_tls_set" {
+        wlget(g, 0); wgset(g, 1);
+        wi64(g, 0);
+    } else if name == "nat_arch" {
+        // The generic Linux layouts (struct stat): as AArch64
+        wi64(g, 1);
+    } else if name == "nat_fma" {
+        wlget(g, 0); w(g, 0xBF);
+        wlget(g, 1); w(g, 0xBF);
+        w(g, 0xA2);
+        wlget(g, 2); w(g, 0xBF);
+        w(g, 0xA0);
+        w(g, 0xBD);
+    } else if name == "nat_wasm_grow" {
+        wlget(g, 0); wwrap(g);
+        w(g, 0x40); w(g, 0);
+        wexts(g);
+    } else if name == "nat_wasm_size" {
+        w(g, 0x3F); w(g, 0);
+        wextu(g);
+    } else if name == "nat_c_round" {
+        // half away from zero: t = trunc(x); |x - t| >= 0.5 -> t + sign(x)
+        wlget(g, 0); w(g, 0xBF); wlset(g, x);
+        wlget(g, x); w(g, 0x9D); wlset(g, t);
+        wlget(g, x); wlget(g, t); w(g, 0xA1); w(g, 0x99);
+        w(g, 0x44); wb_f64_half(&mut g.b);
+        w(g, 0x66);
+        wif_t(g, 0x7C);
+        wlget(g, t);
+        w(g, 0x44); wb_f64_one(&mut g.b);
+        wlget(g, x);
+        w(g, 0xA6);
+        w(g, 0xA0);
+        welse(g);
+        wlget(g, t);
+        wendif(g);
+        w(g, 0xBD);
+    } else if str_starts_with(name, "nat_c_") {
+        wlget(g, 0); w(g, 0xBF);
+        if name == "nat_c_sqrt" { w(g, 0x9F); }
+        if name == "nat_c_fabs" { w(g, 0x99); }
+        if name == "nat_c_floor" { w(g, 0x9C); }
+        if name == "nat_c_ceil" { w(g, 0x9B); }
+        if name == "nat_c_trunc" { w(g, 0x9D); }
+        w(g, 0xBD);
+    } else {
+        // nat_ctx_tramp, nat_frame_*, nat_sig_handler, nat_sig_restorer,
+        // nat_os (0: Linux)
+        wi64(g, 0);
     }
+    wend(g);
+}
 
-    // Build the type section body
-    var type_sec: WasmBuf = WasmBuf_new();
-    WasmBuf_uleb(&mut type_sec, self.type_sigs.len());
+fn wb_f64_bits(out: &mut Vec<i64>, bits: i64) {
+    var i: i64 = 0;
+    while i < 8 {
+        out.push((bits >> (i * 8)) & 0xFF);
+        i = i + 1;
+    }
+}
+
+fn wb_f64_half(out: &mut Vec<i64>) { wb_f64_bits(out, 4602678819172646912); }
+fn wb_f64_one(out: &mut Vec<i64>) { wb_f64_bits(out, 4607182418800017408); }
+
+/// _start: pe_rt_init, main(env 0), proc_exit(its result)
+fn wg_gen_start(g: &mut WasmGen, exit_ix: i64) {
+    g.cur_name = "_start";
+    g.b = Vec::new();
+    g.extra = 0;
+    wu(g, 0);
+    if wg_has_fn(g, "pe_rt_init") {
+        wi64(g, 0);
+        wg_call_named(g, "pe_rt_init", 1);
+        w(g, 0x1A);
+    }
+    wi64(g, 0);
+    wg_call_named(g, "main", 1);
+    if exit_ix >= 0 {
+        wwrap(g);
+        wcall(g, exit_ix);
+    } else {
+        w(g, 0x1A);
+    }
+    wend(g);
+}
+
+/// The dyn types: every type made into a dyn value or named by a trait
+/// impl, sorted (as pe_ir and nat_ir find DynCall candidates).
+fn wg_collect_dyn_types(g: &mut WasmGen, module: &IrModule) {
+    var types: Vec<str> = Vec::new();
     var ti: i64 = 0;
-    while ti < self.type_sigs.len() {
-        var sig: TypeSig = self.type_sigs[ti];
-        WasmBuf_push(&mut type_sec, 0x60); // functype
-        WasmBuf_uleb(&mut type_sec, sig.params.len());
-        var pj: i64 = 0;
-        while pj < sig.params.len() {
-            WasmBuf_push(&mut type_sec, sig.params[pj]);
-            pj = pj + 1;
-        }
-        WasmBuf_uleb(&mut type_sec, sig.results.len());
-        var rj: i64 = 0;
-        while rj < sig.results.len() {
-            WasmBuf_push(&mut type_sec, sig.results[rj]);
-            rj = rj + 1;
+    while ti < module.trait_impls.len() {
+        var items: Vec<str> = module.trait_impls.get(ti).items;
+        var ii: i64 = 0;
+        while ii < items.len() {
+            types = wg_insert_sorted(types, items.get(ii));
+            ii = ii + 1;
         }
         ti = ti + 1;
     }
-    var type_section: Vec<i64> = section(SEC_TYPE, type_sec.bytes);
-
-    // ─── Import section ────────────────────────────────────────────────
-    var import_sec: WasmBuf = WasmBuf_new();
-    WasmBuf_uleb(&mut import_sec, imports.len());
-    hi = 0;
-    while hi < imports.len() {
-        var h: HostImport = imports[hi];
-        WasmBuf_name(&mut import_sec, "env");
-        WasmBuf_name(&mut import_sec, h.name);
-        WasmBuf_push(&mut import_sec, 0x00); // import kind: function
-        var imp_ti: i64 = WasmCodeGen_intern_type(self, h.params, h.results);
-        WasmBuf_uleb(&mut import_sec, imp_ti);
-        hi = hi + 1;
-    }
-    var import_section: Vec<i64> = section(SEC_IMPORT, import_sec.bytes);
-
-    // ─── Function section ─────────────────────────────────────────────
-    // Function indices: 0..N are host imports, then user functions.
-    var ufi: i64 = 0;
-    while ufi < self.user_funcs.len() {
-        var name: str = self.user_funcs[ufi];
-        var type_idx: i64 = WasmCodeGen_func_type_get(self, name);
-        self.func_index.push(FuncIndexEntry { name: name, index: imports.len() + ufi });
-        ufi = ufi + 1;
-    }
-
-    var func_sec: WasmBuf = WasmBuf_new();
-    WasmBuf_uleb(&mut func_sec, self.user_funcs.len());
-    ufi = 0;
-    while ufi < self.user_funcs.len() {
-        var type_idx: i64 = WasmCodeGen_func_type_get(self, self.user_funcs[ufi]);
-        WasmBuf_uleb(&mut func_sec, type_idx);
-        ufi = ufi + 1;
-    }
-    var function_section: Vec<i64> = section(SEC_FUNCTION, func_sec.bytes);
-
-    // ─── Memory section ────────────────────────────────────────────────
-    var mem_sec: WasmBuf = WasmBuf_new();
-    WasmBuf_uleb(&mut mem_sec, 1);
-    WasmBuf_push(&mut mem_sec, 0x00); // limits flag: min only
-    WasmBuf_uleb(&mut mem_sec, 16); // min = 16 pages = 1 MiB
-    var memory_section: Vec<i64> = section(SEC_MEMORY, mem_sec.bytes);
-
-    // ─── Global section ────────────────────────────────────────────────
-    var glob_sec: WasmBuf = WasmBuf_new();
-    WasmBuf_uleb(&mut glob_sec, 1);
-    WasmBuf_push(&mut glob_sec, WT_I64);
-    WasmBuf_push(&mut glob_sec, 0x01); // mutability: var
-    WasmBuf_push(&mut glob_sec, 0x42); // i64.const
-    WasmBuf_sleb(&mut glob_sec, 65536);
-    WasmBuf_push(&mut glob_sec, 0x0B); // end init
-    var global_section: Vec<i64> = section(SEC_GLOBAL, glob_sec.bytes);
-
-    // ─── Export section ───────────────────────────────────────────────
-    var exp_sec: WasmBuf = WasmBuf_new();
-    var export_count: i64 = 1; // memory export
-    var main_idx: i64 = WasmCodeGen_func_index_get(self, "main");
-    if main_idx >= 0 {
-        export_count = 2;
-    }
-    WasmBuf_uleb(&mut exp_sec, export_count);
-    WasmBuf_name(&mut exp_sec, "memory");
-    WasmBuf_push(&mut exp_sec, 0x02); // mem export
-    WasmBuf_uleb(&mut exp_sec, 0);
-    if main_idx >= 0 {
-        WasmBuf_name(&mut exp_sec, "_start");
-        WasmBuf_push(&mut exp_sec, 0x00); // func export
-        WasmBuf_uleb(&mut exp_sec, main_idx);
-    }
-    var export_section: Vec<i64> = section(SEC_EXPORT, exp_sec.bytes);
-
-    // ─── Code section ──────────────────────────────────────────────────
-    var code_sec: WasmBuf = WasmBuf_new();
-    WasmBuf_uleb(&mut code_sec, self.user_funcs.len());
-    ufi = 0;
-    while ufi < self.user_funcs.len() {
-        var name: str = self.user_funcs[ufi];
-        // Find the function in the module
-        var func: IrFunction = IrModule_get_function_by_name(module, name);
-        var body: Vec<i64> = WasmCodeGen_gen_function(self, name, &func);
-        WasmBuf_uleb(&mut code_sec, body.len());
-        WasmBuf_push_bytes(&mut code_sec, body);
-        ufi = ufi + 1;
-    }
-    var code_section: Vec<i64> = section(SEC_CODE, code_sec.bytes);
-
-    // ─── Data section ──────────────────────────────────────────────────
-    var data_sec: WasmBuf = WasmBuf_new();
-    // Collect and sort strings by address
-    var entries: Vec<WasmStringAddrEntry> = Vec::new();
-    var sai: i64 = 0;
-    while sai < self.string_addrs.len() {
-        entries.push(self.string_addrs[sai]);
-        sai = sai + 1;
-    }
-    // Sort by address (simple insertion sort)
-    var ei: i64 = 1;
-    while ei < entries.len() {
-        var key: WasmStringAddrEntry = entries[ei];
-        var j: i64 = ei - 1;
-        while j >= 0 && entries[j].addr > key.addr {
-            entries.set(j + 1, entries[j]);
-            j = j - 1;
+    var fi: i64 = 0;
+    while fi < module.functions.len() {
+        var f: IrFunction = module.functions.get(fi).func;
+        var k: i64 = 0;
+        while k < f.insts.len() {
+            match f.insts.get(k).inst {
+                Inst::MakeDyn(_, tname, _) => { types = wg_insert_sorted(types, tname); }
+                _ => {}
+            }
+            k = k + 1;
         }
-        entries.set(j + 1, key);
-        ei = ei + 1;
+        fi = fi + 1;
     }
-
-    var base: i64 = 1024;
-    var blob: Vec<i64> = Vec::new();
-    ei = 0;
-    while ei < entries.len() {
-        var addr: i64 = entries[ei].addr;
-        var s: str = entries[ei].s;
-        while (base + blob.len()) < addr {
-            blob.push(0);
-        }
-        // Append string bytes
-        var si: i64 = 0;
-        while si < str_len(s) {
-            blob.push(str_byte_at(s, si) & 0xFF);
-            si = si + 1;
-        }
-        blob.push(0); // null terminator
-        // Pad to 8-byte alignment
-        while blob.len() % 8 != 0 {
-            blob.push(0);
-        }
-        ei = ei + 1;
-    }
-
-    if blob.len() == 0 {
-        WasmBuf_uleb(&mut data_sec, 0);
-    } else {
-        WasmBuf_uleb(&mut data_sec, 1);
-        WasmBuf_push(&mut data_sec, 0x00); // memory index 0
-        WasmBuf_push(&mut data_sec, 0x42); // i64.const
-        WasmBuf_sleb(&mut data_sec, base);
-        WasmBuf_push(&mut data_sec, 0x0B); // end
-        WasmBuf_uleb(&mut data_sec, blob.len());
-        WasmBuf_push_bytes(&mut data_sec, blob);
-    }
-    var data_section: Vec<i64> = section(SEC_DATA, data_sec.bytes);
-
-    // ─── Assemble the module ───────────────────────────────────────────
-    var module_bytes: WasmBuf = WasmBuf_new();
-    // Magic + version
-    module_bytes.bytes.push(0);
-    module_bytes.bytes.push(0x61);
-    module_bytes.bytes.push(0x73);
-    module_bytes.bytes.push(0x6D);
-    WasmBuf_u32(&mut module_bytes, 1);
-    WasmBuf_push_bytes(&mut module_bytes, type_section);
-    WasmBuf_push_bytes(&mut module_bytes, import_section);
-    WasmBuf_push_bytes(&mut module_bytes, function_section);
-    WasmBuf_push_bytes(&mut module_bytes, memory_section);
-    WasmBuf_push_bytes(&mut module_bytes, global_section);
-    WasmBuf_push_bytes(&mut module_bytes, export_section);
-    WasmBuf_push_bytes(&mut module_bytes, code_section);
-    WasmBuf_push_bytes(&mut module_bytes, data_section);
-
-    return module_bytes.bytes;
+    g.dyn_types = types;
 }
 
-/// Look up a function by name in an IrModule.
-pub fn IrModule_get_function_by_name(module: &IrModule, name: str) -> IrFunction {
+/// The values of the globals, the panic-trace table (empty: no frames to
+/// walk here) and the table of functions named by strings.
+fn wg_finish_data(g: &mut WasmGen, module: &IrModule) -> Vec<i64> {
+    var gi: i64 = 0;
+    while gi < g.globs.len() {
+        var gname: str = g.globs.get(gi);
+        var addr: i64 = HashMap_get(g.glob_addr, gname);
+        var bits: i64 = 0;
+        match IrModule_get_global(module, gname) {
+            OptGlobalLookup::Some(gty, init_expr) => {
+                match init_expr {
+                    Expr::IntLit(v) => { bits = v; }
+                    Expr::BoolLit(bv) => { if bv { bits = 1; } }
+                    Expr::FloatLit(f) => {
+                        if ir_type_eq(gty, IrType::F32) { bits = p_f32_to_bits(f) & 0xFFFFFFFF; }
+                        else { bits = p_f64_to_bits(f); }
+                    }
+                    Expr::StringLit(s) => { bits = wg_str(g, s); }
+                    _ => {}
+                }
+            }
+            OptGlobalLookup::None => {}
+        }
+        wg_data_word(g, addr, bits);
+        gi = gi + 1;
+    }
+    var out: Vec<i64> = Vec::new();
+    wg_data_align(g);
+    var names: i64 = WG_DATA_BASE + g.data.len();
+    var z: i64 = 0;
+    while z < 32 { g.data.push(0); z = z + 1; }
+    out.push(names);
+    // [name, table index] pairs, then 0, 0
+    var ti: i64 = 0;
+    var pairs: Vec<i64> = Vec::new();
+    while ti < g.named_fns.len() {
+        var fname: str = g.named_fns.get(ti);
+        pairs.push(wg_str(g, fname));
+        pairs.push(wg_table_ref(g, fname));
+        ti = ti + 1;
+    }
+    wg_data_align(g);
+    var table_addr: i64 = WG_DATA_BASE + g.data.len();
+    var pi: i64 = 0;
+    while pi < pairs.len() + 2 {
+        var v: i64 = 0;
+        if pi < pairs.len() { v = pairs.get(pi); }
+        var bi: i64 = 0;
+        while bi < 8 { g.data.push((v >> (bi * 8)) & 0xFF); bi = bi + 1; }
+        pi = pi + 1;
+    }
+    out.push(table_addr);
+    return out;
+}
+
+/// The type section's entry for signature key `key`
+fn wb_functype(out: &mut Vec<i64>, key: str) {
+    var gt: i64 = str_find(key, ">");
+    out.push(0x60);
+    wb_uleb(out, gt);
     var i: i64 = 0;
-    while i < module.functions.len() {
-        if module.functions[i].name == name {
-            return module.functions[i].func;
+    while i < gt {
+        if str_byte_at(key, i) == 105 { out.push(WT_I32); } else { out.push(WT_I64); }
+        i = i + 1;
+    }
+    var nr: i64 = str_len(key) - gt - 1;
+    wb_uleb(out, nr);
+    i = gt + 1;
+    while i < str_len(key) {
+        if str_byte_at(key, i) == 105 { out.push(WT_I32); } else { out.push(WT_I64); }
+        i = i + 1;
+    }
+}
+
+fn wb_global_i64(out: &mut Vec<i64>, mutable: bool, v: i64) {
+    out.push(WT_I64);
+    if mutable { out.push(1); } else { out.push(0); }
+    out.push(0x42);
+    wb_sleb(out, v);
+    out.push(0x0B);
+}
+
+// ─── Public entry points ───────────────────────────────────────────────
+
+/// A WASI module from an IR module that has the Linux runtime and its
+/// WASI layer (stdlib/linux_runtime/wasi.fd) merged in.
+pub fn wasm_generate(module: IrModule) -> ResultBytes {
+    if !pe_module_has_fn(&module, "main") {
+        return ResultBytes::Err(c_vec1("wasm backend: the program has no `main` function"));
+    }
+    var g: WasmGen = WasmGen_new();
+    var fi: i64 = 0;
+    while fi < module.functions.len() {
+        var fe: IrFunctionEntry = module.functions.get(fi);
+        HashMap_insert(g.all_fns, fe.name, fe.func.params.len() + 1);
+        fi = fi + 1;
+    }
+    if !wg_has_fn(&g, "pe_wasi_syscall") {
+        return ResultBytes::Err(c_vec1("wasm backend: the WASI layer of the runtime (stdlib/linux_runtime/wasi.fd) is not merged"));
+    }
+    wg_collect_dyn_types(&mut g, &module);
+    // extern "C" functions; the WASI ones are imports, proc_exit always
+    var ei: i64 = 0;
+    while ei < module.extern_decls.len() {
+        var ext: ExternDecl = module.extern_decls.get(ei);
+        if !HashMap_contains(g.c_names, ext.pledge_name) {
+            g.c_list.push(ext.c_name);
+            HashMap_insert(g.c_names, ext.pledge_name, g.c_list.len());
         }
-        i = i + 1;
+        if str_starts_with(ext.c_name, "wasi_") && !HashMap_contains(g.imp_index, ext.c_name) {
+            var wname: str = str_slice(ext.c_name, 5, str_len(ext.c_name));
+            var sig: str = wg_wasi_sig(wname);
+            if sig != "" {
+                g.imp_names.push(wname);
+                g.imp_sigs.push(sig);
+                HashMap_insert(g.imp_index, ext.c_name, g.imp_names.len());
+            }
+        }
+        ei = ei + 1;
     }
-    // Return a dummy function if not found
-    return IrFunction_new("dummy", IrType::Void);
+    if !HashMap_contains(g.imp_index, "wasi_proc_exit") {
+        g.imp_names.push("proc_exit");
+        g.imp_sigs.push("i>");
+        HashMap_insert(g.imp_index, "wasi_proc_exit", g.imp_names.len());
+    }
+    g.n_imports = g.imp_names.len();
+    var imp_types: Vec<i64> = Vec::new();
+    var ii: i64 = 0;
+    while ii < g.imp_names.len() {
+        imp_types.push(wg_type(&mut g, g.imp_sigs.get(ii)));
+        ii = ii + 1;
+    }
+    // _start is the first function defined
+    var start_type: i64 = wg_type(&mut g, ">");
+    HashMap_insert(g.fn_index, "_start", g.n_imports);
+    g.def_types.push(start_type);
+    var code: Vec<i64> = Vec::new();
+    var nbodies: i64 = 0;
+    wg_gen_start(&mut g, HashMap_get(g.imp_index, "wasi_proc_exit") - 1);
+    wb_uleb(&mut code, g.b.len());
+    wb_append(&mut code, &g.b);
+    nbodies = nbodies + 1;
+    // Compile what _start reaches, as calls are met
+    var qi: i64 = 0;
+    while qi < g.queue.len() {
+        var name: str = g.queue.get(qi);
+        if wg_has_fn(&g, name) {
+            match IrModule_get_function(&module, name) {
+                OptIrFunction::Some(func) => { wg_gen_function(&mut g, name, &func, &module); }
+                OptIrFunction::None => {
+                    g.b = Vec::new();
+                    wu(&mut g, 0);
+                    w(&mut g, 0x00);
+                    wend(&mut g);
+                }
+            }
+        } else {
+            wg_gen_primitive(&mut g, name);
+        }
+        wb_uleb(&mut code, g.b.len());
+        wb_append(&mut code, &g.b);
+        nbodies = nbodies + 1;
+        qi = qi + 1;
+    }
+    var tabs: Vec<i64> = wg_finish_data(&mut g, &module);
+    // The panic trace table and the named-function table may queue no
+    // functions (their entries were queued when named)
+    if g.unresolved.len() > 0 {
+        return ResultBytes::Err(c_vec1("wasm backend: not available in WebAssembly yet: "
+            + str_join(g.unresolved, ", ") + " (build with `fid ccompile --target wasm32-wasi` instead)"));
+    }
+    if nbodies != g.def_types.len() {
+        return ResultBytes::Err(c_vec1("wasm backend: internal error: " + int_to_str(nbodies)
+            + " bodies for " + int_to_str(g.def_types.len()) + " functions"));
+    }
+
+    var m: Vec<i64> = Vec::new();
+    m.push(0); m.push(0x61); m.push(0x73); m.push(0x6D);
+    m.push(1); m.push(0); m.push(0); m.push(0);
+    // Types
+    var sec: Vec<i64> = Vec::new();
+    wb_uleb(&mut sec, g.type_keys.len());
+    var ti: i64 = 0;
+    while ti < g.type_keys.len() {
+        wb_functype(&mut sec, g.type_keys.get(ti));
+        ti = ti + 1;
+    }
+    wb_section(&mut m, SEC_TYPE, &sec);
+    // Imports
+    sec = Vec::new();
+    wb_uleb(&mut sec, g.n_imports);
+    ii = 0;
+    while ii < g.n_imports {
+        wb_name(&mut sec, "wasi_snapshot_preview1");
+        wb_name(&mut sec, g.imp_names.get(ii));
+        sec.push(0x00);
+        wb_uleb(&mut sec, imp_types.get(ii));
+        ii = ii + 1;
+    }
+    wb_section(&mut m, SEC_IMPORT, &sec);
+    // Functions
+    sec = Vec::new();
+    wb_uleb(&mut sec, g.def_types.len());
+    var di: i64 = 0;
+    while di < g.def_types.len() {
+        wb_uleb(&mut sec, g.def_types.get(di));
+        di = di + 1;
+    }
+    wb_section(&mut m, SEC_FUNCTION, &sec);
+    // Table (funcref; index 0 is null)
+    sec = Vec::new();
+    wb_uleb(&mut sec, 1);
+    sec.push(0x70);
+    sec.push(0x00);
+    wb_uleb(&mut sec, g.table.len() + 1);
+    wb_section(&mut m, SEC_TABLE, &sec);
+    // Memory: the stack, the data, a page to spare
+    var data_end: i64 = WG_DATA_BASE + g.data.len();
+    var pages: i64 = (data_end + 65535) / 65536 + 1;
+    sec = Vec::new();
+    wb_uleb(&mut sec, 1);
+    sec.push(0x00);
+    wb_uleb(&mut sec, pages);
+    wb_section(&mut m, SEC_MEMORY, &sec);
+    // Globals: 0 the stack pointer, 1 the thread block, 2 the named
+    // functions' table, 3 the panic-trace table
+    sec = Vec::new();
+    wb_uleb(&mut sec, 4);
+    wb_global_i64(&mut sec, true, WG_STACK_TOP);
+    wb_global_i64(&mut sec, true, 0);
+    wb_global_i64(&mut sec, false, tabs.get(1));
+    wb_global_i64(&mut sec, false, tabs.get(0));
+    wb_section(&mut m, SEC_GLOBAL, &sec);
+    // Exports
+    sec = Vec::new();
+    wb_uleb(&mut sec, 2);
+    wb_name(&mut sec, "memory");
+    sec.push(0x02);
+    wb_uleb(&mut sec, 0);
+    wb_name(&mut sec, "_start");
+    sec.push(0x00);
+    wb_uleb(&mut sec, g.n_imports);
+    wb_section(&mut m, SEC_EXPORT, &sec);
+    // Elements: the table from index 1
+    if g.table.len() > 0 {
+        sec = Vec::new();
+        wb_uleb(&mut sec, 1);
+        sec.push(0x00);
+        sec.push(0x41);
+        sec.push(0x01);
+        sec.push(0x0B);
+        wb_uleb(&mut sec, g.table.len());
+        var tj: i64 = 0;
+        while tj < g.table.len() {
+            wb_uleb(&mut sec, g.table.get(tj));
+            tj = tj + 1;
+        }
+        wb_section(&mut m, SEC_ELEM, &sec);
+    }
+    // Code
+    sec = Vec::new();
+    wb_uleb(&mut sec, nbodies);
+    wb_append(&mut sec, &code);
+    wb_section(&mut m, SEC_CODE, &sec);
+    // Data: one segment at WG_DATA_BASE
+    sec = Vec::new();
+    wb_uleb(&mut sec, 1);
+    sec.push(0x00);
+    sec.push(0x41);
+    wb_sleb(&mut sec, WG_DATA_BASE);
+    sec.push(0x0B);
+    wb_uleb(&mut sec, g.data.len());
+    wb_append(&mut sec, &g.data);
+    wb_section(&mut m, SEC_DATA, &sec);
+    p_eprint_str("[wasm] " + int_to_str(nbodies) + " functions, " + int_to_str(g.data.len()) + " bytes of data, "
+        + int_to_str(m.len()) + " bytes\n");
+    return ResultBytes::Ok(m);
 }
 
-// ─── Public entry points ──────────────────────────────────────────────
-
-/// Lower an IR module to a WASM binary (as Vec<i64> bytes).
+/// Lower an IR module to a WASM binary (empty when it cannot be built).
 pub fn generate_wasm(module: IrModule) -> Vec<i64> {
-    var gen: WasmCodeGen = WasmCodeGen_new();
-    return WasmCodeGen_generate(&mut gen, &module);
+    match wasm_generate(module) {
+        ResultBytes::Ok(bytes) => { return bytes; }
+        ResultBytes::Err(_) => {}
+    }
+    return Vec::new();
 }
 
-/// Render a WASM binary as a human-readable WAT-ish dump (for --wat debug).
+/// A listing of a WASM binary's sections and the module's functions
+/// (`fid wasm --wat`; not WAT text).
 pub fn dump_wat(module: IrModule) -> str {
+    var names: Vec<str> = Vec::new();
+    var fi: i64 = 0;
+    while fi < module.functions.len() {
+        names.push(module.functions.get(fi).name);
+        fi = fi + 1;
+    }
     var bytes: Vec<i64> = generate_wasm(module);
-    var out: str = "";
-    out = out + "; WASM module (" + int_to_str(bytes.len()) + " bytes)\n";
-    if bytes.len() >= 4 {
-        out = out + "; magic: \\0asm\n";
-    }
-    if bytes.len() >= 8 {
-        var version: i64 = bytes[4] | (bytes[5] << 8) | (bytes[6] << 16) | (bytes[7] << 24);
-        out = out + "; version: " + int_to_str(version) + "\n";
-    }
-
-    // Walk sections
-    var i: i64 = 8;
+    var out: str = "; WASM module (" + int_to_str(bytes.len()) + " bytes)\n";
     var sec_names: Vec<str> = Vec::new();
-    sec_names.push("custom");
-    sec_names.push("type");
-    sec_names.push("import");
-    sec_names.push("function");
-    sec_names.push("table");
-    sec_names.push("memory");
-    sec_names.push("global");
-    sec_names.push("export");
-    sec_names.push("start");
-    sec_names.push("element");
-    sec_names.push("code");
-    sec_names.push("data");
+    sec_names.push("custom"); sec_names.push("type"); sec_names.push("import");
+    sec_names.push("function"); sec_names.push("table"); sec_names.push("memory");
+    sec_names.push("global"); sec_names.push("export"); sec_names.push("start");
+    sec_names.push("element"); sec_names.push("code"); sec_names.push("data");
     sec_names.push("datacount");
-
+    var i: i64 = 8;
     while i < bytes.len() {
-        var id: i64 = bytes[i];
+        var id: i64 = bytes.get(i);
         i = i + 1;
-        // Read uleb size
         var size: i64 = 0;
         var shift: i64 = 0;
-        while true {
-            var b: i64 = bytes[i];
+        while i < bytes.len() {
+            var b: i64 = bytes.get(i);
             i = i + 1;
             size = size | ((b & 0x7F) << shift);
             shift = shift + 7;
             if (b & 0x80) == 0 { break; }
         }
         var name: str = "?";
-        if id >= 0 && id < sec_names.len() {
-            name = sec_names[id];
-        }
+        if id >= 0 && id < sec_names.len() { name = sec_names.get(id); }
         out = out + "; section " + int_to_str(id) + " (" + name + ") size=" + int_to_str(size) + "\n";
         i = i + size;
     }
-
-    out = out + ";\n; Functions:\n";
-    var fi: i64 = 0;
-    while fi < module.functions.len() {
-        out = out + ";   " + module.functions[fi].name + "\n";
+    out = out + ";\n; Functions of the module:\n";
+    fi = 0;
+    while fi < names.len() {
+        out = out + ";   " + names.get(fi) + "\n";
         fi = fi + 1;
     }
     return out;
-}
-
-/// Collect function names from an IrModule for WAT dump.
-/// Ported from src/wasm.rs:1237 (gen_func_names).
-pub fn gen_func_names(module: &IrModule) -> Vec<str> {
-    var names: Vec<str> = Vec::new();
-    var i: i64 = 0;
-    while i < module.functions.len() {
-        var entry: IrFunctionEntry = module.functions.get(i);
-        names.push(entry.name);
-        i = i + 1;
-    }
-    return names;
 }

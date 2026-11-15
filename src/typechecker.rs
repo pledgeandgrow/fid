@@ -8220,6 +8220,12 @@ impl TypeChecker {
             None => false,
             Some(Stmt::Return(..)) => true,
             Some(Stmt::Expr(..)) => true,
+            Some(Stmt::If { cond: Expr::BoolLit(true), then_block, .. }) => {
+                Self::always_leaves(then_block)
+            }
+            Some(Stmt::If { cond: Expr::BoolLit(false), else_block, .. }) => {
+                else_block.as_ref().map_or(false, |b| Self::always_leaves(b))
+            }
             Some(Stmt::If { then_block, else_block: Some(else_block), .. }) => {
                 Self::always_leaves(then_block) && Self::always_leaves(else_block)
             }
