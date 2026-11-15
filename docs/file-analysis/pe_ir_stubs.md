@@ -1,5 +1,7 @@
 # pe_ir_stubs.fd — runtime stubs, Fides runtime hookup and reachability (pe_ir)
 
+> **Nov 15:** the bare runtime now builds a bootable Multiboot 1+2 kernel (4 KB prefix, long-mode entry, GDT/TSS/IDT, `@interrupt(N)` wiring, isa-debug-exit); `PEIR_BARE_BOOT` switches it. The boot ABI is in the comment block at the top of the bare runtime (release G1).
+
 > **New 2026-11-09** (not in the 10-22 audit). Written from the source and
 > live probes with `s18.exe` (see pe_ir.md). **The file is being edited by
 > another session right now:** HEAD (3215fe7) has 7,071 lines; the working

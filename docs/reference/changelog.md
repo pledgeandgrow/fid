@@ -1,5 +1,32 @@
 # Fides Language Changelog
 
+## Release tracks D and F/G (Nov 15, 2026)
+
+Uncommitted at the time of writing; checked on one-stage builds (the -O2
+split compiler), not a 3-stage fixpoint.
+
+- **Performance:** `&v[i]` / `&mut v[i]` and `&arr[i]` are the element's
+  address, so writes through them reach the container (D15; before, every
+  backend wrote to a copy). The C runtime's string functions use the stored
+  length, so zero bytes survive split, replace, find and trim; `StrView` in
+  stdlib/string.fd slices without copying (D16). The escape check computes
+  per-function reference facts once instead of copying each candidate
+  function per method call (D8). Self-compile is 40 s with the -O2 compiler
+  (D10). Benchmarks in CI compare a change with its base commit on the same
+  runner (D7, .github/workflows/bench.yml).
+- **Platforms:** `fid wasm` writes valid modules that run under WASI
+  (316 of 344 suite tests match `fid run`; F9). Native macOS executables
+  (`emit --target aarch64-macos|x86_64-macos`, Mach-O with dyld binds and an
+  ad-hoc signature over libSystem) are written and structurally checked, not
+  yet run on a Mac (F7). `emit --bare` / `--boot` writes a Multiboot kernel
+  that boots under QEMU: 10 of 10 bare tests pass (G1); fides-os builds with
+  `fid` and boots to its shell (G4). macOS through C, the bare tests and the
+  native macOS programs have GitHub workflows that run once pushed (F5).
+- **Fixed:** the interpreter read structs stored inline in a `Vec` at the
+  wrong place (`ps[1].x` gave 0); `emit` dropped a struct's `drop` method
+  (2g.23); the generic-struct literal check rejected stdlib `Stack`/`Queue`/
+  `BTree` (2g.28).
+
 ## Own backend, ownership layouts and speed in `fid` (Nov 7–9, 2026)
 
 All in the self-hosted compiler. Fixpoint verified Nov 8 (stage 2 == stage 3,

@@ -2222,11 +2222,12 @@ fn TypeChecker_check_exhaustive(self: &mut TypeChecker, match_ty: Type, arms: Ve
     var covered: Vec<str> = Vec::new();
     var has_true: bool = false;
     var has_false: bool = false;
+    var any_guard: bool = false;
     var i: i64 = 0;
     while i < arms.len() {
         var guarded: bool = false;
         match arms.get(i).guard {
-            OptBoxExpr::Some(_) => { guarded = true; }
+            OptBoxExpr::Some(_) => { guarded = true; any_guard = true; }
             OptBoxExpr::None => {}
         }
         if !guarded {
@@ -2265,9 +2266,10 @@ fn TypeChecker_check_exhaustive(self: &mut TypeChecker, match_ty: Type, arms: Ve
             vi = vi + 1;
         }
         if str_len(missing) > 0 {
-            self.errors.push("Type error: non-exhaustive match at line " + int_to_str(line) + " in " + self.current_module + " — missing variant(s): " + missing
-                + "
-    (an arm with a guard `if ...` covers nothing: add an arm without one, or `_ =>`)");
+            var ghint: str = "";
+            if any_guard { ghint = "
+    (an arm with a guard `if ...` covers nothing: add an arm without one, or `_ =>`)"; }
+            self.errors.push("Type error: non-exhaustive match at line " + int_to_str(line) + " in " + self.current_module + " — missing variant(s): " + missing + ghint);
         }
         return;
     }
@@ -10420,7 +10422,21 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                     if stps.len() > 0 {
                         var ak: i64 = 0;
                         while ak < sargs.len() {
-                            if tc_type_has_infer(sargs.get(ak)) {
+                            // A parameter only nested in a field type (`items:
+                            // Vec<T>` given `Vec::new()`) stays open: the type
+                            // the literal is used as (a return type, an
+                            // annotated variable) decides it. Only a bare `T`
+                            // field the literal does not determine is an error.
+                            var bare_t: bool = false;
+                            var bf: i64 = 0;
+                            while bf < struct_fields.len() {
+                                match struct_fields.get(bf).ty {
+                                    Type::Named(bn) => { if bn == stps.get(ak) { bare_t = true; } }
+                                    _ => {}
+                                }
+                                bf = bf + 1;
+                            }
+                            if tc_type_has_infer(sargs.get(ak)) && bare_t {
                                 self.errors.push("Type error (line " + int_to_str(self.current_line) + "): cannot infer type parameter '" + stps.get(ak) + "' of struct '" + real_name + "' from the literal. Fix: give the variable a type, e.g. `var p: " + real_name + "<...> = ...`");
                                 sargs.set(ak, Type::I64);
                             }

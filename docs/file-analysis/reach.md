@@ -1,5 +1,7 @@
 # reach.fd — which functions `emit` lowers
 
+> **Nov 15:** every method named `drop` is a root (the compiler calls it at scope exit; known-bugs 2g.23).
+
 - **Path:** `compiler/reach.fd`
 - **LOC:** 305 (2026-11-10)
 - **Role:** compile time (competitive-roadmap CS4). Computes on the AST the

@@ -49,7 +49,7 @@ reference.md is right. Counts: [selfhost.md → Numbers](selfhost.md#numbers).*
 | core.fd check stamp | ✅ | core.fd is type-checked once per (compiler, core.fd) pair; `FIDES_CHECK_CORE=1` forces it. `.fidcache/` evicts least recently used artifacts past 64 files or 1 GB |
 | `fid emit --checked-alloc` | written, not run | Every block on pages of its own, ending at a guard page; freed pages inaccessible, never reused |
 | `scripts/sanitize.sh`, `scripts/fuzz/nightly.sh` | written, not run | ASan/UBSan through C (needs clang with ASan); fuzzing with a `checked` backend; no CI workflow schedules it |
-| Value semantics (proposals 0001, 0004) | ⚠️ | Since the ownership rule of 0004 (`LOWER_RC` on, Nov 7–8): `var b = a` on a `Vec`, `str` or `HashMap` gives an independent value, shared until the first write copies it (checked Nov 9, interpreter and C). A copied struct still shares its `Vec` fields (`var t = s; t.v.push(2)` changes `s.v`). `LOWER_COW`, 0001's lowering, is off |
+| Value semantics (proposals 0001, 0004) | ✅ | Since the ownership rule of 0004 (`LOWER_RC` on, Nov 7–8): `var b = a` on a `Vec`, `str` or `HashMap` gives an independent value, shared until the first write copies it (checked Nov 9, interpreter and C). A copied struct's `Vec` fields are separate too (`var t = s; t.v.push(2)` leaves `s.v` unchanged, run/C/native, Nov 15). `LOWER_COW`, 0001's lowering, is off |
 
 ## Legend
 
@@ -358,7 +358,7 @@ reference.md is right. Counts: [selfhost.md → Numbers](selfhost.md#numbers).*
 | `@audit` | ✅ | Logs entry (with parameters) and exit at run time |
 | `@deterministic` | ✅ | No IO/Net/Spawn, no floating-point |
 | `given`/`ensure` contracts | ⚠️ | `given` is checked at calls with constant arguments; no run-time check. `ensure` is parsed and not checked |
-| `txn {}` blocks | ⚠️ | `fid run` snapshots memory at entry; C and native run the body with no rollback |
+| `txn {}` blocks | ✅ | `abort;` restores the function's locals and leaves the block, on every backend; globals, `&mut`/pointer targets and IO are not rolled back (a global assigned inside is an error) |
 | `sandbox {}` blocks | ✅ | Capability revocation |
 | ECS (component/system/query) | ✅ | Phase 8B: F18 — entity-component-system |
 | State machines | ✅ | Phase 8B: F19 — `state_machine` with states/transitions |
@@ -664,7 +664,7 @@ val out = quant::dequantize_q8(q_out); // dequantize result
 | `@gas(N)` | ✅ DONE | Compile-time gas budget — counts AST nodes, propagates through call graph, rejects if > N |
 | `@crashfree` | ✅ DONE | Compile-time panic prevention — rejects unwrap, p_panic, non-const div/mod, while loops, non-crashfree calls |
 | `@audit` | ✅ DONE | Entry/exit logging with parameter values via IR injection. Type-aware printing. |
-| `txn {}` | ⚠️ | Parsing + typechecking + interpreter rollback (memory snapshot on TxnBegin, restore on panic, commit on TxnEnd); no rollback in C or native |
+| `txn {}` | ✅ | `abort;` rollback of locals, lowered the same for interpreter, C and native (`Lowerer_txn_open`/`Lowerer_txn_abort`) |
 
 ### Financial Safety Stdlib
 

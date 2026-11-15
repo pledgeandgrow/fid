@@ -33,8 +33,8 @@
 >   temporaries); everything else lives until exit. Copy-on-write value
 >   semantics hold for `var b = a` on a `Vec`, `str` or `HashMap` since the
 >   ownership rule of proposal 0004 (Nov 7–8; data shared until the first
->   write); a copied struct still shares its `Vec` fields, and the full
->   suite has not run with `fid` as the compiler.
+>   write), struct copies included (Nov 15); the full suite has not run
+>   with `fid` as the compiler.
 > - **Safety annotations** are 17 checked rules
 >   ([safety-rules.md](safety-rules.md)); `fid qualify` writes evidence that
 >   always says `NOT_QUALIFIED`. Fides is not suitable for medical,
@@ -54,15 +54,23 @@
 >   the borrow checker rejects two live `&mut`; a spawned function writing a
 >   global without a lock is rejected; `@constant_time` rejects early
 >   returns; bounds and overflow checks panic on every backend.
-> - **`sandbox { }` does not prove code can't do IO:** it rejects a direct
->   `print`, but IO through a called function, or `p_file_read` directly,
->   compiles and runs inside it. An `unsafe` C call is accepted too.
-> - **`region r with budget(N)` counts declared locals only:** a `Vec` grown
->   to 800 KB inside `budget(64)` compiles and runs. It is not a bound on the
->   memory a block uses.
-> - **`@conserve` is not a conservation proof:** it forbids `Money_new`, but
->   `Money_from_cents(Money_to_cents(a) * 2)` inside a `@conserve` function
->   compiles and doubles the money.
+> - **`sandbox { }`** (fixed by Nov 15): IO through a called function, IO
+>   builtins such as `p_file_read`, function values of unknown effect, and
+>   C code, run-time loaded code or inline assembly reached directly or
+>   through any callee are all rejected (`test_sandbox_helper_io_fail`,
+>   `test_sandbox_file_read_fail`, `test_sandbox_ffi_fail`).
+> - **`region r with budget(N)`** (fixed by Nov 15): heap growth counts too,
+>   directly or through any function or method the block calls; what has no
+>   size known at compile time is rejected (`test_budget_heap_fail`,
+>   `test_budget_method_fail`).
+> - **`@conserve`** (fixed Nov 15): no mint calls or `Money { .. }`
+>   literals, no reading or changing `.cents` outside stdlib/money.fd, a
+>   Money taken by value must be passed on (never dropped), and a field
+>   moved out of a linear struct is consumed (no `Money_add(w.balance,
+>   w.balance)`). The money module's `@conserve` operations all keep the
+>   total (`Money_add`, `Money_take`, borrowing readers); the destroying
+>   ones (`Money_sub`, `Money_to_cents`) are not `@conserve`. Tests:
+>   `test_money_*_fail`, `test_money_take`.
 > - **`@crashfree` does not rule out every panic:** unbounded recursion (with
 >   `@wrapping`) compiles and hits the recursion limit at run time; `@gas`
 >   does not bound recursion either.
@@ -71,8 +79,12 @@
 >   "No bypass" is wrong.
 > - **Typed strings do not stop injection by themselves:** `sql_query("… id
 >   = " + user)` takes any string; only `SQLString + str` is rejected.
-> - **`txn { }` rolls nothing back** on C or native (a no-op there); a
->   failure ends the program before any rollback could be seen.
+> - **`txn { }`** (Nov 15): `abort;` inside it restores every local
+>   variable of the function as it was at the txn's start and leaves the
+>   block, the same on every backend. Globals, memory behind `&mut` or
+>   pointers, and IO are not rolled back; assigning a global inside a txn is
+>   an error (`test_txn_abort`, `test_txn_global_fail`). A panic still ends
+>   the program.
 > - **Not working in `fid`:** `build-x86` (out of memory), `fid wasm` (the module fails
 >   `WebAssembly.validate`), stack traces in natively built programs (the
 >   panic message only), ARM64/RISC-V codegen (assembly text that nothing

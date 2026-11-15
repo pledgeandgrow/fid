@@ -63,6 +63,7 @@ KERNEL_TESTS=(
 
 expected_of() {   # $1 = test file: prints the expected lines
   awk '
+    { sub(/\r$/, "") }
     /^\/\/ Expected output:/ { on = 1; next }
     on && /^\/\/ Expected exit:/ { next }
     on && /^\/\// { sub(/^\/\/ ?/, ""); print; next }
@@ -72,7 +73,7 @@ expected_of() {   # $1 = test file: prints the expected lines
 has_expected() { grep -q '^// Expected output:' "$1"; }
 exit_of() {
   local e
-  e=$(sed -n 's#^// Expected exit: *\([0-9][0-9]*\).*#\1#p' "$1" | head -1)
+  e=$(tr -d '\r' < "$1" | sed -n 's#^// Expected exit: *\([0-9][0-9]*\).*#\1#p' | head -1)
   echo "${e:-0}"
 }
 

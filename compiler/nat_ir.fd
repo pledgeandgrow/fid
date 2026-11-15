@@ -133,6 +133,7 @@ pub struct NatGen {
     pub label_fn: i64,
     pub fn_mask: i64,
     pub n_folded: i64,
+    pub n_peep: i64,
     // The function being compiled
     pub cur_name: str,
     pub cur_wrapping: bool,
@@ -251,6 +252,7 @@ pub fn NatGen_new(arch: i64) -> NatGen {
         label_fn: HashMap_new(),
         fn_mask: HashMap_new(),
         n_folded: 0,
+        n_peep: 0,
         cur_name: "",
         cur_wrapping: false,
         cur_crashfree: false,
@@ -1629,6 +1631,150 @@ fn mi_use_mask(op: i64) -> i64 {
 
 fn mi_is_call(op: i64) -> bool { return op == MO_CALL || op == MO_CALLR; }
 
+// --- Recorded-MIR peephole (OP19) -------------------------------------------
+// Local patterns over one recorded function before allocation. Everything
+// here is block-local or goes through the label->block map, so it stays
+// correct when it rewrites branch targets or deletes whole instructions.
+
+fn mi_nop() -> MInst {
+    return MInst { op: -1, r0: 0, r1: 0, r2: 0, i0: 0, i1: 0, i2: 0 };
+}
+
+/// `m` uses vreg `d` (through the fields mi_use_mask reports).
+fn ng_peep_uses(m: MInst, d: i64) -> bool {
+    var um: i64 = mi_use_mask(m.op);
+    if (um & 1) != 0 && m.r0 == d { return true; }
+    if (um & 2) != 0 && m.r1 == d { return true; }
+    if (um & 4) != 0 && m.r2 == d { return true; }
+    return false;
+}
+
+/// `m` could write or clobber memory (a barrier for load forwarding).
+fn ng_peep_mem_barrier(m: MInst) -> bool {
+    return m.op == MO_STORE || m.op == MO_STSLOT || m.op == MO_CALL
+        || m.op == MO_CALLR || m.op == MO_COPY || m.op == MO_TRAP;
+}
+
+fn ng_peep(mir: &mut Vec<MInst>) -> i64 {
+    var changed: i64 = 0;
+    var mb: MBlocks = mi_blocks(mir);
+    var nb: i64 = mb.start.len();
+    var lab_blk: i64 = HashMap_new();
+    var k: i64 = 0;
+    while k < mir.len() {
+        var mp: MInst = mir.get(k);
+        if mp.op == MO_PLACE { HashMap_insert_i(lab_blk, mp.i0, mb.of.get(k)); }
+        k = k + 1;
+    }
+    var b: i64 = 0;
+    while b < nb {
+        var st: i64 = mb.start.get(b);
+        var en: i64 = mb.end.get(b);
+        var k2: i64 = st;
+        while k2 <= en {
+            var m: MInst = mir.get(k2);
+            // mov d,d -> nop
+            if m.op == MO_MOV && m.r0 == m.r1 {
+                mir.set(k2, mi_nop());
+                changed = changed + 1;
+            }
+            // li/mov d overwritten before any use -> nop
+            if m.op == MO_LI || m.op == MO_MOV {
+                var d: i64 = m.r0;
+                var k3: i64 = k2 + 1;
+                while k3 <= en {
+                    var m3: MInst = mir.get(k3);
+                    if m3.op >= 0 {
+                        if ng_peep_uses(m3, d) { k3 = en + 1; }
+                        else if mi_defines(m3.op) && m3.r0 == d {
+                            mir.set(k2, mi_nop());
+                            changed = changed + 1;
+                            k3 = en + 1;
+                        }
+                    }
+                    k3 = k3 + 1;
+                }
+            }
+            // load d,[b+x] then load d2,[b+x] with no store/call and no
+            // redefine of b or d between -> mov d2,d
+            if m.op == MO_LOAD {
+                var k4: i64 = k2 + 1;
+                while k4 <= en {
+                    var m4: MInst = mir.get(k4);
+                    if m4.op >= 0 {
+                        if ng_peep_mem_barrier(m4) { k4 = en + 1; }
+                        else if m4.op == MO_LOAD && m4.r1 == m.r1 && m4.i0 == m.i0 && m4.i1 == m.i1 && m4.i2 == m.i2 {
+                            mir.set(k4, MInst { op: MO_MOV, r0: m4.r0, r1: m.r0, r2: 0, i0: 0, i1: 0, i2: 0 });
+                            changed = changed + 1;
+                            k4 = en + 1;
+                        } else if (mi_defines(m4.op) && (m4.r0 == m.r1 || m4.r0 == m.r0)) {
+                            k4 = en + 1;
+                        }
+                    }
+                    k4 = k4 + 1;
+                }
+            }
+            k2 = k2 + 1;
+        }
+        // Terminator patterns on the block's last live instruction.
+        var last: i64 = en;
+        while last >= st && mir.get(last).op < 0 { last = last - 1; }
+        if last >= st {
+            var t: MInst = mir.get(last);
+            if t.op == MO_JMP || t.op == MO_BNEZ || t.op == MO_BEQZ {
+                if HashMap_contains_i(lab_blk, t.i0) {
+                    var tb: i64 = HashMap_get_i(lab_blk, t.i0);
+                    // branch to the immediately following block -> nop
+                    if tb == b + 1 {
+                        mir.set(last, mi_nop());
+                        changed = changed + 1;
+                    } else {
+                        var ts: i64 = mb.start.get(tb);
+                        var te: i64 = mb.end.get(tb);
+                        // first non-place inst of the target block
+                        var tl: i64 = ts;
+                        while tl <= te && (mir.get(tl).op == MO_PLACE || mir.get(tl).op == MO_LINE) { tl = tl + 1; }
+                        // jump threading: target block is [PLACE* JMP L2]
+                        if tl == te && tl >= ts && mir.get(tl).op == MO_JMP && mir.get(tl).i0 != t.i0 {
+                            mir.set(last, MInst { op: t.op, r0: t.r0, r1: t.r1, r2: t.r2, i0: mir.get(tl).i0, i1: 0, i2: 0 });
+                            changed = changed + 1;
+                        }
+                        // BEQZ r,L ; JMP L2 ; L: -> BNEZ r,L2 and drop the
+                        // lone-JMP block (it has no label, so only
+                        // fallthrough reaches it; r==0 then lands on L's
+                        // block = the one after it).
+                        if t.op == MO_BEQZ || t.op == MO_BNEZ {
+                            var nb2: i64 = b + 1;
+                            if nb2 < nb && tb == nb2 + 1
+                                && mb.start.get(nb2) == mb.end.get(nb2)
+                                && mir.get(mb.start.get(nb2)).op == MO_JMP {
+                                var nop2: i64 = MO_BNEZ;
+                                if t.op == MO_BNEZ { nop2 = MO_BEQZ; }
+                                var jt: MInst = mir.get(mb.start.get(nb2));
+                                mir.set(last, MInst { op: nop2, r0: t.r0, r1: 0, r2: 0, i0: jt.i0, i1: 0, i2: 0 });
+                                mir.set(mb.start.get(nb2), mi_nop());
+                                changed = changed + 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        b = b + 1;
+    }
+    if changed == 0 { return 0; }
+    var out: Vec<MInst> = Vec::new();
+    var j: i64 = 0;
+    while j < mir.len() {
+        if mir.get(j).op >= 0 { out.push(mir.get(j)); }
+        j = j + 1;
+    }
+    mir.clear();
+    j = 0;
+    while j < out.len() { mir.push(out.get(j)); j = j + 1; }
+    return changed;
+}
+
 /// Ends a machine block: control does not go on to the next instruction
 /// only (it may jump, or not continue at all).
 fn mi_ends_block(op: i64) -> bool {
@@ -2968,6 +3114,7 @@ fn ng_mir_finish(g: &mut NatGen) -> str {
     while oi < order.len() {
         var rec2: NatFnRec = g.recs.get(order.get(oi));
         g.cur_name = rec2.name;
+        if ng_on("peep") { g.n_peep = g.n_peep + ng_peep(&mut rec2.mir); }
         var hix: i64 = nc_hit_at(g, rec2.name);
         if hix != 0 {
             // CS6: a cache hit — the recorded bytes replay at this offset and
@@ -5309,22 +5456,31 @@ pub fn nat_target_arch(target: str) -> i64 {
 /// A static Linux executable for `arch` from an IR module that has the
 /// Linux runtime (stdlib/linux_runtime) merged in.
 pub fn nat_generate_elf(module: IrModule, arch: i64) -> ResultBytes {
-    return nat_generate_image(module, arch, false);
+    return nat_generate_image(module, arch, false, false);
 }
 
 /// A Windows x64 executable (PE) from an IR module that has the Linux
 /// runtime and its Windows layer (stdlib/linux_runtime/win.fd) merged in.
 pub fn nat_generate_pe(module: IrModule) -> ResultBytes {
-    return nat_generate_image(module, NAT_X64, true);
+    return nat_generate_image(module, NAT_X64, true, false);
 }
 
-fn nat_generate_image(module: IrModule, arch: i64, win: bool) -> ResultBytes {
+/// A macOS executable (Mach-O) for `arch` from an IR module that has the
+/// Linux runtime and its macOS layer (stdlib/linux_runtime/darwin.fd) merged.
+pub fn nat_generate_macho(module: IrModule, arch: i64) -> ResultBytes {
+    return nat_generate_image(module, arch, false, true);
+}
+
+fn nat_generate_image(module: IrModule, arch: i64, win: bool, mac: bool) -> ResultBytes {
     if !pe_module_has_fn(&module, "main") {
         return ResultBytes::Err(c_vec1("native backend: the program has no `main` function"));
     }
     var t_start: i64 = p_clock_now_ms();
     var g: NatGen = NatGen_new(arch);
     g.win = win;
+    g.mac = mac;
+    g_nat_abs_base = NAT_IMAGE_BASE;
+    if mac { g_nat_abs_base = NAT_MACHO_BASE + NAT_MACHO_HDR; }
     var fi: i64 = 0;
     while fi < module.functions.len() {
         HashMap_insert(g.all_fns, module.functions.get(fi).name, 1);
@@ -5372,6 +5528,12 @@ fn nat_generate_image(module: IrModule, arch: i64, win: bool) -> ResultBytes {
         g.win_iat_label = NatEnc_label(&mut g.e);
         g.win_iat_end = NatEnc_label(&mut g.e);
     }
+    if g.mac {
+        if !ng_has_fn(&g, "pe_mac_syscall") {
+            return ResultBytes::Err(c_vec1("native backend: the macOS layer of the runtime (stdlib/linux_runtime/darwin.fd) is not merged"));
+        }
+        g.mac_got_label = NatEnc_label(&mut g.e);
+    }
 
     nc_start(&mut g, &module);
     ng_gen_primitives(&mut g);
@@ -5406,7 +5568,7 @@ fn nat_generate_image(module: IrModule, arch: i64, win: bool) -> ResultBytes {
     time_mark("nat alloc+emit", t_rec);
     p_eprint_str("[prof] native: lower " + int_to_str(t_rec - t_start) + "ms, allocate and emit "
         + int_to_str(t_emit - t_rec) + "ms, " + int_to_str(g.recs.len()) + " functions, "
-        + int_to_str(g.n_folded) + " folded\n");
+        + int_to_str(g.n_folded) + " folded, " + int_to_str(g.n_peep) + " peep\n");
     NatEnc_align(&mut g.e, 4);
     NatEnc_place(&mut g.e, g.code_end_label);
     // Windows: the data on pages of its own (a read/execute .text, a
@@ -5415,9 +5577,16 @@ fn nat_generate_image(module: IrModule, arch: i64, win: bool) -> ResultBytes {
     if g.win {
         NatEnc_align(&mut g.e, 4096);
         data_off = NatEnc_pos(&g.e);
+    } else if g.mac {
+        // Split code (__TEXT, r-x) from data (__DATA, rw) at a page.
+        var mac_page: i64 = 4096;
+        if arch == NAT_A64 { mac_page = 16384; }
+        NatEnc_align(&mut g.e, mac_page);
+        data_off = NatEnc_pos(&g.e);
     }
     ng_gen_data(&mut g, &module);
     if g.win { ng_gen_win_imports(&mut g); }
+    if g.mac { ng_gen_mac_got(&mut g); }
 
     if g.unresolved.len() > 0 {
         return ResultBytes::Err(c_vec1("native backend: not available in native Linux executables yet: "
@@ -5435,6 +5604,21 @@ fn nat_generate_image(module: IrModule, arch: i64, win: bool) -> ResultBytes {
         return ResultBytes::Ok(nat_pe(g.e.code, entry_off, data_off, imp_off,
             NatEnc_label_offset(&g.e, g.win_imp_end) - imp_off,
             iat_off, NatEnc_label_offset(&g.e, g.win_iat_end) - iat_off));
+    }
+    if g.mac {
+        // Rebase every ABS64 word; bind each GOT slot to its libSystem symbol.
+        var rebase_offs: Vec<i64> = Vec::new();
+        var rfi: i64 = 0;
+        while rfi < g.e.fixups.len() {
+            if g.e.fixups.get(rfi).kind == NATFIX_ABS64 { rebase_offs.push(g.e.fixups.get(rfi).pos); }
+            rfi = rfi + 1;
+        }
+        var imp_names: Vec<str> = ng_mac_imports(ng_x64(&g));
+        var got_base: i64 = NatEnc_label_offset(&g.e, g.mac_got_label);
+        var imp_offs: Vec<i64> = Vec::new();
+        var mii: i64 = 0;
+        while mii < imp_names.len() { imp_offs.push(got_base + mii * 8); mii = mii + 1; }
+        return ResultBytes::Ok(nat_macho(arch, g.e.code, entry_off, data_off, rebase_offs, imp_names, imp_offs));
     }
     if !ng_on("debug") {
         return ResultBytes::Ok(nat_elf(arch, g.e.code, entry_off));
@@ -6632,12 +6816,17 @@ fn nc_start(g: &mut NatGen, m: &IrModule) {
 // ===========================================================================
 
 /// "symbol" per libSystem import; the index is the PE_M_* constant of
-/// darwin.fd. Symbols carry the Mach-O leading underscore.
-fn ng_mac_imports() -> Vec<str> {
+/// darwin.fd. Symbols carry the Mach-O leading underscore. On x86-64 the
+/// 64-bit-inode `struct stat` (the layout darwin.fd reads) comes from
+/// `fstatat$INODE64` (<sys/stat.h> __DARWIN_INODE64); plain `fstatat` there
+/// is the old 32-bit-inode layout. arm64 has no suffix.
+fn ng_mac_imports(x64: bool) -> Vec<str> {
+    var fstatat: str = "_fstatat";
+    if x64 { fstatat = "_fstatat$INODE64"; }
     var v: Vec<str> = Vec::new();
     v.push("_write"); v.push("_read"); v.push("_close"); v.push("_exit");
     v.push("_mmap"); v.push("_munmap"); v.push("_mprotect"); v.push("_openat");
-    v.push("_lseek"); v.push("_fstatat"); v.push("_clock_gettime"); v.push("_nanosleep");
+    v.push("_lseek"); v.push(fstatat); v.push("_clock_gettime"); v.push("_nanosleep");
     v.push("_sched_yield"); v.push("_getpid"); v.push("_arc4random_buf"); v.push("_pthread_create");
     v.push("_pthread_join"); v.push("_pthread_self"); v.push("_pthread_key_create");
     v.push("_pthread_getspecific"); v.push("_pthread_setspecific"); v.push("___ulock_wait");
@@ -6702,6 +6891,12 @@ fn ng_mac_call_body(g: &mut NatGen) {
     a64_add(&mut g.e, 10, 10, 10);                   // 8k
     a64_add(&mut g.e, 9, 9, 10);                     // x9 = got + 8k
     a64_ldr(&mut g.e, 11, 9, 0);                     // x11 = GOT[k]
+    // Apple arm64 passes variadic arguments on the stack: openat's mode
+    // (argument d, after three fixed ones) goes to [sp] as well. The other
+    // imports take at most six arguments, all in registers, and never
+    // read the stack.
+    a64_sub_imm(&mut g.e, A64_SP, A64_SP, 16);
+    a64_str(&mut g.e, 4, A64_SP, 0);
     a64_mov(&mut g.e, 0, 1);
     a64_mov(&mut g.e, 1, 2);
     a64_mov(&mut g.e, 2, 3);
@@ -6709,6 +6904,7 @@ fn ng_mac_call_body(g: &mut NatGen) {
     a64_mov(&mut g.e, 4, 5);
     a64_mov(&mut g.e, 5, 6);
     a64_blr(&mut g.e, 11);
+    a64_add_imm(&mut g.e, A64_SP, A64_SP, 16);
     NatEnc_word(&mut g.e, 0xA8C17BFD);               // ldp x29, x30, [sp], #16
     a64_ret(&mut g.e);
 }
@@ -6876,7 +7072,7 @@ fn ng_gen_primitives_mac(g: &mut NatGen) {
 fn ng_gen_mac_got(g: &mut NatGen) {
     NatEnc_align(&mut g.e, 8);
     NatEnc_place(&mut g.e, g.mac_got_label);
-    var n: i64 = ng_mac_imports().len();
+    var n: i64 = ng_mac_imports(ng_x64(g)).len();
     var i: i64 = 0;
     while i < n { NatEnc_quad(&mut g.e, 0); i = i + 1; }
 }

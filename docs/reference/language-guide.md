@@ -456,10 +456,6 @@ program; the modules it imports are trusted, as is the compiler.
 
 **Does not hold yet:**
 
-- Copying a struct does not separate the `Vec` fields it holds: after
-  `var t = s; t.v.push(2)`, `s.v` sees the push. (`var b = a` on a `Vec`,
-  `str` or `HashMap` itself gives an independent value since the ownership
-  rule of proposal 0004.)
 - Race checks cover globals and the arguments of `spawn` (each must be `@send`;
   references and raw pointers are not). A `Vec` passed to a thread is shared
   with the caller, and that sharing is not checked.
@@ -1550,8 +1546,8 @@ reserve is insufficient for the compiler's deep recursion.
 
 - **Value semantics**: `var b = a` on a `Vec`/`str`/`HashMap` gives an
   independent value (ownership rule of proposal 0004, `LOWER_RC` on; the
-  data is copied at the first write). A copied struct still shares its `Vec`
-  fields. `LOWER_COW`, the earlier copy-on-write lowering, is off.
+  data is copied at the first write), and so does a copied struct's `Vec`
+  fields (Nov 15). `LOWER_COW`, the earlier copy-on-write lowering, is off.
 - **Native async/tasks**: worked under `fid emit` on Nov 6; wrong results in
   builds of Nov 9 afternoon (an iropt bug; fixed again in the evening's fid31, known-bugs 2f.2).
 - **Other targets**: native Linux AArch64/RISC-V/x86-64 work through the

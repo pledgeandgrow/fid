@@ -1,5 +1,7 @@
 # nat_enc.fd — code buffer, encoders, ELF and PE writers of the native backend
 
+> **Nov 15:** `nat_macho` (Mach-O writer with dyld rebases/binds and an ad-hoc SHA-256 signature) and `g_nat_abs_base` were added for native macOS (release F7); see also stdlib/linux_runtime/darwin.fd and scripts/macho-check.py.
+
 Audited 2026-11-09 (new doc).
 
 - **Path:** `compiler/nat_enc.fd`

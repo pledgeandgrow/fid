@@ -1,5 +1,7 @@
 # wasm.fd — WebAssembly backend
 
+> **compiler/wasm.fd was rewritten on Nov 15 (release F9):** it now lowers like nat_ir, uses i32 addresses, emits only what `_start` reaches, runs the Linux runtime over WASI (stdlib/linux_runtime/wasi.fd) and validates; scripts/wasm-test.sh `ALL=1` matches `fid run` on 316 of 344 tests. The findings below describe the module before the rewrite.
+
 > **Re-audited 2026-11-09.** Since 10-23 the only change is `str_equal(a,b)`
 > → `a == b` (commit 34259be). Probes with the latest self-hosted binary
 > (s18) and Node's `WebAssembly.Module`.

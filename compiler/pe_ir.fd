@@ -284,6 +284,14 @@ fn pe_binop_is_cmp(op: BinOp) -> bool {
     return false;
 }
 
+/// Is `func` an interrupt handler (iretq, every register saved)? `interrupt
+/// fn`, and in the bootable bare image also an `@interrupt(N)` function,
+/// which the boot code wires to vector N (release G1).
+fn peir_is_interrupt(self: &PeirGen, func: &IrFunction) -> bool {
+    if func.is_interrupt { return true; }
+    return self.bare_mode && pe_bare_boot_on() && func.interrupt_vector >= 0;
+}
+
 /// Does this interrupt vector push an error code?
 /// (#DF=0x08, #TS=0x0A, #NP=0x0B, #SS=0x0C, #GP=0x0D, #PF=0x0E, #AC=0x11,
 ///  #CP=0x1E; interrupt_vector is -1 when the function has none)
@@ -973,7 +981,7 @@ pub fn PeirGen_gen_function(self: &mut PeirGen, name: str, func: &IrFunction, mo
         p_eprint_str("FN " + name + " @" + int_to_str(self.enc.code.len()) + "\n");
     }
 
-    if func.is_interrupt {
+    if peir_is_interrupt(self, func) {
         // Interrupt handler prologue: save all GP registers
         // The CPU already pushed SS:RSP, RFLAGS, CS:RIP on interrupt
         // For exceptions with error codes (#PF=0x0E, #GP=0x0D, etc.),
@@ -1093,7 +1101,7 @@ pub fn PeirGen_gen_function(self: &mut PeirGen, name: str, func: &IrFunction, mo
     self.unchecked = peir_unchecked_ops(func, nvals);
     // Registers: the hottest locals keep one for the whole function, the
     // others serve temporaries, freed and reused as pool slots are.
-    var use_regs: bool = !self.bare_mode && !func.is_interrupt;
+    var use_regs: bool = !self.bare_mode && !peir_is_interrupt(self, func);
     var no_reg: Vec<i64> = peir_zeros(nvals);
     var used_regs: Vec<i64> = Vec::new();
     var ra_facts: PeirRaFacts = PeirRaFacts_new();
@@ -1327,7 +1335,7 @@ pub fn PeirGen_gen_function(self: &mut PeirGen, name: str, func: &IrFunction, mo
     }
     var out_args: i64 = 0;
     if most_args > 4 { out_args = (most_args - 4) * 8; }
-    self.calls_reserved = !func.is_interrupt;
+    self.calls_reserved = !peir_is_interrupt(self, func);
     // Align stack to 16 bytes + 32 shadow space
     var stack_size: i64 = (frame.size + 32 + out_args + 15) & ~15;
     if stack_size < 64 { stack_size = 64; }
@@ -3123,7 +3131,7 @@ pub fn PeirGen_gen_inst(
             PeirGen_restore_regs(self);
             PeirEnc_mov_rr(&mut self.enc, PEIR_RSP, PEIR_RBP);
             PeirEnc_pop(&mut self.enc, PEIR_RBP);
-            if func.is_interrupt {
+            if peir_is_interrupt(self, func) {
                 // Interrupt handler epilogue: restore all GP registers
                 PeirEnc_pop(&mut self.enc, PEIR_R15);
                 PeirEnc_pop(&mut self.enc, PEIR_R14);

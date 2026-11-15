@@ -1,0 +1,132 @@
+# F7: native macOS executables on the machine layer (compiler/nat_ir.fd,
+# nat_enc.fd nat_macho, stdlib/linux_runtime/darwin.fd). Builds fid and runs
+# `fid emit --target <host>-macos` output against `fid run`. This is the only
+# place F7 is actually executed (no Mac is available where it was written),
+# so F7 is UNVERIFIED until this job is green.
+#
+# macos-15 is Apple silicon (arm64); macos-15-intel is x86_64. (GitHub
+# retired macos-13/macos-14.) The host architecture decides the target so
+# the emitted binary runs natively.
+name: macOS native (F7)
+
+on:
+  push:
+    paths:
+      - 'compiler/nat_ir.fd'
+      - 'compiler/nat_enc.fd'
+      - 'stdlib/linux_runtime/**'
+      - 'scripts/macho-check.py'
+      - '.github/workflows/macos-native.yml'
+  pull_request:
+    paths:
+      - 'compiler/nat_ir.fd'
+      - 'compiler/nat_enc.fd'
+      - 'stdlib/linux_runtime/**'
+      - '.github/workflows/macos-native.yml'
+  workflow_dispatch:
+
+jobs:
+  macos-native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
+
+      - name: Pick the macOS target for this host
+        id: tgt
+        run: |
+          if [ "$(uname -m)" = "arm64" ]; then
+            echo "target=aarch64-macos" >> "$GITHUB_OUTPUT"
+          else
+            echo "target=x86_64-macos" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build the Rust bootstrap compiler (stage 0)
+        run: cargo build --release
+
+      - name: Build fid (self-hosted, 3-stage fixpoint)
+        run: |
+          RELEASE=1 CC="zig cc" ./scripts/bootstrap.sh
+          test -x release/fid
+
+      - name: Emit and run the native macOS programs
+        env:
+          TARGET: ${{ steps.tgt.outputs.target }}
+        run: |
+          set -e
+          FID=release/fid
+          mkdir -p build/macos
+          # a small, dependency-free set the machine layer already handles on Linux
+          PROGRAMS="hello return_code arithmetic strings loops fileio"
+          mkdir -p build/macos/src
+          cat > build/macos/src/hello.fd <<'EOF'
+          fn main() { print("hello from native macOS\n"); }
+          EOF
+          cat > build/macos/src/return_code.fd <<'EOF'
+          fn main() -> i64 { return 7; }
+          EOF
+          cat > build/macos/src/arithmetic.fd <<'EOF'
+          fn main() {
+              var s: i64 = 0;
+              var i: i64 = 1;
+              while i <= 100 { s = s + i; i = i + 1; }
+              print(int_to_str(s));
+              print("\n");
+          }
+          EOF
+          cat > build/macos/src/strings.fd <<'EOF'
+          fn main() {
+              var a: str = "abc";
+              var b: str = "def";
+              print(a + b + "\n");
+          }
+          EOF
+          # open flags are translated Linux -> macOS (darwin.fd pe_mac_oflags):
+          # the second write must truncate, so only "two" is printed
+          cat > build/macos/src/fileio.fd <<'EOF'
+          fn main() {
+              var p: str = "build/macos/fileio_probe.txt";
+              p_file_write(p, "one\n");
+              p_file_write(p, "two\n");
+              print(p_file_read(p));
+          }
+          EOF
+          cat > build/macos/src/loops.fd <<'EOF'
+          fn main() {
+              var i: i64 = 0;
+              while i < 5 { print(int_to_str(i)); i = i + 1; }
+              print("\n");
+          }
+          EOF
+          fail=0
+          for p in $PROGRAMS; do
+            src=build/macos/src/$p.fd
+            out=build/macos/$p
+            echo "=== $p ==="
+            "$FID" run "$src" > build/macos/$p.ref 2>/dev/null; ref_rc=$?
+            if ! "$FID" emit "$src" --target "$TARGET" -o "$out"; then
+              echo "BUILD FAIL $p"; fail=1; continue
+            fi
+            python3 scripts/macho-check.py "$out" --quiet || { echo "STRUCT FAIL $p"; fail=1; }
+            chmod +x "$out"
+            "$out" > build/macos/$p.got 2>/dev/null; got_rc=$?
+            if ! diff -u build/macos/$p.ref build/macos/$p.got; then
+              echo "OUTPUT MISMATCH $p"; fail=1
+            fi
+            if [ "$ref_rc" != "$got_rc" ]; then
+              echo "EXIT MISMATCH $p: ref $ref_rc got $got_rc"; fail=1
+            fi
+          done
+          exit $fail

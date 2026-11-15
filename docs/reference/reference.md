@@ -869,8 +869,8 @@ gp             = T [":" Trait {"+" Trait}] | N ":" int-type
   print(a.len());   // 1, and a.get(0) is still 1
   ```
 
-  Exception (Nov 9): copying a struct does not separate the `Vec` fields it
-  holds. After `var t = s; t.v.push(2)`, `s.v` sees the push too.
+  Copying a struct copies the collections it holds the same way: after
+  `var t = s; t.v.push(2)`, `s.v` is unchanged (since Nov 15).
 - `str` values are immutable, so sharing one is not observable.
 - Only `@linear` struct types move (§8.7).
 

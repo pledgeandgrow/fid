@@ -1,5 +1,7 @@
 # escape.fd — Reference escape check
 
+> **Nov 15:** per-function facts (`ret_has_ref`, `ret_is_ref`, `param_has_ref`) are computed once in `EscapeChecker_new`; the method-call check no longer copies each candidate `Func` (release D8).
+
 > **First audit 2026-11-09** (session 29 module; it had a PROGRESS.md row but
 > no analysis doc). Static read of the whole file plus live probes
 > (`s18.exe run`). The check is precise and holds on every probe but one

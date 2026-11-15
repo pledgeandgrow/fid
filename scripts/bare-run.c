@@ -28,6 +28,8 @@
 #include <ucontext.h>
 #include <unistd.h>
 
+static int dlab; /* COM1 line control: divisor latch access */
+
 static void put(int c) {
     unsigned char b = (unsigned char)c;
     if (write(1, &b, 1) < 0) _exit(3);
@@ -44,7 +46,9 @@ static void on_fault(int sig, siginfo_t *si, void *ctx) {
     if (ip[0] == 0x66) { opsize16 = 1; ip++; len = 1; }
     switch (ip[0]) {
     case 0xEE: /* out dx, al */
-        if (port == 0x3F8) put((int)(g[REG_RAX] & 0xFF));
+        /* with LCR.DLAB set (p_serial_init), 0x3F8 is the divisor latch */
+        if (port == 0x3FB) dlab = (int)(g[REG_RAX] & 0x80);
+        if (port == 0x3F8 && !dlab) put((int)(g[REG_RAX] & 0xFF));
         if (port == 0xF4) _exit((int)(g[REG_RAX] & 0xFF));
         len += 1; break;
     case 0xEF: len += 1; break;                 /* out dx, ax/eax */

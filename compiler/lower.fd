@@ -1837,6 +1837,13 @@ pub fn Lowerer_make_struct_layout(self: &Lowerer, def: StructDef) -> StructLayou
     while i < def.fields.len() {
         var field: Param = def.fields.get(i);
         var ir_ty: IrType = Lowerer_lower_type(self, field.ty);
+        // A field typed by one of the struct's type parameters is one word
+        // (as a generic enum's payload): `first: A` lowered as a struct
+        // named A, and a literal stored nothing in it (2f.11)
+        match field.ty {
+            Type::Named(tpn) => { if lw_c_str_vec_contains(def.type_params, tpn) { ir_ty = IrType::I64; } }
+            _ => {}
+        }
 
         if repr_c || packed_layout {
             // C-compatible or packed layout: use natural type sizes and alignment
@@ -4067,8 +4074,9 @@ fn Lowerer_lower_func_body(self: &mut Lowerer, func: Func) {
                 var result: i64 = 0;
                 var si: i64 = 0;
                 // Check for 0x prefix (hex)
-                if str_len(vec_str) >= 2 {
-                    if str_byte_at(vec_str, 0) == 48 && (str_byte_at(vec_str, 1) == 120 || str_byte_at(vec_str, 1) == 88) {
+                // (>= 1: a one-digit vector such as @interrupt(3) was read as 0)
+                if str_len(vec_str) >= 1 {
+                    if str_len(vec_str) >= 2 && str_byte_at(vec_str, 0) == 48 && (str_byte_at(vec_str, 1) == 120 || str_byte_at(vec_str, 1) == 88) {
                         si = 2;
                         while si < str_len(vec_str) {
                             var b: i64 = str_byte_at(vec_str, si);
@@ -8559,6 +8567,31 @@ fn Lowerer_lower_field_access_expr(self: &mut Lowerer, obj: Box<Expr>, field: st
         }
     }
 
+    // A generic struct instance held as a word (a `p: Pair<i64, i64>`
+    // parameter or variable): the word is the struct's address, as its AST
+    // type says. Without this every field read field 0 (2f.11).
+    if str_len(struct_name) == 0 {
+        var gat: Type = Lowerer_infer_expr_ast_type(self, obj_expr);
+        match gat {
+            Type::Ref(rin, _) => { gat = lw_box_type_unbox(rin); }
+            _ => {}
+        }
+        match gat {
+            Type::Generic(gsn, _) => {
+                match Lowerer_lookup_struct(self, gsn) {
+                    OptStructDef::Some(gsd) => {
+                        if gsd.type_params.len() > 0 && gsn != "Vec" {
+                            struct_name = gsn;
+                            obj_val = Lowerer_emit_inst(self, Inst::BitCast(obj_val, obj_ty, IrType::Ptr(Box::new(IrType::Struct(gsn)))));
+                        }
+                    }
+                    OptStructDef::None => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
     // Swizzle access for vec types (Phase 8A): v.xyz / v.rgb / v.yx ...
     if is_vec_type_name(struct_name) && str_len(field) > 1 && is_valid_swizzle(field) {
         return Lowerer_lower_swizzle(self, struct_name, obj_val, field);
@@ -8585,19 +8618,24 @@ fn Lowerer_lower_field_access_expr(self: &mut Lowerer, obj: Box<Expr>, field: st
         IrType::Struct(_) => { return field_ptr; }
         _ => {}
     }
-    var loaded: i64 = Lowerer_emit_inst(self, Inst::Load(field_ptr, field_ty));
     // A type-parameter field of a generic struct: its word, read as the
-    // instance's type (Pair<f64, str>: an f64 and a string)
+    // instance's type (Pair<f64, str>: an f64 from its bits, a string as
+    // the pointer it is)
     if Lowerer_field_is_type_param(self, struct_name, field) {
         var want: IrType = Lowerer_lower_type(self, Lowerer_infer_expr_ast_type(self, Expr::FieldAccess(obj, field)));
         match want {
-            IrType::I64 => {}
-            IrType::Struct(_) => {}
-            IrType::Void => {}
-            _ => { loaded = Lowerer_emit_inst(self, Inst::BitCast(loaded, field_ty, want)); }
+            IrType::F64 => {
+                var bits: i64 = Lowerer_emit_inst(self, Inst::Load(field_ptr, IrType::I64));
+                var fa: Vec<i64> = Vec::new();
+                fa.push(bits);
+                return Lowerer_emit_inst(self, Inst::Call("p_f64_from_bits", fa, IrType::F64, EffectSet_new()));
+            }
+            IrType::Ptr(_) => { return Lowerer_emit_inst(self, Inst::Load(field_ptr, want)); }
+            IrType::Bool => { return Lowerer_emit_inst(self, Inst::Load(field_ptr, want)); }
+            _ => {}
         }
     }
-    return loaded;
+    return Lowerer_emit_inst(self, Inst::Load(field_ptr, field_ty));
 }
 
 // &obj.field — the field's address (GetFieldPtr), used by Expr::Ref so a
@@ -9426,9 +9464,12 @@ fn Lowerer_lower_struct_lit_expr(self: &mut Lowerer, name: str, fields: Vec<Fiel
                     if Lowerer_field_is_type_param(self, real_name, field_init.name) {
                         var fvt: IrType = Lowerer_get_value_type(self, field_val);
                         match fvt {
-                            IrType::I64 => {}
-                            IrType::Struct(_) => {}
-                            _ => { field_val = Lowerer_emit_inst(self, Inst::BitCast(field_val, fvt, IrType::I64)); }
+                            IrType::F64 => {
+                                var fb: Vec<i64> = Vec::new();
+                                fb.push(field_val);
+                                field_val = Lowerer_emit_inst(self, Inst::Call("p_f64_to_bits", fb, IrType::I64, EffectSet_new()));
+                            }
+                            _ => {}
                         }
                     }
                     match field_ty {
@@ -12859,7 +12900,9 @@ fn Lowerer_field_is_type_param(self: &Lowerer, sn: str, field: str) -> bool {
 fn Lowerer_struct_lit_ast_type(self: &Lowerer, name: str, fields: Vec<FieldInit>) -> Type {
     match Lowerer_lookup_struct(self, name) {
         OptStructDef::Some(sd) => {
-            if sd.type_params.len() == 0 { return Type::Named(name); }
+            // (a plain struct literal keeps the answer it always had: other
+            // lowering decisions depend on it)
+            if sd.type_params.len() == 0 { return Type::I64; }
             var args: Vec<Type> = Vec::new();
             var ti: i64 = 0;
             while ti < sd.type_params.len() {
@@ -12889,7 +12932,7 @@ fn Lowerer_struct_lit_ast_type(self: &Lowerer, name: str, fields: Vec<FieldInit>
         }
         OptStructDef::None => {}
     }
-    return Type::Named(name);
+    return Type::I64;
 }
 
 fn lw_rc_subst(t: Type, params: Vec<str>, args: Vec<Type>) -> Type {

@@ -3150,20 +3150,25 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
     // static ELF. `--target aarch64-linux` / `riscv64-linux`; `--native`
     // with `--target arm64|riscv64` (the old PIR path) comes here too.
     var nat_arch: i64 = 0;
-    if str_contains(target, "linux") || use_native { nat_arch = nat_target_arch(target); }
+    if str_contains(target, "linux") || str_contains(target, "macos") || use_native { nat_arch = nat_target_arch(target); }
     // `--nat`: Windows x64 through the same layer (a PE; the Linux runtime
     // over kernel32, stdlib/linux_runtime/win.fd). pe_ir stays the default.
     var nat_win: bool = has_flag(n, start, "--nat")
         && (target == "" || str_contains(target, "windows") || (!is_posix_host() && !str_contains(target, "linux")));
     if nat_win { nat_arch = nat_target_arch("x86_64"); }
+    // `--target aarch64-macos|x86_64-macos` (F7): a Mach-O; the Linux
+    // runtime over libSystem (stdlib/linux_runtime/darwin.fd).
+    var nat_mac: bool = str_contains(target, "macos");
     if nat_arch != 0 && !bare_mode && !boot_mode {
         var nat_out: str = find_output_arg(n, start, "a.out");
         if nat_win { nat_out = ensure_exe_extension(find_output_arg(n, start, "a.exe")); }
         set_native_runtime("linux_runtime");
         g_native_rt_win = nat_win;
+        g_native_rt_mac = nat_mac;
         // @cfg sees the target, not the host
         g_cfg_os = "linux";
         if nat_win { g_cfg_os = "windows"; }
+        if nat_mac { g_cfg_os = "macos"; }
         if str_contains(target, "riscv") { g_cfg_arch = "riscv64"; }
         else if nat_arch == nat_target_arch("x86_64") { g_cfg_arch = "x86_64"; }
         else { g_cfg_arch = "aarch64"; }
@@ -3227,6 +3232,7 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                 p_eprint_str("[build] Native Linux code generation...\n");
                 var nat_res: ResultBytes = ResultBytes::Err(Vec::new());
                 if nat_win { nat_res = nat_generate_pe(nat_mod); }
+                else if nat_mac { nat_res = nat_generate_macho(nat_mod, nat_arch); }
                 else { nat_res = nat_generate_elf(nat_mod, nat_arch); }
                 t_run = time_mark("native code", t_run);
                 match nat_res {
@@ -3416,7 +3422,7 @@ fn print_usage() {
     p_eprint_str("  fid build    <file.fd> -o <output>    Compile to native executable\n");
     p_eprint_str("  fid emit     <file.fd> -o <output>    Alias for build\n");
     p_eprint_str("  fid build-x86 <file.fd> [-o <out>]    Linux ELF via x86 stack-machine backend\n");
-    p_eprint_str("  fid emit     <file.fd> --boot -o <out>  Multiboot2 kernel binary\n");
+    p_eprint_str("  fid emit     <file.fd> --boot -o <out>  Multiboot 1+2 kernel (as --bare) [--load <addr>]\n");
     p_eprint_str("  fid emit     <file.fd> --bare -o <out>  Bare-metal kernel (Multiboot; QEMU -kernel) [--load <addr>]\n");
     p_eprint_str("  fid emit     <file.fd> --elf -o <out>   Static Linux x86-64 executable (no stdlib yet)\n");
     p_eprint_str("  fid run      <file.fd>                Compile + execute\n");

@@ -261,10 +261,17 @@ the fastest build-to-native among compiled languages, and native code within
 - [x] D6. Run the IR optimizer on the native path (M).
       Done Nov 4: `fid emit` runs iropt (inlining, constant folding, dead code)
       before machine code.
-- [~] D7. Benchmarks in CI, failing on a slowdown over 10% (M).
+- [x] D7. Benchmarks in CI, failing on a slowdown over 10% (M).
       Written Nov 4: bench/check.sh fails on a slowdown over LIMIT_PCT against
       bench/baseline.txt; not in CI.
-- [~] D8. Borrow checking is now the slowest compiler phase (about 30 s on the
+      Done Nov 15: .github/workflows/bench.yml builds `fid` at the change's
+      base commit and at its head on the same runner, records the base with
+      bench/check.sh --save and checks the head against it (run time, native
+      `emit --target x86_64-linux` and C, best of 5; compile time per stage
+      with bench/compile-check.sh); a benchmark more than 10% slower fails
+      the job. check.sh takes BENCH_BASE and uses the native backend on Linux.
+      Runs once pushed.
+- [x] D8. Borrow checking is now the slowest compiler phase (about 30 s on the
       compiler itself): profile and fix it, as for the type checker (M).
       Nov 6: profiled (gprof on a Linux -pg build of the compiler): the phase
       printed as "borrowck" is mostly lints (15 s of 31 under gprof: the
@@ -273,6 +280,12 @@ the fastest build-to-native among compiled languages, and native code within
       itself is 1.8 s. Lists now gathered and made sets once: the phase is
       7 s of a self-compile (31 s under gprof before, which runs about twice
       as slow). Left: the escape check.
+      Done Nov 15: the escape check copied a whole function (its AST) for
+      each candidate of every method call; the facts it needs (does the
+      result or a parameter hold a reference) are now computed once per
+      function. On the compiler itself, with the compiler built at -O2:
+      escape+secrecy 0.8 s, borrow check 0.4 s, lints 0.5 s of an 8.3 s
+      front end (`fid check compiler/main.fd --time`).
 - [~] D9. `emit` of hello world under 0.5 s: stop re-checking the stdlib on each
       build, by caching its checked form (L).
       Done Nov 4: core.fd is checked once per (compiler, core.fd) pair, a stamp
@@ -303,7 +316,7 @@ the fastest build-to-native among compiled languages, and native code within
       r`) instead of through rax and rcx, and loads and stores of a local in
       a register are one move. Left: comparisons and branches on registers,
       and copy propagation between the moves that remain.
-- [~] D14. `Vec` elements at their real size (L). Stage A done: one `Vec`
+- [x] D14. `Vec` elements at their real size (L). Stage A done: one `Vec`
       implementation, core's. Every backend's `p_vec_*` builtins run core's
       `Vec_*` functions; on native and the interpreter they disagreed with it
       (`clone` shared the data, `first` returned garbage, builtins did nothing
@@ -332,9 +345,26 @@ the fastest build-to-native among compiled languages, and native code within
       Vec built any other way (a struct field, a function's result, `Vec<u8>`
       from p_vec_new) still has word elements; floats and structs stay one
       word (stage C: structs inline).
-- [ ] D15. References into containers: `&v[i]` and large structs passed by
+      Done Nov 15: every Vec whose element type the program states has its
+      elements at their size: a typed `let`, a struct field, a parameter or
+      result, `Vec::filled` (u8/bool 1 byte, i8/u16/i16 2, i32/u32 4, structs
+      inline up to 232 words, `LOWER_INLINE_STRUCTS`); the interpreter reads
+      inline structs at their address too (`interp_vec_ld`, code 16 and up).
+      An unannotated `var v = Vec::new()` has no static element type in the
+      language (it is checked as a Vec of words) and stays one word per
+      element; `f32` elements are still one word each.
+- [x] D15. References into containers: `&v[i]` and large structs passed by
       pointer, not copied (needs D14) (L).
-- [~] D16. Strings carry their length: O(1) length, zero bytes allowed,
+      Done Nov 15: `&v[i]` and `&mut v[i]` are the element's address (core
+      `Vec_elem_addr`, bounds-checked; a mutable one first takes a shared
+      buffer for this Vec alone), and `&arr[i]` of a fixed array is its
+      element's address. Before, the element was copied to a temporary, so
+      `bump(&mut v[1])` changed nothing (every backend). The borrow checker
+      keeps the Vec unchanged while the reference lives. Structs are passed
+      by pointer and read in place (a parameter the body changes is copied at
+      entry). `LOWER_REF_INDEX` switches it off. test_ref_index: same output
+      on run, C and native.
+- [x] D16. Strings carry their length: O(1) length, zero bytes allowed,
       slices without copying (competitive RT2) (L).
       Nov 6: every string a program makes has [magic][length] before its
       bytes: core's (p_str_alloc), the C runtime's concatenation and
@@ -350,7 +380,16 @@ the fastest build-to-native among compiled languages, and native code within
       Nov 7: also on `fid run` (the interpreter stores strings with the
       header and reads them back by length) and native `==` (it measured
       with strlen): test_str_length passes on run, C and native.
-- [~] D10. Self-compile under 60 s (M). Profiled with a stack sampler: 601 s to
+      Done Nov 15: the C runtime's string functions (len, find, contains,
+      starts/ends_with, replace, split, trim, case, repeat, join, the string
+      builder) use the stored length, so zero bytes are ordinary bytes
+      (test_str_zero_bytes, run/C/native). Slices without copying:
+      `StrView` in stdlib/string.fd, a counted share of the string plus a
+      start and a length: slice, split, find, compare, trim and parse_int
+      copy no bytes; `to_str` makes one copy (test_str_view, run/C/native).
+      A (pointer, length) `str` in the language itself was not done: it
+      changes every backend's ABI.
+- [x] D10. Self-compile under 60 s (M). Profiled with a stack sampler: 601 s to
       136 s, 4.4 times faster, fixpoint kept. Fixed: on Windows `printf` wrote
       stdout a byte at a time (31% of the time, and every printing program on the C
       path); instruction lookup by id scanned the whole function whenever it had
@@ -370,6 +409,12 @@ the fastest build-to-native among compiled languages, and native code within
       function zeroes about 1,900 locals per call (an enum match as a C
       `switch`, or no zeroing of SSA temporaries, would fix it); lowering
       (19 s) and C generation (10 s).
+      Done Nov 15: `dump-c compiler/main.fd` takes 40 s with the compiler built
+      at -O2 (8 split units): front end 9 s, lowering 15 s, C generation
+      14 s (from 74 s on Nov 9; the comptime substitution that skips
+      functions it cannot change and reachability-only lowering for `emit`
+      did most of it). At -O0 it is several times slower, so the release
+      build splits (scripts/bootstrap.sh, build-selfhost.sh).
 
 **Acceptance:** the Target column above; self-compile under 60 s.
 
@@ -458,6 +503,11 @@ compiler.
       Mac here. `scripts/ci/cross.yml` has the macOS job (bootstrap with
       clang, then the suite through C, compared with the interpreter); this
       repository keeps no `.github/`, so it is not active. Left: run that job.
+      Nov 15: .github/workflows/macos.yml builds `fid` on macos-15 (Apple
+      silicon) and macos-15-intel with clang and runs the suite through C
+      against the interpreter (scripts/cross-test.sh); macOS 13 and 14
+      images are gone from GitHub Actions. Runs once pushed: done when it
+      passes.
 - [~] F6. Native ARM64/RISC-V/WASM backends: overflow and divide-by-zero
       semantics match the other backends (M).
       Nov 7: through C every target shares the C runtime's checks.
@@ -468,9 +518,23 @@ compiler.
       Windows; cross-test.sh compares them on every cross target (not yet run
       there: the runs were stopped). Native AArch64 and RISC-V (F8, Nov 7):
       the four tests pass under QEMU (output, exit code, panic message).
-      Left: a native WASM backend (F9).
-- [ ] F7. Native macOS: Mach-O executables, not only objects (L).
+      Nov 15, native WASM (F9, `fid wasm`): the four tests pass
+      (scripts/wasm-test.sh).
+- [~] F7. Native macOS: Mach-O executables, not only objects (L).
       macOS executables come from the C path (F5) for now.
+      Nov 15, written, not yet run on a Mac: `fid emit <f> --target
+      aarch64-macos|x86_64-macos` writes a PIE Mach-O on the machine layer
+      (compiler/nat_enc.fd `nat_macho`: __PAGEZERO, __TEXT/__DATA, dyld
+      rebases and libSystem binds into a GOT, LC_MAIN, LC_BUILD_VERSION, an
+      ad-hoc SHA-256 code signature), with the Linux runtime over libSystem
+      (stdlib/linux_runtime/darwin.fd: pthreads, `__ulock` futexes, stat,
+      sigaction and open-flag layouts). scripts/macho-check.py checks the
+      structure and every page hash (validated against zig's own macOS
+      output first); 8 programs on both architectures pass it.
+      .github/workflows/macos-native.yml runs them on macos-15 and
+      macos-15-intel against `fid run`: done when it passes. Open: errno
+      (every failure is -EIO), directory listing, sockets and poll, process
+      spawn, signal numbers and siginfo, sigaltstack.
 - [~] F8. ARM64 and RISC-V: replace the runtime stubs (19 and 18 zero stubs, 46
       capability stubs), and test under QEMU (XL).
       Nov 7, through C: AArch64 Linux ran 270 of 286 suite tests the same as
@@ -524,6 +588,12 @@ compiler.
       (stdlib/linux_runtime/win.fd maps each system call); 301 of 338 suite
       tests match. Processes wait for a `nat_os()` hook in `pe_sh`. Line
       tables (`.debug_line`) in every native Linux executable.
+      Nov 15: test_args, test_free_escape, test_sensitive and
+      test_str_return3 match `fid run` on AArch64 (qemu) and x86-64 Linux.
+      Suite (`NATIVE=1 cross-test.sh aarch64-linux`): 318 passed, 18 failed,
+      10 did not build, 21 without reference; the sampled failures
+      (test_drop, test_int_width, test_deref_minimal) predate Nov 15 and the
+      rest are not triaged. cross-test.sh needs a relative OUT under WSL.
 - [~] F9. WASM: globals, struct copies, collections (L).
       Nov 7, through C: `fid ccompile --target wasm32-wasi -o x.wasm` (zig cc,
       WASI preview 1) and `node scripts/wasm-run.mjs x.wasm` run the sample
@@ -533,14 +603,35 @@ compiler.
       not completed. The native backend (`fid wasm`, compiler/wasm.fd) is
       unchanged: it still writes a module that fails validation (an i64
       data-segment offset in 32-bit memory) and has no collections.
+      Nov 15, native: `fid wasm x.fd -o x.wasm` (compiler/wasm.fd rewritten:
+      i32 addresses, only what `_start` reaches, the other backends' overflow
+      and division checks, a shadow stack, a funcref table for function
+      values; the Linux runtime over WASI preview 1 in
+      stdlib/linux_runtime/wasi.fd; no C compiler) validates and runs under
+      `node scripts/wasm-run.mjs`. scripts/wasm-test.sh `ALL=1`: 316 of the
+      344 suite tests with a reference match `fid run`; the rest are
+      interpreter failures, processes (none under WASI), Node's fd_readdir
+      (ENOSYS on Windows) and bugs shared with the other native backends.
+      Tasks and threads run to their end when started (no stack switching).
+      Hello is 37.7 KB (129 KB and invalid before).
 
 **Acceptance:** Windows, Linux and macOS are fully supported at 1.0.0, on x64 and
 ARM64 where the system runs there; RISC-V and WASM pass the suite.
 
 ## Track G — Bare metal
 
-- [ ] G1. Bare-metal tests run under QEMU in CI, not hosted, where they are
+- [x] G1. Bare-metal tests run under QEMU in CI, not hosted, where they are
       expected to fault (M).
+      Done Nov 15: `fid emit --bare` (and `--boot`) writes a Multiboot 1+2
+      kernel that QEMU `-kernel` and GRUB load: a 4 KB prefix with the
+      headers and a 32-bit entry that enters long mode (4 GB identity map,
+      GDT and TSS, an IDT with default handlers and `@interrupt(N)` wired,
+      the PIC remapped, interrupts on); `--load <addr>`. An unhandled CPU
+      exception panics; `main`'s result or a panic ends QEMU through
+      isa-debug-exit. scripts/bare-qemu-test.sh: 10 of 10 bare and kernel
+      tests pass under qemu-system-x86_64 (paging with a #PF handler, int3
+      and timer interrupts included); .github/workflows/bare-metal.yml runs
+      it. scripts/bare-run.c still runs the images.
 - [x] G2. `fid emit --bare` works: `pe_ir` panics with "bare mode not ported" (M).
       Done Nov 6: `--bare` goes through pe_ir (the PIR path crashed): a flat
       binary loaded at 0x10000, entered at its first byte. The hardware
@@ -558,7 +649,13 @@ ARM64 where the system runs there; RISC-V and WASM pass the suite.
       backend; a failed check, like any panic, calls the program's
       `@panic_handler` with the message, else prints `panic: <message>` to
       COM1, then halts. `@wrapping` wraps (test_bare_panic_handler).
-- [ ] G4. `fides-os` builds with the released compiler, in its own CI (M).
+- [~] G4. `fides-os` builds with the released compiler, in its own CI (M).
+      Nov 15: fides-os builds with `fid` (`emit --boot --load 0x1000000`):
+      minimal.fd prints "Hello from Fides OS!" and the shell kernel reaches
+      its prompt under QEMU. Its CI (fides-os .github/workflows/build.yml)
+      builds fid from pledgeandgrow/fid and boots both; done when it has run
+      green there. GRUB from an ISO, user mode, disk and network are not
+      tested.
 
 **Acceptance:** a kernel boots and prints under QEMU, from a clean checkout.
 

@@ -64,6 +64,8 @@ const SEC_DATA: i64 = 11;
 const WG_STACK_LO: i64 = 1024;
 const WG_STACK_TOP: i64 = 8389632;     // 1024 + 8 MB
 const WG_DATA_BASE: i64 = 8389632;
+// What nat_ctx_tramp returns: marks a task's first context record
+const WG_TRAMP: i64 = 0x7A5E7A5E;
 
 // The arithmetic panics (nat_ir's NP_*)
 const WP_ADD: i64 = 0;
@@ -416,6 +418,7 @@ fn wg_prim_params(name: str) -> i64 {
     if name == "nat_os" { return 0; }
     if name == "nat_wasm_grow" { return 1; }
     if name == "nat_wasm_size" { return 0; }
+    if name == "nat_wasm_zero" { return 2; }
     if name == "nat_c_sqrt" || name == "nat_c_fabs" || name == "nat_c_floor" || name == "nat_c_ceil"
         || name == "nat_c_trunc" || name == "nat_c_round" {
         return 1;
@@ -441,6 +444,8 @@ fn wg_wasi_sig(name: str) -> str {
         return "ii>i";
     }
     if name == "sched_yield" { return ">i"; }
+    if name == "fd_prestat_get" { return "ii>i"; }
+    if name == "fd_prestat_dir_name" { return "iii>i"; }
     return "";
 }
 
@@ -1683,14 +1688,16 @@ fn wg_gen_primitive(g: &mut WasmGen, name: str) {
     g.cur_name = name;
     g.b = Vec::new();
     g.extra = 0;
-    // Two scratch f64 locals (2, 3 after up to... all primitives take < 8
-    // parameters: locals 8 and 9)
+    // Scratch locals after the parameters (every primitive takes fewer
+    // than 8): i64s up to 9, f64s 10 and 11
     var np: i64 = wg_prim_params(name);
-    wu(g, 1);
+    wu(g, 2);
     wu(g, 10 - np);
+    w(g, WT_I64);
+    wu(g, 2);
     w(g, 0x7C);
-    var x: i64 = 8;
-    var t: i64 = 9;
+    var x: i64 = 10;
+    var t: i64 = 11;
     if name == "nat_syscall" {
         if wg_has_fn(g, "pe_wasi_syscall") {
             wi64(g, 0);
@@ -1729,11 +1736,77 @@ fn wg_gen_primitive(g: &mut WasmGen, name: str) {
         wi64(g, 0);
         wendif(g);
     } else if name == "nat_ctx_swap" {
-        // Tasks need a stack switch: a WASI program has none
-        wg_panic_msg(g, "tasks are not supported in WebAssembly (fid wasm)");
+        // nat_ctx_swap(save, sp) without a stack switch (WASM has none):
+        // tasks run to their end when first entered, nested on this stack.
+        // Entering a new task (its record at sp names the trampoline): its
+        // body [sp + 112](env 0, [sp + 120]) now. Leaving an unfinished task
+        // (save = its block + 104, sp = [block + 168]; done at block + 80):
+        // run another queued
+        // task meanwhile (pe_co_step), then go on. Anything else: nothing.
+        wlget(g, 1); wload(g, 8, false, 104);
+        wi64(g, WG_TRAMP);
+        w(g, 0x51);
+        wif(g);
+        wlget(g, 1); wwrap(g); wi64(g, 0); wstore(g, 8, 104);
         wi64(g, 0);
+        wlget(g, 1); wload(g, 8, false, 120);
+        wlget(g, 1); wload(g, 8, false, 112); wwrap(g);
+        w(g, 0x11); wu(g, wg_type_n(g, 2)); wu(g, 0);
+        w(g, 0x1A);
+        wi64(g, 0);
+        w(g, 0x0F);
+        wendif(g);
+        if wg_has_fn(g, "pe_co_step") {
+            // a leave: sp is the enterer's record, kept at block + 168
+            wlget(g, 0); wload(g, 8, false, 64);
+            wlget(g, 1); w(g, 0x51);
+            wif(g);
+            wlget(g, 0); wi64(g, 24); w(g, 0x7D);
+            wload(g, 8, false, 0);
+            w(g, 0x50);
+            wif(g);
+            wi64(g, 0);
+            wi64(g, 1);
+            wg_call_named(g, "pe_co_step", 2);
+            w(g, 0x1A);
+            wendif(g);
+            wendif(g);
+        }
+        wi64(g, 0);
+    } else if name == "nat_ctx_tramp" {
+        wi64(g, WG_TRAMP);
     } else if name == "nat_clone_thread" {
-        wi64(g, 0 - 38);
+        // nat_clone_thread(entry, arg, stack_top, ctid, tls) without
+        // threads: entry(env 0, arg) runs now, to its end, with the new
+        // thread's block as its thread pointer; then the 32-bit word at
+        // ctid is zeroed, as the kernel does when a thread is gone. The
+        // scheduler's workers (pe_worker_main, which never return) do not
+        // start: tasks run on the thread that waits for them.
+        if wg_has_fn(g, "pe_worker_main") {
+            wlget(g, 0);
+            wi64(g, wg_table_ref(g, "pe_worker_main"));
+            w(g, 0x51);
+            wif(g);
+            wi64(g, 0 - 38);
+            w(g, 0x0F);
+            wendif(g);
+        }
+        wgget(g, 1); wlset(g, 9);
+        wlget(g, 4); wgset(g, 1);
+        wi64(g, 0);
+        wlget(g, 1);
+        wlget(g, 0); wwrap(g);
+        w(g, 0x11); wu(g, wg_type_n(g, 2)); wu(g, 0);
+        w(g, 0x1A);
+        wlget(g, 9); wgset(g, 1);
+        wlget(g, 3); wwrap(g); wi64(g, 0); wstore(g, 4, 0);
+        wi64(g, 1000);
+    } else if name == "nat_wasm_zero" {
+        wlget(g, 0); wwrap(g);
+        wi32(g, 0);
+        wlget(g, 1); wwrap(g);
+        w(g, 0xFC); wu(g, 11); w(g, 0);
+        wi64(g, 0);
     } else if name == "nat_call_fn" {
         // addr(env 0, argv[0..nargs])
         var k2: i64 = 0;

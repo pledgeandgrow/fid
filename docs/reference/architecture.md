@@ -433,7 +433,7 @@ Native Binary / WASM / SPIR-V / C Source / Running Code
 - ✅ Effect handlers: `handle { do } with`, `resume(cont, v)` runs the rest of the block
 - ⚠️ `async` / `await` / `spawn`: an `async fn` is a green task on its own stack; `spawn f(args)` runs on an OS thread with `@send` arguments. Native (`fid emit`) async worked Nov 6 and broke in builds of Nov 9 afternoon (iropt passes; fixed again in the evening's fid31).
 - ❌ `#[test]` attribute: parsed and ignored; `fid test file.fd` runs `test_*` and `bench_*` functions
-- ⚠️ Value semantics: `var b = a` on a `Vec`/`str`/`HashMap` copies (shared until the first write; proposal 0004, `LOWER_RC`); a copied struct still shares its `Vec` fields. `LOWER_COW` (proposal 0001's lowering) is off
+- ✅ Value semantics: `var b = a` on a `Vec`/`str`/`HashMap` copies (shared until the first write; proposal 0004, `LOWER_RC`); a copied struct's `Vec` fields too (Nov 15). `LOWER_COW` (proposal 0001's lowering) is off
 - ✅ `@derive(Debug/Clone/Serialize/Deserialize)`: implemented (Phase 7.7)
 - ✅ Borrow checker: Phases 1-6 complete, `on` by default, field-wise borrows, two-phase borrows, NLL
 - ✅ `Box<T>` recursive types: implemented (self-hosting blocker 3 resolved)
@@ -596,7 +596,7 @@ PIR Level 3 → Register Allocator → Instruction Selector → Peephole → Bin
 
 #### What's Planned
 - Region allocator: arena-based, tied to the region system (not started; today the compiler frees collections declared in a region at its end)
-- Value semantics for `Vec`/`str`/`HashMap`: done by the ownership rule of proposal 0004 (shared until the first write); proposal 0001's `LOWER_COW` stays off; struct copies do not separate their `Vec` fields yet
+- Value semantics for `Vec`/`str`/`HashMap`: done by the ownership rule of proposal 0004 (shared until the first write); proposal 0001's `LOWER_COW` stays off; struct copies separate their `Vec` fields too (Nov 15)
 
 ---
 

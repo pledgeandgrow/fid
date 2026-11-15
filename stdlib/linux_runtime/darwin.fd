@@ -171,7 +171,9 @@ fn pe_mac_mmap(n: i64) -> i64 {
     // mmap(0, n, PROT_READ|WRITE, MAP_PRIVATE|MAP_ANON, -1, 0); macOS
     // MAP_ANON = 0x1000, MAP_PRIVATE = 0x2
     var a: i64 = nat_mac_call(PE_M_MMAP, 0, n, 3, 0x1002, 0 - 1, 0);
-    if a == 0 - 1 { return 0; }
+    // MAP_FAILED: -ENOMEM, as the Linux call gives (base.fd pe_mmap reports
+    // it as out of memory)
+    if a == 0 - 1 { return 0 - 12; }
     return a;
 }
 
@@ -211,6 +213,25 @@ fn pe_mac_stat(path: i64, st: i64) -> i64 {
     return 0;
 }
 
+/// Linux open flags -> macOS (the access mode, bits 0-1, is the same).
+/// Linux: CREAT 0x40, EXCL 0x80, TRUNC 0x200, APPEND 0x400, NONBLOCK 0x800,
+/// DIRECTORY 0x4000 (generic) / 0x10000 (x86-64), CLOEXEC 0x80000.
+/// macOS: NONBLOCK 0x4, APPEND 0x8, CREAT 0x200, TRUNC 0x400, EXCL 0x800,
+/// DIRECTORY 0x100000, CLOEXEC 0x1000000.
+fn pe_mac_oflags(f: i64) -> i64 {
+    var m: i64 = f & 3;
+    if (f & 0x40) != 0 { m = m | 0x200; }
+    if (f & 0x80) != 0 { m = m | 0x800; }
+    if (f & 0x200) != 0 { m = m | 0x400; }
+    if (f & 0x400) != 0 { m = m | 0x8; }
+    if (f & 0x800) != 0 { m = m | 0x4; }
+    var dir_bit: i64 = 0x4000;
+    if nat_arch() == 3 { dir_bit = 0x10000; }       // x86-64: 0x4000 is O_DIRECT
+    if (f & dir_bit) != 0 { m = m | 0x100000; }
+    if (f & 0x80000) != 0 { m = m | 0x1000000; }
+    return m;
+}
+
 fn pe_mac_errno_ret(r: i64) -> i64 {
     // libc returns -1 and sets errno; we cannot read errno easily, so map
     // a failure to a generic -EIO (the shared runtime only checks < 0).
@@ -221,8 +242,17 @@ fn pe_mac_errno_ret(r: i64) -> i64 {
 // ─── Signals ────────────────────────────────────────────────────────────
 
 fn pe_mac_sigaction(sig: i64, act: i64) -> i64 {
-    // sigaction(sig, act, NULL)
-    return pe_m(PE_M_SIGACTION, sig, act, 0);
+    // base.fd builds a Linux struct sigaction (handler at 0, flags at 8).
+    // macOS wants { handler (8), sa_mask uint32 (8), sa_flags int (12) },
+    // with SA_SIGINFO = 0x40. Translate into a temporary.
+    var ma: i64 = pert_malloc(16);
+    pe_zero(ma, 16);
+    pe_st(ma, pe_ld(act));                 // handler
+    var i: i64 = 0;
+    while i < 4 { pe_stb(ma + 12 + i, (0x40 >> (i * 8)) & 255); i = i + 1; }  // SA_SIGINFO
+    var r: i64 = pe_m(PE_M_SIGACTION, sig, ma, 0);
+    pert_free(ma);
+    return r;
 }
 
 // ─── Clocks ─────────────────────────────────────────────────────────────
@@ -287,14 +317,17 @@ pub fn pe_mac_syscall(n: i64, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) ->
     if n == 63 { return pe_mac_errno_ret(pe_m(PE_M_READ, a, b, c)); }         // read
     if n == 64 { return pe_mac_errno_ret(pe_m(PE_M_WRITE, a, b, c)); }        // write
     if n == 56 {                                                             // openat
-        // openat(AT_FDCWD=-2, path, flags, mode)
-        var fd: i64 = nat_mac_call(PE_M_OPEN, 0 - 2, b, c, d, 0, 0);
+        // openat(AT_FDCWD=-2, path, macOS flags, mode)
+        var fd: i64 = nat_mac_call(PE_M_OPEN, 0 - 2, b, pe_mac_oflags(c), d, 0, 0);
         return pe_mac_errno_ret(fd);
     }
     if n == 57 { return pe_mac_errno_ret(pe_m(PE_M_CLOSE, a, 0, 0)); }        // close
     if n == 62 { return pe_mac_errno_ret(pe_m(PE_M_LSEEK, a, b, c)); }        // lseek
     if n == 79 { return pe_mac_stat(b, c); }                                 // newfstatat
-    if n == 61 { return pe_mac_errno_ret(pe_m(PE_M_GETDIRENTRIES, a, b, c)); } // getdents64 ~ getdirentries
+    // getdents64: not supported yet. Darwin's getdirentries gives its own
+    // record layout, not the Linux dirent64 sys.fd parses, so a listing
+    // comes back empty rather than garbled (needs opendir/readdir).
+    if n == 61 { return 0 - 38; }
     if n == 35 {                                                             // unlinkat
         return pe_mac_errno_ret(nat_mac_call(PE_M_UNLINKAT, 0 - 2, b, c, 0, 0, 0));
     }

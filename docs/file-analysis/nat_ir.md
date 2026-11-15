@@ -1,5 +1,7 @@
 # nat_ir.fd — IR to native code: machine IR, register allocator, targets
 
+> **Nov 15:** the macOS path (`ng_gen_primitives_mac`, `nat_generate_macho`, libSystem calls through a GOT) was added (release F7); not yet run on a Mac.
+
 Audited 2026-11-09 (new doc). Another session was editing this file during
 the audit (5,548 lines when first read, 5,606 an hour later; `git diff`
 showed about 240 uncommitted lines: WP5 indirect-call masks, WP8 leaf

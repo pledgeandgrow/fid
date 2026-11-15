@@ -8,10 +8,12 @@
 // type (pointers and sizes as i32). The process's arguments and
 // environment are laid out as Linux starts a process (nat_start_sp: argc,
 // argv, NULL, envp, NULL). Memory: mmap grows the linear memory, munmap
-// keeps it. Paths are relative to the first preopened directory (fd 3),
-// an absolute one to the second (fd 4; scripts/wasm-run.mjs preopens "."
-// and "/"). Errors are -errno as on Linux. Threads, processes, signals and
-// sockets fail with ENOSYS. Merged only for this target.
+// keeps the region for the next mmap of its size. Paths go to the
+// preopened directories as wasi-libc sends them (scripts/wasm-run.mjs
+// preopens ".", "/" and "/tmp"). Errors are -errno as
+// on Linux. A thread or a task runs to its end when it starts
+// (compiler/wasm.fd: nat_clone_thread, nat_ctx_swap); processes, signals
+// and sockets fail with ENOSYS. Merged only for this target.
 
 extern "C" {
     fn wasi_fd_write(fd: i64, iovs: i64, n: i64, nwritten: i64) -> i64;
@@ -34,7 +36,10 @@ extern "C" {
     fn wasi_environ_get(env: i64, buf: i64) -> i64;
     fn wasi_sched_yield() -> i64;
     fn wasi_poll_oneoff(subs: i64, events: i64, n: i64, nevents: i64) -> i64;
+    fn wasi_fd_prestat_get(fd: i64, buf: i64) -> i64;
+    fn wasi_fd_prestat_dir_name(fd: i64, path: i64, len: i64) -> i64;
     fn nat_wasm_grow(pages: i64) -> i64;
+    fn nat_wasm_zero(addr: i64, n: i64);
 }
 
 // Scratch words for the calls (iovecs, results), the process image, the
@@ -48,11 +53,52 @@ var pe_wasi_dir_fd: i64 = 0 - 1;
 var pe_wasi_dir_cookie: i64 = 0;
 var pe_wasi_dir_buf: i64 = 0;
 
+/// A page of its own (not the heap: a system call may run with the heap's
+/// lock held): scratch words at 0, the unmapped regions at 1024
 fn pe_wasi_scratch() -> i64 {
     if pe_wasi_tmp == 0 {
-        pe_wasi_tmp = pert_malloc(128);
+        pe_wasi_tmp = nat_wasm_grow(1) * 65536;
     }
     return pe_wasi_tmp;
+}
+
+const PE_WASI_REGIONS: i64 = 64;
+
+/// mmap: an unmapped region of the same size again (task and thread
+/// stacks, large blocks), zeroed; else new pages
+fn pe_wasi_mmap(len: i64) -> i64 {
+    var size: i64 = ((len + 65535) / 65536) * 65536;
+    var tab: i64 = pe_wasi_scratch() + 1024;
+    var i: i64 = 0;
+    while i < PE_WASI_REGIONS {
+        if pe_ld(tab + i * 16 + 8) == size {
+            var a: i64 = pe_ld(tab + i * 16);
+            pe_st(tab + i * 16 + 8, 0);
+            nat_wasm_zero(a, size);
+            return a;
+        }
+        i = i + 1;
+    }
+    var old: i64 = nat_wasm_grow(size / 65536);
+    if old < 0 { return 0 - 12; }
+    return old * 65536;
+}
+
+/// munmap: the region kept for an mmap of its size (WASM memory does not
+/// shrink)
+fn pe_wasi_munmap(addr: i64, len: i64) -> i64 {
+    var size: i64 = ((len + 65535) / 65536) * 65536;
+    var tab: i64 = pe_wasi_scratch() + 1024;
+    var i: i64 = 0;
+    while i < PE_WASI_REGIONS {
+        if pe_ld(tab + i * 16 + 8) == 0 {
+            pe_st(tab + i * 16, addr);
+            pe_st(tab + i * 16 + 8, size);
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 0;
 }
 
 fn pe_wasi_ld32(addr: i64) -> i64 {
@@ -81,14 +127,71 @@ fn pe_wasi_err(e: i64) -> i64 {
     return 0 - 5;
 }
 
+/// The preopened directories: [n], then [fd, name, length] each (as
+/// wasi-libc finds them: fd 3 on, until fd_prestat_get fails)
+var pe_wasi_pre: i64 = 0;
+
+fn pe_wasi_preopens() -> i64 {
+    if pe_wasi_pre != 0 { return pe_wasi_pre; }
+    var tab: i64 = pert_malloc(8 + 16 * 24);
+    var buf: i64 = pert_malloc(16);
+    var n: i64 = 0;
+    var fd: i64 = 3;
+    while n < 16 {
+        pe_zero(buf, 16);
+        if wasi_fd_prestat_get(fd, buf) != 0 { break; }
+        var len: i64 = pe_wasi_ld32(buf + 4);
+        var name: i64 = pert_malloc(len + 1);
+        wasi_fd_prestat_dir_name(fd, name, len);
+        pe_stb(name + len, 0);
+        while len > 1 && pe_ldb(name + len - 1) == 47 { len = len - 1; }
+        pe_st(tab + 8 + n * 24, fd);
+        pe_st(tab + 16 + n * 24, name);
+        pe_st(tab + 24 + n * 24, len);
+        n = n + 1;
+        fd = fd + 1;
+    }
+    pert_free(buf);
+    pe_st(tab, n);
+    pe_wasi_pre = tab;
+    return tab;
+}
+
 /// The directory and relative path of `path` for the path calls:
-/// pe_wasi_pfd, pe_wasi_pptr, pe_wasi_plen ("./" and a leading "/" off)
+/// pe_wasi_pfd, pe_wasi_pptr, pe_wasi_plen. An absolute path is relative to
+/// the preopened directory whose name is its longest prefix ("/tmp" for
+/// "/tmp/x", "/" for anything else), a relative one to ".".
 fn pe_wasi_path(path: i64) {
+    var tab: i64 = pe_wasi_preopens();
+    var count: i64 = pe_ld(tab);
     var p: i64 = path;
     var fd: i64 = 3;
+    var i: i64 = 0;
     if pe_ldb(p) == 47 {
-        fd = 4;
+        var best: i64 = 0 - 1;
+        while i < count {
+            var name: i64 = pe_ld(tab + 16 + i * 24);
+            var len: i64 = pe_ld(tab + 24 + i * 24);
+            if pe_ldb(name) == 47 && len > best {
+                var j: i64 = 0;
+                while j < len && pe_ldb(name + j) == pe_ldb(p + j) { j = j + 1; }
+                if j == len && (len == 1 || pe_ldb(p + len) == 0 || pe_ldb(p + len) == 47) {
+                    best = len;
+                    fd = pe_ld(tab + 8 + i * 24);
+                }
+            }
+            i = i + 1;
+        }
+        if best > 0 { p = p + best; }
         while pe_ldb(p) == 47 { p = p + 1; }
+    } else {
+        while i < count {
+            var dname: i64 = pe_ld(tab + 16 + i * 24);
+            if pe_ld(tab + 24 + i * 24) == 1 && pe_ldb(dname) == 46 {
+                fd = pe_ld(tab + 8 + i * 24);
+            }
+            i = i + 1;
+        }
     }
     while pe_ldb(p) == 46 && pe_ldb(p + 1) == 47 {
         p = p + 2;
@@ -129,8 +232,10 @@ fn pe_wasi_openat(path: i64, flags: i64) -> i64 {
     if (flags & 1024) != 0 { fdflags = 1; }               // O_APPEND
     pe_wasi_path(path);
     var out: i64 = pe_wasi_scratch();
+    // Rights: every one but sock_shutdown (bits 0..27; Node refuses a file
+    // the bit 28 asks for with ENOTCAPABLE)
     var e: i64 = wasi_path_open(pe_wasi_pfd, 1, pe_wasi_pptr, pe_wasi_plen, oflags,
-        536870911, 536870911, fdflags, out);
+        268435455, 268435455, fdflags, out);
     if e != 0 { return pe_wasi_err(e); }
     return pe_wasi_ld32(out);
 }
@@ -290,12 +395,10 @@ pub fn pe_wasi_syscall(n: i64, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) -
     if n == 63 { return pe_wasi_rw(false, a, b, c); }                // read
     if n == 222 {                                                     // mmap
         if e >= 0 { return 0 - 38; }
-        var pages: i64 = (b + 65535) / 65536;
-        var old: i64 = nat_wasm_grow(pages);
-        if old < 0 { return 0 - 12; }
-        return old * 65536;
+        return pe_wasi_mmap(b);
     }
-    if n == 215 || n == 226 { return 0; }                            // munmap, mprotect
+    if n == 215 { return pe_wasi_munmap(a, b); }                     // munmap
+    if n == 226 { return 0; }                                        // mprotect
     if n == 94 || n == 93 {                                           // exit_group, exit
         wasi_proc_exit(a);
         return 0;

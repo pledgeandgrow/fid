@@ -539,8 +539,8 @@ w.push(1);      // v.len() is now 1 as well
 There is no move check for `str` or `Vec`: only `@linear` struct types move
 (used exactly once; reference.md §8.7). `var b = a` on a `Vec`, `str` or
 `HashMap` gives an independent value: the data is shared until the first
-write copies it (proposal 0004; reference.md §8.1). A copied struct still
-shares its `Vec` fields.
+write copies it (proposal 0004; reference.md §8.1), and the same holds for
+the collections inside a copied struct.
 
 ---
 

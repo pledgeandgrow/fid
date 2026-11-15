@@ -357,8 +357,9 @@ scope; reading borrows; keeping a value (let, assignment, field, element,
 return, payload) takes an owner (`Lowerer_rc_own_value`: a temporary is
 handed over, anything else gets `Str_dup` / `Vec_share` / `HashMap_share` /
 `__own_dup_N`). A shared `Vec` buffer is copied at the first write
-(`core.fd:vec_own`), so `var b = a` gives an independent value. Copying a
-struct does not yet separate its `Vec` fields (known-bugs 2g.3).
+(`core.fd:vec_own`), so `var b = a` gives an independent value; copying a
+struct does the same for the collections it holds (known-bugs 2g.3, fixed
+Nov 15).
 
 A `Vec` header is 40 bytes `{data, len, cap, code, tid}`; element codes 16
 and up are structs held inline (`code - 15` words, `LOWER_INLINE_STRUCTS`);
