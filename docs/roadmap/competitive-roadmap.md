@@ -760,14 +760,18 @@ Reach what Rust, Go, Zig and C++ programmers expect on day one.
       check (`test_generic_bound_fail`, `test_generic_infer_fail`,
       `test_turbofish_arity_fail`). Left: associated types, default methods
       and trait objects, not checked against this goal.
-- [~] LG5. Zero-cost iterators: `map`, `filter`, `fold` compile to a plain loop (L).
-      Done (Nov 13): `iro_closure_devirt` (iropt.fd) rewrites `CallPtr` to a
-      direct `Call` when the env's fn ref is a `ConstFnRef` — devirtualized
-      calls inline like any other; `FID_IROPT_OFF=closuredevirt` disables.
-      Left: `Vec_map`/`Vec_fold`-style higher-order stdlib fns still dispatch
-      at runtime — the env crosses a call boundary before the `CallPtr`, so
-      the target isn't statically known at the call site; needs callsite
-      specialization (iro_specialize) or inlining of the HOF first.
+- [x] LG5. Zero-cost iterators: `map`, `filter`, `fold` compile to a plain loop (L).
+      Done (Nov 15): `iro_closure_devirt` (iropt.fd) rewrites `CallPtr` to a
+      direct `Call` when the env's fn ref is a `ConstFnRef`, and
+      `iro_hof_specialize` covers the call-boundary case: it clones a
+      higher-order fn once per `(hof, closure)` when the caller's env is a
+      statically known `p_malloc` env — `apply`/`Vec_map` get
+      `apply__cdev_*`/`Vec_map__cdev_*` clones whose inner `CallPtr` on the
+      env parameter becomes a direct `Call`, inlinable by `iro_inline`
+      (`FID_HOF_DBG=1` traces; verified `hofspec 2` on
+      `test_closure_devirt.fd`: `v.map(fn)` + `apply(h,3)` both specialize,
+      output identical on/off). The generic HOF stays for envs that are not
+      statically known. `FID_IROPT_OFF=hofspec`/`closuredevirt` disables.
 - [~] LG6. Closures that capture by reference and by value, with no heap allocation
       when they do not escape (L).
       Done (Nov 13): the same `iro_closure_devirt` pass replaces an env's
@@ -779,15 +783,28 @@ Reach what Rust, Go, Zig and C++ programmers expect on day one.
       Done (existing, verified Nov 13): `fn sum<N: i64>(arr: [i64; N]) -> i64`
       typechecks, monomorphizes per `N` and runs; `sum<3>(...)` calls work.
       (`test_const_generic*.fd`.)
-- [~] LG8. Sum types and pattern matching with guards, nesting and exhaustiveness in
+- [x] LG8. Sum types and pattern matching with guards, nesting and exhaustiveness in
       every position (M).
-      Done (verified Nov 13): `match` arms with `if` guards, literal +
-      wildcard arms, and exhaustiveness errors naming the missing variants.
-      Left: nested constructor patterns (`Some(Ok(x))`) do not parse —
-      patterns are one level deep.
+      Done (Nov 15): guards, literals, wildcards, exhaustiveness naming
+      missing variants — and nested constructor patterns: the parser records
+      each nested payload (`Ok(x)` in `Some(Ok(x))`, `Rect(w,h)` in
+      `Pair(Rect, Circle)`) as a `PatNest` bound to a fresh `__np` name and
+      `pd_desugar_arms` wraps the arm in inner `match`es, so every backend
+      (interp, C, PE/nat; fidesc + self-hosted fid) sees the existing flat
+      `EnumVariant` shape. Guards ride the innermost pattern; `_` arms fall
+      through to the remaining desugared arms, and a trailing `_` arm panics
+      when no remaining arm covers the scrutinee (no silent fall-off).
+      Verified on
+      `tests/bootstrap/test_match_nested.fd` (`7 4 5 11 -1 0 42 11 8 -5 -9`
+      on all five paths). Restriction: in expression position the scrutinee
+      must be a variable (no place to hoist a one-time evaluation).
 - [~] LG9. Hygienic macros, or a comptime that covers what they do (L).
-      Done (existing): `comptime` blocks/functions run at compile time.
-      Left: no syntactic macro system; comptime does not generate decls.
+      Done (verified Nov 15): `comptime` blocks/functions run at compile
+      time and `comptime gen` DOES generate decls — it evaluates a block to
+      a source string, parses it, and merges the generated functions/structs
+      into the program (`test_comptime_gen.fd` and the comptime_* suite).
+      Left: no syntactic macro system and no hygiene guarantees — generated
+      names are unhygienic (can collide with user decls).
 - [x] LG10. Error handling with context and no allocation on the happy path (M).
       `Result.context(msg)`, `with_context(f)`, `Option.context(msg)` (complaint
       CE1).

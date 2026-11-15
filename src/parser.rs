@@ -3849,20 +3849,41 @@ fn pd_desugar_arms(
                 },
                 line,
             )]
-        } else if as_expr {
-            vec![Stmt::Expr(
-                Expr::Match {
-                    expr: Box::new(Expr::Ident(scrut.to_string())),
-                    arms: rest.clone(),
-                },
-                line,
-            )]
         } else {
-            vec![Stmt::Match {
-                expr: Expr::Ident(scrut.to_string()),
-                arms: rest.clone(),
-                line,
-            }]
+            // The fallthrough re-matches the scrutinee against the remaining
+            // arms; when none of them covers it, the inner match must panic,
+            // not silently fall off the end.
+            let mut rest2 = rest.clone();
+            if !matches!(rest2.last().map(|a| &a.pattern), Some(Pattern::Wildcard)) {
+                rest2.push(MatchArm {
+                    pattern: Pattern::Wildcard,
+                    guard: None,
+                    body: vec![Stmt::Expr(
+                        Expr::Call {
+                            callee: "panic".to_string(),
+                            args: vec![Expr::StringLit(
+                                "nested match: no arm matched".to_string(),
+                            )],
+                        },
+                        line,
+                    )],
+                });
+            }
+            if as_expr {
+                vec![Stmt::Expr(
+                    Expr::Match {
+                        expr: Box::new(Expr::Ident(scrut.to_string())),
+                        arms: rest2,
+                    },
+                    line,
+                )]
+            } else {
+                vec![Stmt::Match {
+                    expr: Expr::Ident(scrut.to_string()),
+                    arms: rest2,
+                    line,
+                }]
+            }
         };
         let mut body = arm.body.clone();
         // nests are pushed post-order — children before parents — so the

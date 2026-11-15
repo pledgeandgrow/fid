@@ -4058,10 +4058,26 @@ fn pd_desugar_arms(self: &mut Parser, scrut: str, arms: Vec<MatchArm>, nests: Ve
     } else {
         var rest_stmts: Vec<Stmt> = Vec::new();
         if rest.len() > 0 {
+            // The fallthrough re-matches the scrutinee against the remaining
+            // arms; when none of them covers it, the inner match must panic,
+            // not silently fall off the end.
+            var rest2: Vec<MatchArm> = rest;
+            var lastw: bool = false;
+            match rest2.get(rest2.len() - 1).pattern {
+                Pattern::Wildcard => { lastw = true; }
+                _ => {}
+            }
+            if !lastw {
+                var pstmts: Vec<Stmt> = Vec::new();
+                var pargs: Vec<Expr> = Vec::new();
+                pargs.push(Expr::StringLit("nested match: no arm matched"));
+                pstmts.push(Stmt::Expr(Expr::Call("panic", pargs), line));
+                rest2.push(MatchArm_new(Pattern::Wildcard, OptBoxExpr::None, pstmts));
+            }
             if as_expr {
-                rest_stmts.push(Stmt::Expr(Expr::Match(Box::new(Expr::Ident(scrut)), rest), line));
+                rest_stmts.push(Stmt::Expr(Expr::Match(Box::new(Expr::Ident(scrut)), rest2), line));
             } else {
-                rest_stmts.push(Stmt::Match(Expr::Ident(scrut), rest, line));
+                rest_stmts.push(Stmt::Match(Expr::Ident(scrut), rest2, line));
             }
         } else {
             var pargs: Vec<Expr> = Vec::new();
